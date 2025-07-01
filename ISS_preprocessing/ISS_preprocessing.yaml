@@ -4,7 +4,7 @@ channels:
 dependencies:
   - python=3.8
   - pip
-  - numpy==1.23.5
+  - numpy=1.23.5
   - pandas
   - matplotlib
   - scikit-learn
@@ -56,6 +56,9 @@ dependencies:
   - pillow
   - networkx
   - tqdm
+  - cudatoolkit=11.2
+  - cudnn=8.1.0
+  - dask
   - pip:
       - aicspylibczi==3.0.5
       - ashlar==1.13.1
@@ -83,6 +86,7 @@ dependencies:
       - scikit-image==0.16.2
       - shapely==1.8.1.post1
       - simplejson==3.17.6
+      - siphash24
       - split-image==2.0.1
       - readlif==0.6.5
       - tenacity==8.0.1
@@ -91,4 +95,4 @@ dependencies:
       - txt2tags==3.7
       - widgetsnbextension==3.5.2
       - xmltodict==0.13.0
-prefix: /home/marco/anaconda3/envs/ISS_preprocessing
+      - redlionfish
