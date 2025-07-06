@@ -91,7 +91,7 @@ def preprocessing_main_leica(input_dir,
                             mode,
                             deconvolution_method=None,
                             PSF_metadata=None, 
-                            align_channel=5, 
+                            align_channel=4, 
                             mip=True,
                             tile_dimension=6000,  
                             chunk_size=None):
@@ -133,7 +133,7 @@ def preprocessing_main_leica(input_dir,
         Required if deconvolution is to be performed.
 
     align_channel : int, optional
-        Channel index used for image alignment. Default is 5.
+        Channel index used for image alignment. Default is 4.
 
     mip : bool, optional
         Whether to apply Maximum Intensity Projection (MIP) to image stacks. Default is True.
@@ -161,8 +161,8 @@ def preprocessing_main_leica(input_dir,
     if deconvolution_method not in valid_methods:
         raise ValueError(f"Unsupported deconvolution method: {deconvolution_method}. Choose from {valid_methods - {None}} or None.")
 
-    if PSF_metadata is None:
-        raise ValueError("PSF_metadata is required to generate PSF.")
+    if deconvolution_method is not None and PSF_metadata is None:
+        raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
  
     # DECONVOLUTION
     region_directories = deconvolve_leica(
@@ -242,39 +242,46 @@ def deconvolve_leica(
     print(f"Mode: {mode}".ljust(width))
     print(f"Deconvolution method: {deconvolution_method}".ljust(width))
 
-    if PSF_metadata is None:
-        raise ValueError("PSF_metadata is required to generate PSF.")
+    if deconvolution_method is not None and PSF_metadata is None:
+        raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
     
     input_dir = Path(input_dir)
 
     # STEP 1: Detect regions to process
     
     # --- Processing Leica .tif files ---
-    if mode in ['tif_autosaved', 'tif_exported']:
-
-        # List of all tif files in input_dir
+    if mode == 'tif_exported':
         tif_files = [
-        f.name
-        for f in input_dir.iterdir()
-        if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name]
-        
-        region_names = set()     # To collect unique region names (like 'Region 4')
-        region_numbers = set()   # To collect unique region numbers (like 4)
-        
-        region_pattern = re.compile(r'(Region\s*\d+)')     # Match pattern 'Region 4', 'Region4', etc.
-    
+            f.name
+            for f in input_dir.iterdir()
+            if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
+        ]
+        # Use underscore split
+        region_names = set()
         for f in tif_files:
-            if (m := region_pattern.search(f)):
-                region_name = m.group(1)                                  # e.g. "Region4" or "Region 1"
-                region_num = int(re.search(r'\d+', region_name).group())  # Extract numeric part
-                region_names.add(region_name)
-                region_numbers.add(region_num)
-    
-        # Sorted lists of region names and region numbers
+            base = f.rsplit('.', 1)[0]
+            chunks = base.split('_')
+            region_name = chunks[0]
+            region_names.add(region_name)
         regions = sorted(region_names)
-        region_numbers = sorted(region_numbers)
-        num_regions = len(region_numbers)     # Total number of regions detected
-
+        num_regions = len(regions)
+    
+    elif mode == 'tif_autosaved':
+        tif_files = [
+            f.name
+            for f in input_dir.iterdir()
+            if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
+        ]
+        # Use double-dash split
+        region_names = set()
+        for f in tif_files:
+            base = f.rsplit('.', 1)[0]
+            chunks = base.split('--')
+            region_name = chunks[0]
+            region_names.add(region_name)
+        regions = sorted(region_names)
+        num_regions = len(regions)
+    
     # --- Processing Leica .lif files ---
     elif mode == 'lif':
         lif_files = [f for f in input_dir.iterdir() if f.suffix == '.lif']
@@ -285,8 +292,6 @@ def deconvolve_leica(
         if num_files > 1:
             # Case: one file per region
             num_regions = num_files                           # one file for each region
-            region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
-
             for file in lif_files:
                 lif_file = LifFile(file)
                 image_dict = lif_file.image_list[0]           # Each .lif has one image per region
@@ -296,13 +301,13 @@ def deconvolve_leica(
             # Case: one .lif file containing multiple regions
             lif_file = LifFile(lif_files[0])
             num_regions = len(lif_file.image_list)            # number of images = number of regions
-            region_numbers = list(range(1, num_regions + 1))
             for image_dict in lif_file.image_list:
                 image_names.append(image_dict['name'])
 
-        # Extract region names from image names using regex pattern
-        region_pattern = re.compile(r'Region\d+')
-        regions = [region_pattern.search(name).group() for name in image_names]
+        # Use unique image names directly as region names 
+        regions = sorted(set(image_names))
+    # rename regions    
+    region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
 
     print("Regions to be processed:", regions) 
     print("=" * width + "\033[0m")
@@ -312,7 +317,7 @@ def deconvolve_leica(
     print(f"\033[1;96mDeconvolution and mipping\033[0m")
     # Process each region
     for region_index, region in enumerate(regions):
-        print(f"\033[1;90mProcessing {region}\033[0m")
+        print(f"\033[1;90mProcessing R{region_numbers[region_index]}\033[0m")
 
         # Define output directory for this region:
         # - If only one region, use the output prefix directly
@@ -350,6 +355,19 @@ def deconvolve_leica(
             ]
             # Filter only files for the current region
             filtered_tifs = [f for f in tif_files if region in f.name]
+
+            # --- Find all channels from filenames ---
+            channel_set = set()
+            if mode == 'tif_autosaved':
+                channel_pattern = re.compile(r'--C(\d{2})')
+            elif mode == 'tif_exported':
+                channel_pattern = re.compile(r'_ch(\d+)')
+            for f in filtered_tifs:
+                if (m := channel_pattern.search(f.name)):
+                    channel_set.add(int(m.group(1)))
+            channels = sorted(channel_set)
+            print(f"Detected channels: {channels}")
+
     
             # Select regex pattern and sample indicator depending on mode
             if mode == 'tif_autosaved':
@@ -373,7 +391,7 @@ def deconvolve_leica(
             tiles = sorted(tiles, key=int)
             n_tiles = len(tiles)
             # Infer Z-size from number of sample_tile files divided by number of channels
-            size_z = int(len(sample_tiles) / len(PSF_metadata['channels']))
+            size_z = int(len(sample_tiles) / len(channels))
             # Infer image dimensions (X, Y) from the first sample tile
             sample_tile = tifffile.imread(sample_tiles[0])
             image_dimensions = sample_tile.shape[::-1]  # (width, height)
@@ -389,7 +407,7 @@ def deconvolve_leica(
     
             tile_channel_files = {}
             for tile, files_in_tile in tile_to_files.items():
-                for channel in PSF_metadata['channels']:
+                for channel in channels:
     
                     if mode == 'tif_autosaved':
                         pattern = f"--C{str(channel).zfill(2)}"
@@ -428,16 +446,18 @@ def deconvolve_leica(
             n_tiles = dims.m                                 # number of mosaic tiles (if any)
             tiles = list(range(n_tiles))                     # tile indices 0..n_tiles-1
             mosaic = image_dict.get('mosaic_position', None) # Get mosaic positions
+            num_channels = image_dict['channels']
+            channels = list(range(num_channels))  # [0, 1, 2, 3, 4, 5]
 
 
         # Check what files are expected to exist
         expected_files = [
             (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
             for tile in tiles
-            for channel in PSF_metadata['channels'].keys()
+            for channel in channels
         ]
         
-        print(f"Expected number of output files in {mipped_directory if mip else stacked_directory}: {len(expected_files)} ({len(tiles)} tiles × {len(PSF_metadata['channels'])} channels)")
+        print(f"Expected number of output files in {mipped_directory if mip else stacked_directory}: {len(expected_files)} ({len(tiles)} tiles × {len(channels)} channels)")
         
         # Identify which files are missing
         missing_files = [f for f in expected_files if not f.exists()]
@@ -571,7 +591,7 @@ def deconvolve_leica(
         for tile in tqdm(tiles, desc="Processing tiles", leave=False):
            
             # Loop over each fluorescence channel in the PSF metadata
-            for channel in PSF_metadata['channels']:
+            for channel in channels:
                 print(f"\033[90m[\033[96mCycle {cycle}\033[90m] Tile {tile}, Channel {channel}...\033[0m")
                 tile_channel_start = time.time()
                 
@@ -767,7 +787,7 @@ def mipped_to_OME_tiffs(region_directories, cycle):
 def align_and_stitch(
     region_directories,
     cycle,
-    align_channel=5, 
+    align_channel=4, 
     flip_x=False, 
     flip_y=True, 
     output_channels=None, 
