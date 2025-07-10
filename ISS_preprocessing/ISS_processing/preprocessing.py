@@ -624,7 +624,7 @@ def preprocessing_main_leica(input_dirs,
     
     # Maximum Intensity Projection
     if mip == True:
-        leica_mipping(input_dirs=input_dirs, output_dir_prefix = output_location)
+        leica_mipping(input_dirs=input_dirs, output_dir_prefix = output_location, image_dimension=image_dimension,mode=mode)
     else: 
         print('not mipping')
         
