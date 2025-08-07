@@ -1,9 +1,0 @@
-README.md
-setup.py
-ISS_preprocessing/__init__.py
-ISS_preprocessing/preprocessing.py
-ISS_preprocessing/psf.py
-ISS_preprocessing.egg-info/PKG-INFO
-ISS_preprocessing.egg-info/SOURCES.txt
-ISS_preprocessing.egg-info/dependency_links.txt
-ISS_preprocessing.egg-info/top_level.txt
