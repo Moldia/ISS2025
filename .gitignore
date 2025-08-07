@@ -1,13 +1,56 @@
+# ───────────────────────────────────────────────────────────────
+# Byte-compiled / optimized / DLL files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
 
-ISS_decoding/build/lib/ISS_decoding/__init__.py
-ISS_decoding/build/lib/ISS_decoding/decoding.py
-ISS_decoding/build/lib/ISS_decoding/qc_metrics.py
-ISS_decoding/build/lib/ISS_decoding/setup.py
-ISS_decoding/build/lib/ISS_decoding/SpaceTx_format.py
-ISS_decoding/ISS_decoding.egg-info/PKG-INFO
-ISS_decoding/ISS_decoding.egg-info/SOURCES.txt
-ISS_decoding/ISS_decoding.egg-info/top_level.txt
-ISS_preprocessing/Notebooks/.ipynb_checkpoints/ISS_preprocessing of Leica-exported tiffs-checkpoint.ipynb
-ISS_decoding/ISS_decoding.egg-info/PKG-INFO
-ISS_decoding/ISS_decoding.egg-info/SOURCES.txt
-ISS_decoding/ISS_decoding.egg-info/top_level.txt
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Virtual Documents (if generated)
+**/.virtual_documents/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Subproject build & metadata
+ISS_preprocessing/build/
+ISS_preprocessing/*.egg-info/
+ISS_decoding/build/
+ISS_decoding/ISS_decoding.egg-info/
+
+# Python environment directories
+env/
+venv/
+.venv/
+ENV/
+ENV3/
+
+# IDE / editor directories and files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# macOS & Windows system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# Cache directories
+.cache/
