@@ -1,0 +1,39 @@
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Package metadata
+*.egg-info/
+ISS_preprocessing.egg-info/
+
+# Build & distribution
+build/
+dist/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+Notebooks/.ipynb_checkpoints/
+
+# VS Code & PyCharm project files (if using)
+.vscode/
+.idea/
+
+# MacOS & Windows
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Other possible temp files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Ignore env directories if present
+env/
+venv/
+.venv/

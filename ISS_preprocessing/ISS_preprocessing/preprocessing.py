@@ -77,10 +77,12 @@ def deconvolve_image(input_image, psf_image, output_image, iterations, tilesize=
         
     except subprocess.CalledProcessError as e:
         print(f"\033[91mError during deconvolution: {e}\033[0m")
-    except FileNotFoundError:
-        print(f"\033[91mError: DeconWolf executable not found at {deconwolf_path}\033[0m")
+    except FileNotFoundError as e:
+        # e.filename is the missing executable or file
+        print(f"\033[91mError: executable not found: {e.filename}\033[0m")
     except Exception as e:
         print(f"\033[91mUnexpected error: {e}\033[0m")
+
 
 # -------------------------------------------------------------------------------------
 # MAIN FUNCTION FOR LEICA PREPROCESSING
@@ -319,13 +321,8 @@ def deconvolve_leica(
     for region_index, region in enumerate(regions):
         print(f"\033[1;90mProcessing R{region_numbers[region_index]}\033[0m")
 
-        # Define output directory for this region:
-        # - If only one region, use the output prefix directly
-        # - If multiple regions, append "_R{region_number}" to distinguish them
-        if num_regions == 1:
-            region_directory = Path(output_dir_prefix)
-        else:
-            region_directory = Path(f"{output_dir_prefix}_R{region_numbers[region_index]}")
+        # Define output directory for this region, always append "R{region_number}" to distinguish them
+        region_directory = Path(f"{output_dir_prefix}R{region_numbers[region_index]}")
 
         region_directories.append(str(region_directory))
         # Create region directory (with parent folders, if needed)
@@ -614,7 +611,7 @@ def deconvolve_leica(
     
                 # Deconvolution with RedLionFish method
                 if deconvolution_method == 'redlionfish':
-                    deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[channel], niter=50)
+                    deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=50)
                     # Save max projection if MIP requested, otherwise full stack
                     processed_img = np.max(deconvolved_images, axis=0).astype('uint16') if mip else deconvolved_images.astype('uint16')
                     tifffile.imwrite(output_file_path, processed_img)
@@ -635,7 +632,7 @@ def deconvolve_leica(
                     # Run Deconwolf deconvolution externally
                     deconvolve_image(
                         input_image=dw_input_path,
-                        psf_image=psf_dict[channel],
+                        psf_image=psf_dict[str(channel)],
                         output_image=dw_output_path,
                         iterations=20,
                         tilesize=chunk_size)

@@ -13,7 +13,7 @@ LONG_DESCRIPTION = 'This package can be used to process ISS data, that includes 
 
 # Setting up
 setup(
-    name="ISS_processing",
+    name="ISS_preprocessing",
     version=VERSION,
     author="Christoffer Mattsson Langseth",
     author_email="<christoffer.langseth@scilifelab.se>",

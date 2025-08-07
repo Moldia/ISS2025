@@ -1,0 +1,74 @@
+🐺 Deconwolf Installation Guide
+
+This guide walks you through cloning, building, and installing the Deconwolf executable.
+
+---
+
+✅ Prerequisites
+
+Make sure you have the following installed:
+
+- Git
+- CMake
+- C++ compiler (e.g., g++, clang++, or MSVC)
+
+### Ubuntu/Debian Example:
+
+    sudo apt update
+    sudo apt install git cmake build-essential
+
+---
+
+📥 Step 1: Clone the Repository
+
+    git clone https://github.com/elgw/deconwolf.git
+    cd deconwolf
+
+---
+
+🏗 Step 2: Create and Enter Build Directory
+
+    mkdir builddir
+    cd builddir
+
+---
+
+⚙️ Step 3: Configure the Project
+
+    cmake ..
+
+---
+
+🔨 Step 4: Build the Project
+
+    cmake --build .
+
+This compiles the project and produces the main binary, typically named `dw-<version>`.
+
+---
+
+✅ Step 5: Verify the Build
+
+Try running the tool from the build directory:
+
+    ./dw-0.4.5 --help
+
+You should see the usage information if the build was successful.
+
+---
+
+📦 Step 6: Install the Binary System-Wide
+
+To make the tool available globally and use a cleaner command name, copy and rename the binary into `/usr/local/bin`:
+
+    sudo cp ./dw-0.4.5 /usr/local/bin/deconwolf
+
+Now you can run:
+
+    deconwolf --help
+
+from any directory.
+
+---
+
+Happy deconvolving!
