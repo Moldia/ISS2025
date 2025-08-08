@@ -60,6 +60,7 @@ dependencies:
   - cudnn=8.1.0
   - dask
   - pip:
+      - ./ISS_preprocessing             # install preprocessing package (non-editable)
       - aicspylibczi==3.0.5
       - ashlar==1.13.1
       - blessed==1.19.1
