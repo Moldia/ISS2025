@@ -2,7 +2,7 @@ name: ISS_preprocessing
 channels:
   - conda-forge
 dependencies:
-  - python=3.8
+  - python=3.9
   - pip
   - numpy=1.23.5
   - pandas
