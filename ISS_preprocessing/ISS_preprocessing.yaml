@@ -25,4 +25,4 @@ dependencies:
       - readlif
       - RedLionfish
       - ashlar
-      - -e ./ISS_preprocessing    # editable install for local dev
+      - .   # non-editable install 
