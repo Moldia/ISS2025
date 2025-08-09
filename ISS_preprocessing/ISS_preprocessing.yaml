@@ -10,7 +10,6 @@ dependencies:
   - tifffile
   - dask-core
   - aicspylibczi
-  - deconwolf            # CLI tools deconwolf + dw_bw
   - pip
   # Jupyter + kernel
   - ipykernel
@@ -26,3 +25,4 @@ dependencies:
       - readlif
       - RedLionfish
       - ashlar
+      - -e ./ISS_preprocessing    # editable install for local dev
