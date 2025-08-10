@@ -19,4 +19,12 @@ setup(
         "pandas>=1.4",
         "xarray>=0.20",
         "scikit-image>=0.19",
-        "slicedimage>=3
+        "slicedimage>=3",
+        "starfish>=0.3",  # add other dependencies you use
+    ],
+    keywords=[
+        "python", "spatial transcriptomics",
+        "spatially resolved transcriptomics",
+        "in situ sequencing", "ISS", "decoding",
+    ],
+)

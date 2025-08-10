@@ -2,29 +2,29 @@ The `ISS_preprocessing` module aims to transform files extracted from the micros
 
 Installation instructions: 
 
-# 1) Clone the repo and enter it
+\# 1) Clone the repo and enter it
 git clone https://github.com/Moldia/ISS2025.git ISS2025
 cd ISS2025
 
-# 2) Make sure you're on the main branch and up to date
+\# 2) Make sure you're on the main branch and up to date
 git fetch origin
 git checkout main
 git pull --ff-only
 
-# 3) Create the conda environment from the YAML
-# (auto-installs the ISS_decoding package in non-editable mode)
+\# 3) Create the conda environment from the YAML
+\# (auto-installs the ISS_decoding package in non-editable mode)
 conda env create --name ISS_decoding --file ISS_decoding/ISS_decoding.yaml
-# If the env already exists, update instead:
-# conda env update -n ISS_decoding -f ISS_decoding/ISS_decoding.yaml --prune
+\# If the env already exists, update instead:
+\# conda env update -n ISS_decoding -f ISS_decoding/ISS_decoding.yaml --prune
 
-# 4) Activate the environment
+\# 4) Activate the environment
 conda activate ISS_decoding
 
-# 5) Register a Jupyter kernel for this environment
+\# 5) Register a Jupyter kernel for this environment
 python -m ipykernel install --user --name ISS_decoding
 
-# 6) (Optional) Verify the install
+\# 6) (Optional) Verify the install
 python -c "import ISS_decoding; print('OK:', ISS_decoding.__file__)"
 
-# 7) (Optional) When you're done, go back to base
+\# 7) (Optional) When you're done, go back to base
 conda deactivate
