@@ -1,0 +1,45 @@
+name: ISS_decoding
+channels:
+  - conda-forge
+dependencies:
+  # Python & core
+  - python=3.11
+  - pip
+  - setuptools<81
+  - wheel
+
+  # Arrays / data
+  - numpy
+  - pandas
+
+  # Imaging & plotting
+  - scikit-image
+  - matplotlib=3.7.3
+  - tifffile
+
+  # Jupyter (optional but handy)
+  - notebook
+  - jupyterlab
+  - ipywidgets
+  - ipykernel
+
+  # Optional: xarray is used under the hood by starfish; include explicitly to be safe
+  - xarray
+
+  # (If you need progress bars etc., uncomment)
+  # - tqdm
+
+  # Everything else via pip
+  - pip:
+      # Starfish & friends
+      - starfish==0.3.3
+      - slicedimage
+      - read-roi
+      - regional
+      - showit
+
+      # Spotiflow (your script imports Spotiflow and SpotiflowDetector)
+      - spotiflow==0.5.8
+
+      # Install current project (non-editable)
+      - .

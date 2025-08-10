@@ -1,34 +1,22 @@
 from setuptools import setup, find_packages
-import codecs
-import os
+import pathlib
 
-here = os.path.abspath(os.path.dirname(__file__))
+here = pathlib.Path(__file__).parent.resolve()
+long_description = (here / "README.md").read_text(encoding="utf-8")
 
-with codecs.open(os.path.join(here, "README.md"), encoding="utf-8") as fh:
-    long_description = "\n" + fh.read()
-
-VERSION = '0.0.0'
-DESCRIPTION = 'Package used to decode ISS data'
-LONG_DESCRIPTION = 'This package can be used to decode ISS data'
-
-# Setting up
 setup(
     name="ISS_decoding",
-    version=VERSION,
-    author="Christoffer Mattsson Langseth",
-    author_email="<christoffer.langseth@scilifelab.se>",
-    description=DESCRIPTION,
-    long_description_content_type="text/markdown",
+    version="0.0.23",
+    author="Marco Grillo",
+    author_email="marco.grillo@scilifelab.se",
+    description="Decode preprocessed ISS images, including SpaceTx formatting and plotting",
     long_description=long_description,
-    packages=find_packages(),
-    install_requires=[],
-    keywords=['python', 'spatial transcriptomics', 'spatial resolved transcriptomics', 'in situ sequencing', 'ISS','decoding'],
-    classifiers=[
-        "Development Status :: 1 - Planning",
-        "Intended Audience :: Researchers",
-        "Programming Language :: Python :: 3",
-        "Operating System :: Unix",
-        "Operating System :: MacOS :: MacOS X",
-        "Operating System :: Microsoft :: Windows",
-    ]
-)
+    long_description_content_type="text/markdown",
+    packages=find_packages(exclude=("tests", "docs", "*.ipynb_checkpoints")),
+    python_requires=">=3.8",
+    install_requires=[
+        "numpy>=1.22",
+        "pandas>=1.4",
+        "xarray>=0.20",
+        "scikit-image>=0.19",
+        "slicedimage>=3

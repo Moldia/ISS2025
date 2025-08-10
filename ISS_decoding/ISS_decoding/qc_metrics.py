@@ -3,144 +3,182 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-def quality_per_gene(reads,on='quality_mean',gene_name='target',format_base_quality=False):
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads['qc_base'+str(col+1)]=list(quality_per_base.loc[:,col])
-    score=on
-    ordervals=reads.groupby(gene_name).mean()[score].sort_values()
-    valsdict=dict(zip(ordervals.index,np.round(ordervals,2)))
-    reads['meangenequality']=list(reads[gene_name].map(valsdict))
-    reads=reads.sort_values(by='meangenequality')
-    plt.figure(figsize=(6,len(valsdict)/1.2))
-    sns.violinplot(y=gene_name, x=score, data=reads)
-    plt.title([score,'for each gene'])
-    return ordervals
-def quality_per_cycle(reads,cycles=5,format_base_quality=False):
-    bases=cycles
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads['qc_cycle'+str(col+1)]=list(quality_per_base.loc[:,col])
-    ess=[]
-    for e in range(1,bases+1):
-        ess.append('qc_cycle'+str(e))
-    qualities=reads.loc[:,ess]
-    qlt=pd.DataFrame(columns=['quality','base'])
-    qualist=[]
-    baselist=[]
-    for qual in qualities.columns:
-        qualist=qualist+list(qualities[qual])
-        qa=[qual]*len(qualities)
-        baselist=baselist+list(qa)
-    output=pd.DataFrame(columns=['quality','cycle'])
-    output['quality']=qualist
-    output['cycle']=baselist
-    plt.figure(figsize=(bases*2,7))
-    sns.violinplot(y='quality', x='cycle', data=output)
-    plt.title('Qualities for each cycle')
-def compare_scores(reads,score1='quality_minimum',score2='quality_mean',kind='kde',color='#3266a8',format_base_quality=False,hue=None): # option for kind are “scatter” | “kde” | “hist” | “hex” | “reg” | “resid” 
-    if hue=='assigned':
-        reads['assigned']=list(~reads['target'].isna())
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads['qc_base'+str(col+1)]=list(quality_per_base.loc[:,col])
-    sns.jointplot(x=reads.loc[:,score1], y=reads.loc[:,score2], kind=kind, color=color,hue=reads[hue])
 
-def plot_scores(reads,on='quality_mean',hue='None',log_scale=False,format_base_quality=False,palette='ch:rot=-.25,hue=1,light=.75'):
-    if hue=='assigned':
-        reads['assigned']=list(~reads['target'].isna())
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads['qc_base '+str(col+1)]=list(quality_per_base.loc[:,col])
-    sns.histplot(reads,x=on, hue=hue,multiple="stack",palette=palette,edgecolor=".3",linewidth=.5,log_scale=False)
-    if hue=='assigned':
-        sns.displot(
-        data=reads,
-        x=on, hue=hue,
-        kind="kde", height=6,
-        multiple="fill", clip=(0, None),
+def _expand_base_quality(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parse the 'quality_all_bases' column once into numeric per-cycle columns:
+    qc_cycle1, qc_cycle2, …
+    """
+    if any(col.startswith('qc_cycle') for col in df.columns):
+        return df
+    # strip brackets, split on comma, convert to float
+    base_q = (
+        df['quality_all_bases']
+        .str.strip('[]')
+        .str.split(',', expand=True)
+        .astype(float)
+    )
+    base_q.columns = [f'qc_cycle{i+1}' for i in base_q.columns]
+    return df.join(base_q)
+
+
+def quality_per_cycle(reads: pd.DataFrame) -> None:
+    """
+    Violin plot of per-cycle quality.
+    """
+    df = _expand_base_quality(reads)
+    cycle_cols = sorted(c for c in df if c.startswith('qc_cycle'))
+    melted = df.melt(
+        value_vars=cycle_cols,
+        var_name='cycle',
+        value_name='quality',
+    )
+    plt.figure(figsize=(len(cycle_cols)*1.5, 6))
+    sns.violinplot(x='cycle', y='quality', data=melted)
+    plt.title('Quality per cycle')
+    plt.tight_layout()
+
+
+def quality_per_gene(
+    reads: pd.DataFrame,
+    score: str = 'quality_mean',
+    gene: str = 'target',
+) -> pd.Series:
+    """
+    Violin plot of a given quality score per gene, 
+    ordered by mean quality.
+    Returns the ordered mean‐quality Series.
+    """
+    df = reads.copy()
+    means = df.groupby(gene)[score].mean().sort_values()
+    order = means.index
+    plt.figure(figsize=(6, max(4, len(order)*0.2)))
+    sns.violinplot(x=score, y=gene, data=df, order=order)
+    plt.title(f'{score} per {gene}')
+    plt.tight_layout()
+    return means
+
+
+def compare_scores(
+    reads: pd.DataFrame,
+    score1: str = 'quality_minimum',
+    score2: str = 'quality_mean',
+    kind: str = 'kde',
+    color: str = '#3266a8',
+    hue: str = None,
+) -> None:
+    """
+    Jointplot comparing two quality scores.
+    """
+    df = reads.copy()
+    if hue == 'assigned':
+        df['assigned'] = df['target'].notna()
+        hue = 'assigned'
+    sns.jointplot(
+        x=score1, y=score2,
+        data=df, kind=kind,
+        color=color, hue=hue
+    )
+    plt.tight_layout()
+
+
+def plot_scores(
+    reads: pd.DataFrame,
+    score: str = 'quality_mean',
+    hue: str = None,
+    log_scale: bool = False,
+    palette: str = 'ch:rot=-.25,hue=1,light=.75',
+) -> None:
+    """
+    Histogram (stacked by hue) of a quality score.
+    """
+    df = reads.copy()
+    if hue == 'assigned':
+        df['assigned'] = df['target'].notna()
+        hue = 'assigned'
+    plt.figure(figsize=(8, 6))
+    sns.histplot(
+        data=df,
+        x=score, hue=hue,
+        multiple='stack',
         palette=palette,
-        )
-def plot_frequencies(reads,on='targets'):
-    readssum=reads.groupby(on).count()
-    readssum[on]=list(readssum.index)
-    readssum=readssum.sort_values(by='fov')
-    plt.figure(figsize=(10,len(readssum)/4))
-    plt.title('Number of each '+on)
-    ax=sns.barplot(x="fov", y="target", data=readssum)
-    ax.set(xlabel='counts', ylabel=on)
-    subset=readssum.iloc[:,0:1]
-    subset.columns=['counts']
-    return subset
-def plot_expression(reads,key='target',colorcode="colorblind",xcolumn='xc',ycolumn='yc',genes='all',size=8,background='white',figuresize=(10,7),save=None,format='pdf',title_color='black'): 
-    adataobs=reads
-    sizecols=len(adataobs[key].unique())
-    cls=sns.color_palette(colorcode,sizecols)
-    cls2=cls.as_hex()
-    colors=dict(zip(adataobs[key].unique(),cls2))
-    #cl.apply(lambda x: colors[x])
+        edgecolor='.3',
+        linewidth=.5,
+        log_scale=log_scale
+    )
+    plt.tight_layout()
+
+
+def plot_frequencies(reads: pd.DataFrame, by: str = 'target') -> pd.DataFrame:
+    """
+    Bar plot of counts per category (e.g. per gene or per FOV).
+    Returns a DataFrame with 'counts' and the index = categories.
+    """
+    counts = reads[by].value_counts().sort_values()
+    plt.figure(figsize=(10, max(4, len(counts)*0.2)))
+    sns.barplot(x=counts.values, y=counts.index, palette='deep')
+    plt.xlabel('counts')
+    plt.ylabel(by)
+    plt.title(f'Number of each {by}')
+    plt.tight_layout()
+    return counts.rename_axis(by).reset_index(name='counts')
+
+
+def plot_expression(
+    reads: pd.DataFrame,
+    key: str = 'target',
+    x: str = 'xc',
+    y: str = 'yc',
+    genes: list[str] | None = None,
+    size: float = 8,
+    palette: str = 'colorblind',
+    background: str = 'white',
+    save: str | None = None,
+    fmt: str = 'pdf',
+) -> None:
+    """
+    Scatter‐map of reads colored by `key`. If `genes` list is given,
+    plot others in gray and those in `genes` in color.
+    """
+    df = reads.copy()
     plt.rcParams['figure.facecolor'] = background
-    if genes=='all':
-        cl=adataobs[key]
-        plt.figure(figsize=figuresize)
-        figa=plt.scatter(x=adataobs[xcolumn],y=adataobs[ycolumn],c=cl.apply(lambda x: colors[x]),s=size,linewidths=0, edgecolors=None)
-        plt.axis('off')
-        if not save==None:
-            plt.savefig(save +'/map_all_genes_'+str(size)+'_'+background+'_'+key+'.'+format)
-    elif genes=='individual':
-        cl=adataobs[key]
-        for each in adataobs[key].unique():
-            adatasubobs=adataobs.loc[adataobs.loc[:,key]==each,:]
-            plt.figure(figsize=figuresize)
-            plt.scatter(x=adataobs[xcolumn],y=adataobs[ycolumn],c='grey',s=size/5,linewidths=0, edgecolors=None)
-            cl=adatasubobs[key]
-            plt.scatter(x=adatasubobs[xcolumn],y=adatasubobs[ycolumn],c=cl.apply(lambda x: colors[x]),s=size,linewidths=0, edgecolors=None)
-            plt.axis('off')
-            plt.title(str(each)+':' + str(len(adatasubobs))+' reads',color=title_color)
-            if not save==None:
-                plt.savefig(save +'/map_individual_cluster_'+str(each)+'_'+str(size)+background+'_'+key+'.'+format)
+    plt.figure(figsize=(10, 7))
+
+    if genes is None:
+        sns.scatterplot(
+            data=df, x=x, y=y, hue=key,
+            palette=palette, s=size, linewidth=0
+        )
     else:
-        adatasubobs=adataobs.loc[adataobs[key].isin(genes),:]
-        plt.figure(figsize=figuresize)
-        plt.scatter(x=adataobs.X,y=adataobs.Y,c='grey',s=size/5,linewidths=0, edgecolors=None)
-        cl=adatasubobs[key]
-        plt.scatter(x=adatasubobs.X,y=adatasubobs.Y,c=cl.apply(lambda x: colors[x]),s=size,linewidths=0, edgecolors=None)
-        plt.axis('off')
-        plt.legend()
-        if not save==None:
-                s=''
-                for element in genes:
-                    s=s+str(element)
-                print(s)
-                plt.savefig(save +'/map_group_of_clusters_'+str(s)+'_'+str(size)+background+'_'+key+'.'+format)
-    #        plt.title('Group: '+ paste(clusters))
+        mask = df[key].isin(genes)
+        sns.scatterplot(
+            data=df[~mask], x=x, y=y,
+            color='lightgray', s=size/3, linewidth=0
+        )
+        sns.scatterplot(
+            data=df[mask], x=x, y=y, hue=key,
+            palette=palette, s=size, linewidth=0
+        )
+
+    plt.axis('off')
+    if save:
+        suffix = 'all' if genes is None else '_'.join(map(str, genes))
+        plt.savefig(f'{save}/map_{suffix}_{key}.{fmt}')
+
     plt.rcParams['figure.facecolor'] = 'white'
-def filter_reads(reads,min_quality_mean=False,min_quality_minimum=False,max_distance=False,max_radius=False,min_radius=False,min_intensity=False,max_intensity=False):
-    readsfilt=reads
-    if not max_distance==False:
-        readsfilt=readsfilt.loc[readsfilt['distance']<max_distance,:]
-    if not min_quality_mean==False:
-        readsfilt=readsfilt.loc[readsfilt['quality_mean']>min_quality_mean,:]
-    if not min_quality_minimum==False:
-        readsfilt=readsfilt.loc[readsfilt['quality_minimum']>min_quality_minimum,:]
-    if not max_radius==False:
-        readsfilt=readsfilt.loc[readsfilt['radius']<max_radius,:]
-    if not min_radius==False:
-        readsfilt=readsfilt.loc[readsfilt['radius']>min_radius,:]
-    if not min_intensity==False:
-        readsfilt=readsfilt.loc[readsfilt['intensity']>min_intensity,:]
-    if not max_intensity==False:
-        readsfilt=readsfilt.loc[readsfilt['intensity']<max_intensity,:]
-    return readsfilt
+
+
+def filter_reads(reads: pd.DataFrame, **criteria) -> pd.DataFrame:
+    """
+    Filter by named criteria, e.g. min_quality_mean=0.5, max_distance=2.
+    """
+    df = reads.copy()
+    for name, thresh in criteria.items():
+        if thresh is False or name not in df.columns:
+            continue
+        op, col = name.split('_', 1)
+        if op == 'min':
+            df = df[df[col] > thresh]
+        elif op == 'max':
+            df = df[df[col] < thresh]
+    return df
