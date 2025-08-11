@@ -25,7 +25,7 @@ conda activate ISS_preprocessing
 python -m ipykernel install --user --name ISS_preprocessing
 
 # 6) (Optional) Verify the install
-python -c "import ISS_preprocessing; print('OK:', ISS_preprocessing.ISS_preprocessing.__file__)"
+python -c "import ISS_preprocessing; print('OK:', ISS_preprocessing.__file__)"
 
 # 7) (Optional) When you're done, go back to base
 conda deactivate
