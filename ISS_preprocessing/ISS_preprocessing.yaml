@@ -20,6 +20,6 @@ dependencies:
   - pip:
       - ashlar
       - readlif
-      - RedLionfishDeconv
+      - RedLionfish
       # Install current project (non-editable)
       - .
