@@ -1,28 +1,23 @@
 name: ISS_preprocessing
 channels:
   - conda-forge
-  - bioconda
 dependencies:
-  - python=3.9
-  - numpy=1.23
-  - pandas=2.3
-  - scipy=1.13
-  - tifffile
-  - dask-core
-  - aicspylibczi
+  - python=3.10
   - pip
-  # Jupyter + kernel
   - ipykernel
-  - jupyterlab
-  - notebook
+  - numpy
+  - pandas
+  - dask
+  - opencv
+  - tqdm
+  - natsort
+  - aicspylibczi
+  - tifffile<2025.2.18
+  - zarr<3
   # Optional GPU (comment out if not needed)
   - cudatoolkit=11.2
   - cudnn=8.1.0
   - pip:
-      - opencv-python-headless>=4.8
-      - tqdm
-      - natsort
-      - readlif
-      - RedLionfish
       - ashlar
-      - .   # non-editable install 
+      - readlif
+      - RedLionfishDeconv

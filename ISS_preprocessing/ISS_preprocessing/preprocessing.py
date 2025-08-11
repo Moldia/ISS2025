@@ -248,6 +248,7 @@ def deconvolve_leica(
         raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
     
     input_dir = Path(input_dir)
+    output_dir_prefix = Path(output_dir_prefix)  
 
     # STEP 1: Detect regions to process
     
@@ -322,7 +323,7 @@ def deconvolve_leica(
         print(f"\033[1;90mProcessing R{region_numbers[region_index]}\033[0m")
 
         # Define output directory for this region, always append "R{region_number}" to distinguish them
-        region_directory = Path(f"{output_dir_prefix}R{region_numbers[region_index]}")
+        region_directory = output_dir_prefix / f"R{region_numbers[region_index]}"
 
         region_directories.append(str(region_directory))
         # Create region directory (with parent folders, if needed)
@@ -912,6 +913,7 @@ def align_and_stitch(
                 ashlar.process_plates(
                     ome_tiff_files, stitched_directory, ashlar_filename_pattern,
                     flip_x, flip_y, ffp_paths, dfp_paths,
+                    0.0,                      # barrel_correction
                     aligner_args, mosaic_args,
                     pyramid, quiet
                 )
@@ -920,6 +922,7 @@ def align_and_stitch(
                 ashlar.process_single(
                     ome_tiff_files, mosaic_path_format,
                     flip_x, flip_y, ffp_paths, dfp_paths,
+                    0.0,                      # barrel_correction (use None or a path/config if you have one)
                     aligner_args, mosaic_args,
                     pyramid, quiet
                 )
