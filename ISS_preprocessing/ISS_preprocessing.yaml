@@ -21,3 +21,5 @@ dependencies:
       - ashlar
       - readlif
       - RedLionfishDeconv
+      # Install current project (non-editable)
+      - .
