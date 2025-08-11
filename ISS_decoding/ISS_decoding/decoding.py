@@ -278,7 +278,7 @@ def process_experiment(
     for region_directory in region_directories:
         
         region_name = region_directory.name
-        decoded_dir = region_directory / 'decoding' / ('decoded_dense' if dense else 'decoded') / (spot_detection_mode)
+        decoded_dir = region_directory / 'decoding' / ('2_decoded_dense' if dense else '2_decoded')
         decoded_dir.mkdir(parents=True, exist_ok=True)
 
         print("=" * 60)
@@ -286,7 +286,7 @@ def process_experiment(
         print(f"Output decoded directory: {decoded_dir}")
 
         # --- Step 4: Load SpaceTx experiment metadata ---
-        SpaceTX_dir = region_directory / 'decoding' / 'SpaceTX_format' 
+        SpaceTX_dir = region_directory / 'decoding' / '1_SpaceTX_format' 
         experiment = Experiment.from_json(str(SpaceTX_dir / 'experiment.json'))
         tiles = list(experiment.keys())
 

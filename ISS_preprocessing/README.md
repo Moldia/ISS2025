@@ -14,9 +14,9 @@ git pull --ff-only
 
 # 3) Create the conda environment from the YAML
 # (auto-installs the ISS_preprocessing package in non-editable mode)
-conda env create --name ISS_preprocessing --file ISS_preprocessing/ISS_preprocessing.yaml
+conda env create --name ISS_preprocessing --file ISS_preprocessing/ISS_preprocessing.yml
 # If the env already exists, update instead:
-# conda env update -n ISS_preprocessing -f ISS_preprocessing/ISS_preprocessing.yaml --prune
+# conda env update -n ISS_preprocessing -f ISS_preprocessing/ISS_preprocessing.yml --prune
 
 # 4) Activate the environment
 conda activate ISS_preprocessing

@@ -17,9 +17,9 @@ git pull --ff-only
 
 # 3) Create the conda environment from the decoding YAML
 # (auto-installs the ISS_decoding package in non-editable mode)
-conda env create -n ISS_decoding -f ISS_decoding/ISS_decoding.yaml
+conda env create -n ISS_decoding -f ISS_decoding/ISS_decoding.yml
 # If the env already exists, update instead:
-# conda env update -n ISS_decoding -f ISS_decoding/ISS_decoding.yaml --prune
+# conda env update -n ISS_decoding -f ISS_decoding/ISS_decoding.yml --prune
 
 # 4) Activate the environment
 conda activate ISS_decoding
