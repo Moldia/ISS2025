@@ -103,51 +103,47 @@ def ISS_pipeline(
     spotiflow_model=None,
     prob_threshold=None
 ):
- 
-    print('Loading image planes')
+     
+        print('Loading image planes')
     primary_image = tile.get_image(FieldOfView.PRIMARY_IMAGES)
     nuclei = tile.get_image('nuclei')
-
-    # --- STEP 1: Create registration reference (commented out) ---
-    # dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
-
-    # --- STEP 2: Registration (commented out) ---
-    # if register:
-    #     if register_dapi:
-    #         ref_round = 1 if dense else 0
-    #         nuclei_ref = nuclei.sel({Axes.ROUND: ref_round, Axes.CH: 0, Axes.ZPLANE: 0})
-    #         print(f'Registering images based on nuclei stain (ROUND={ref_round})')
-    #         learn_translation = LearnTransform.Translation(reference_stack=nuclei_ref, axes=Axes.ROUND, upsampling=1000)
-    #         transforms_list = learn_translation.run(nuclei)
-    #     else:
-    #         print('Creating reference images')
-    #         ref_for_reg = dots if dense else primary_image.reduce({Axes.CH, Axes.ZPLANE}, func="max")
-    #         print('Registering images')
-    #         learn_translation = LearnTransform.Translation(reference_stack=ref_for_reg, axes=Axes.ROUND, upsampling=100)
-    #         run_stack = primary_image.reduce({Axes.CH, Axes.ZPLANE}, func="max")
-    #         transforms_list = learn_translation.run(run_stack)
-    #
-    #     warp = ApplyTransform.Warp()
-    #     registered = warp.run(primary_image, transforms_list=transforms_list, in_place=False, verbose=True)
-    #
-    # --- STEP 3: Masking / Filtering (commented out) ---
-    #     filt = Filter.WhiteTophat(masking_radius, is_volume=False)
-    #     filtered = filt.run(registered, verbose=True, in_place=False)
-    # else:
-    #     print('Not registering images, applying filter to raw data')
-    #     filt = Filter.WhiteTophat(masking_radius, is_volume=False)
-    #     filtered = filt.run(primary_image, verbose=True, in_place=False)
-
-    # --- STEP 4: Channel normalization (commented out) ---
-    # print('Normalizing channel intensities')
-    # if channel_normalization == 'MH':
-    #     sbp = starfish.image.Filter.MatchHistograms({Axes.CH, Axes.ROUND})
-    # else:
-    #     sbp = starfish.image.Filter.ClipPercentileToZero(p_min=80, p_max=99.999, level_method=Levels.SCALE_BY_CHUNK)
-    # scaled = sbp.run(filtered, n_processes=1, in_place=False)
-
-    # --- For now, skip preprocessing and use raw primary_image ---
-    scaled = primary_image
+    
+    # --- STEP 1: Create registration reference ---
+    dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
+    
+    # --- STEP 2: Registration ---
+    if register:
+        if register_dapi:
+            ref_round = 1 if dense else 0
+            nuclei_ref = nuclei.sel({Axes.ROUND: ref_round, Axes.CH: 0, Axes.ZPLANE: 0})
+            print(f'Registering images based on nuclei stain (ROUND={ref_round})')
+            learn_translation = LearnTransform.Translation(reference_stack=nuclei_ref, axes=Axes.ROUND, upsampling=1000)
+            transforms_list = learn_translation.run(nuclei)
+        else:
+            print('Creating reference images')
+            ref_for_reg = dots if dense else primary_image.reduce({Axes.CH, Axes.ZPLANE}, func="max")
+            print('Registering images')
+            learn_translation = LearnTransform.Translation(reference_stack=ref_for_reg, axes=Axes.ROUND, upsampling=100)
+            run_stack = primary_image.reduce({Axes.CH, Axes.ZPLANE}, func="max")
+            transforms_list = learn_translation.run(run_stack)
+    
+        warp = ApplyTransform.Warp()
+        registered = warp.run(primary_image, transforms_list=transforms_list, in_place=False, verbose=True)
+    
+        # --- STEP 3: Masking / Filtering ---
+        filt = Filter.WhiteTophat(masking_radius, is_volume=False)
+        filtered = filt.run(registered, verbose=True, in_place=False)
+    else:
+        print('Not registering images, applying filter to raw data')
+        filt = Filter.WhiteTophat(masking_radius, is_volume=False)
+        filtered = filt.run(primary_image, verbose=True, in_place=False)
+    
+    # --- STEP 4: Channel normalization ---
+    print('Normalizing channel intensities')
+    if channel_normalization == 'MH':
+        sbp = starfish.image.Filter.MatchHistograms({Axes.CH, Axes.ROUND})
+    else:
+        sbp = starfish.image.Filter.ClipPercentileToZero(p_min=_
 
     # --- STEP 5: Spot detection ---
     min_sigma, max_sigma, num_sigma = sigma_vals
