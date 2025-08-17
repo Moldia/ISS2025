@@ -123,6 +123,14 @@ def make_spacetx_format(input_dir,
         # Create SpaceTx output directory for this region
         SpaceTX_dir = region_directory / "decoding" / "1_SpaceTX_format"
         SpaceTX_dir.mkdir(parents=True, exist_ok=True)
+
+        # ===== EARLY EXIT / MINIMAL WORK BRANCHING =====
+        experiment_json_path = SpaceTX_dir / "experiment.json"
+        codebook_json_path = SpaceTX_dir / "codebook.json"
+        
+        if experiment_json_path.exists() and codebook_json_path.exists():
+            print(f"[{region_name}] Skipping: experiment.json and codebook.json already exist.")
+            continue
         
         # Find all cycles for this region (Cycle1, Cycle2, ...)
         cycle_names = sorted([
