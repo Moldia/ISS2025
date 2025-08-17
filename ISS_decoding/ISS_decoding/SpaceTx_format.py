@@ -121,7 +121,7 @@ def make_spacetx_format(input_dir,
     for region_directory, region_name in zip(region_directories, region_names):
 
         # Create SpaceTx output directory for this region
-        SpaceTX_dir = region_directory / "decoding" / "SpaceTX_format"
+        SpaceTX_dir = region_directory / "decoding" / "1_SpaceTX_format"
         SpaceTX_dir.mkdir(parents=True, exist_ok=True)
         
         # Find all cycles for this region (Cycle1, Cycle2, ...)

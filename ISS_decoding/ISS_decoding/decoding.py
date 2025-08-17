@@ -104,7 +104,7 @@ def ISS_pipeline(
     prob_threshold=None
 ):
      
-        print('Loading image planes')
+    print('Loading image planes')
     primary_image = tile.get_image(FieldOfView.PRIMARY_IMAGES)
     nuclei = tile.get_image('nuclei')
     
@@ -141,10 +141,15 @@ def ISS_pipeline(
     # --- STEP 4: Channel normalization ---
     print('Normalizing channel intensities')
     if channel_normalization == 'MH':
-        sbp = starfish.image.Filter.MatchHistograms({Axes.CH, Axes.ROUND})
+        sbp = Filter.MatchHistograms({Axes.CH, Axes.ROUND})
     else:
-        sbp = starfish.image.Filter.ClipPercentileToZero(p_min=_
-
+        sbp = Filter.ClipPercentileToZero(
+            p_min=80,
+            p_max=99.999,
+            level_method=Levels.SCALE_BY_CHUNK
+        )
+    scaled = sbp.run(filtered, n_processes=1, in_place=False)
+    
     # --- STEP 5: Spot detection ---
     min_sigma, max_sigma, num_sigma = sigma_vals
     bd = FindSpots.BlobDetector(
@@ -282,8 +287,9 @@ def process_experiment(
         print(f"Output decoded directory: {decoded_dir}")
 
         # --- Step 4: Load SpaceTx experiment metadata ---
-        SpaceTX_dir = region_directory / 'decoding' / '1_SpaceTX_format' 
+        SpaceTX_dir = (region_directory / 'decoding' / '1_SpaceTX_format').resolve()
         experiment = Experiment.from_json(str(SpaceTX_dir / 'experiment.json'))
+
         tiles = list(experiment.keys())
 
         # --- Step 5: Find processed tiles ---
