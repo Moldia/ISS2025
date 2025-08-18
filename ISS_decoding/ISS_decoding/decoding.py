@@ -286,6 +286,14 @@ def process_experiment(
         print(f"\033[1mProcessing region {region_name}\033[0m")
         print(f"Output decoded directory: {decoded_dir}")
 
+        # ===== EARLY EXIT CHECK =====
+        final_csv = decoded_dir / f"{region_name}_decoded.csv"
+        if final_csv.exists():
+            print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
+            print(f"  ✔ {final_csv}")
+            continue
+
+
         # --- Step 4: Load SpaceTx experiment metadata ---
         SpaceTX_dir = (region_directory / 'decoding' / '1_SpaceTX_format').resolve()
         experiment = Experiment.from_json(str(SpaceTX_dir / 'experiment.json'))
@@ -302,6 +310,8 @@ def process_experiment(
 
         # --- Step 6: Decode each unprocessed tile ---
         for tile_id in not_done:
+
+                            
             tile = experiment[tile_id]
             print(f"\033[1;90mProcessing tile {tile_id[-3:]} \033[0m")
             df = ISS_pipeline(

@@ -130,8 +130,10 @@ def make_spacetx_format(input_dir,
         
         if experiment_json_path.exists() and codebook_json_path.exists():
             print(f"[{region_name}] Skipping: experiment.json and codebook.json already exist.")
+            print(f"  ✔ {experiment_json_path}")
+            print(f"  ✔ {codebook_json_path}")
             continue
-        
+                
         # Find all cycles for this region (Cycle1, Cycle2, ...)
         cycle_names = sorted([
             c.name for c in (region_directory / "preprocessing").glob("Cycle*")
