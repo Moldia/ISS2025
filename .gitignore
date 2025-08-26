@@ -25,7 +25,9 @@ dist/
 ISS_preprocessing/build/
 ISS_preprocessing/*.egg-info/
 ISS_decoding/build/
-ISS_decoding/ISS_decoding.egg-info/
+ISS_decoding/*.egg-info/
+ISS_postprocessing/build/
+ISS_postprocessing/*.egg-info/
 
 # Python environment directories
 env/
