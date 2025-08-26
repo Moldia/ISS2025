@@ -78,6 +78,7 @@ def preprocess_inputs(input_dir, region, segmentation_method, scRNAseq,
     labels = coo.toarray().astype(np.int32)  # dense labels
     iss_spots = pd.read_csv(spots_file)    # decoded ISS spots
 
+    print('iss_spots')
     iss_spots
 
     print(f"Loaded segmentation mask: {coo_file}")
