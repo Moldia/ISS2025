@@ -93,13 +93,13 @@ def preprocess_inputs(input_dir, region, segmentation_method, scRNAseq,
 
     # --- 3. Select overlapping gene set between ISS and scRNAseq ---
     ISS_genes = list(processed_spots['Gene'].unique())
-    scseq_genes = list(scRNAseq.index)
+    scseq_genes = list(scRNAseq.columns)
 
     overlap = list(set(scseq_genes).intersection(ISS_genes))
     print(f"Found {len(overlap)} overlapping genes.")
 
     # --- 4. Filter both datasets to only shared genes ---
-    scrnaseq_clean = scRNAseq.loc[overlap, :]
+    scrnaseq_clean = scRNAseq[overlap]   # select overlapping columns
     processed_spots_clean = processed_spots[processed_spots['Gene'].isin(overlap)]
 
     print(f"scrnaseq_clean shape: {scrnaseq_clean.shape}")
