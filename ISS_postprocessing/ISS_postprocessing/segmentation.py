@@ -42,6 +42,8 @@ from skimage.segmentation import expand_labels
 
 from tifffile import imread, imwrite
 
+from cellpose import models
+
 
 # ========= StarDist segmentation (quiet, GPU-enabled) =========
 def stardist_segmentation(

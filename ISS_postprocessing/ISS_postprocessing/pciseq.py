@@ -64,6 +64,7 @@ def preprocess_inputs(input_dir, region, segmentation_method, scRNAseq,
                       dense=True, quality_threshold=0.5, conversion_factor=1.0, plot=True):
     """
     Preprocess ISS spots and segmentation mask for PCIseq analysis.
+    Ensures scRNAseq matrix is in the correct orientation (genes x clusters).
     """
 
     # --- Build input paths ---
@@ -78,9 +79,6 @@ def preprocess_inputs(input_dir, region, segmentation_method, scRNAseq,
     labels = coo.toarray().astype(np.int32)  # dense labels
     iss_spots = pd.read_csv(spots_file)    # decoded ISS spots
 
-    print('iss_spots')
-    iss_spots
-
     print(f"Loaded segmentation mask: {coo_file}")
     print(f" - Shape: {labels.shape}, {labels.max()} cells")
     print(f"Loaded spots file: {spots_file}")
@@ -92,21 +90,28 @@ def preprocess_inputs(input_dir, region, segmentation_method, scRNAseq,
     # --- 2. Convert coordinates to pixel units ---
     processed_spots = preprocess_spots(spots_filt, conversion_factor=conversion_factor)
 
-    # --- 3. Select overlapping gene set between ISS and scRNAseq ---
+    # --- 3. Ensure scRNAseq orientation (genes x clusters) ---
+    if scRNAseq.columns[0] not in processed_spots['Gene'].values:
+        print("Detected scRNAseq genes in columns, transposing...")
+        scRNAseq = scRNAseq.T
+
+    # --- 4. Select overlapping gene set ---
     ISS_genes = list(processed_spots['Gene'].unique())
-    scseq_genes = list(scRNAseq.columns)
+    scseq_genes = list(scRNAseq.index)
 
-    overlap = list(set(scseq_genes).intersection(ISS_genes))
+    overlap = sorted(set(scseq_genes).intersection(ISS_genes))
     print(f"Found {len(overlap)} overlapping genes.")
+    if len(overlap) > 0:
+        print("Example overlap genes:", overlap[:10])
 
-    # --- 4. Filter both datasets to only shared genes ---
-    scrnaseq_clean = scRNAseq[overlap]   # select overlapping columns
+    # --- 5. Filter both datasets to only shared genes ---
+    scrnaseq_clean = scRNAseq.loc[overlap, :]
     processed_spots_clean = processed_spots[processed_spots['Gene'].isin(overlap)]
 
     print(f"scrnaseq_clean shape: {scrnaseq_clean.shape}")
     print(f"processed_spots_clean shape: {processed_spots_clean.shape}")
 
-    # --- 5. Optional sanity plot ---
+    # --- 6. Optional sanity plot ---
     if plot:
         plt.figure(figsize=(6, 6))
         plt.imshow(labels, cmap="gray", alpha=0.6)
@@ -116,7 +121,6 @@ def preprocess_inputs(input_dir, region, segmentation_method, scRNAseq,
         plt.show()
 
     return coo, processed_spots_clean, scrnaseq_clean
-
 
 
 def get_most_probable_call_pciseq(cellData: pd.DataFrame) -> pd.DataFrame:
