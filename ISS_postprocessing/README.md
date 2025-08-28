@@ -9,7 +9,7 @@ cd ISS2025
 
 # 2) Make sure you're on the main branch and up to date
 git fetch origin
-git checkout main        
+git checkout main # git checkout saga-updates       
 git pull --ff-only       
 
 # 3) Create the conda environment from the postprocessing YML
