@@ -6,7 +6,7 @@ dependencies:
   - python=3.10
   - pip
   # Core scientific stack
-  - numpy=1.26
+  - numpy<2
   - scipy
   - pandas
   - matplotlib
