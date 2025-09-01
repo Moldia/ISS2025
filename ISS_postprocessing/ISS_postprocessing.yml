@@ -4,32 +4,37 @@ channels:
   - nvidia
 dependencies:
   - python=3.11
+  - pip
+  # GPU + core deps
   - cudatoolkit=11.8
   - cudnn=8.9
-  - pip
+  # scientific python stack (conda-forge builds are safer/faster)
+  - numpy=1.26
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scikit-image
+  - tifffile
+  - jupyter
+  - ipykernel
+  # spatial & clustering
+  - scanpy
+  - squidpy
+  - anndata
+  - python-igraph        # required for Leiden clustering
+  # (optional, keeps deps consistent in conda)
+  - pytorch              # installs torch GPU via conda-forge/pytorch channel
+  - tensorflow=2.15      # last TF version working with CUDA 11.x
+  # install the rest via pip (pure python / niche ISS tools)
   - pip:
-      - numpy<2
-      - scipy
-      - pandas
-      - matplotlib
-      - seaborn
-      - scikit-learn
-      - scikit-image
-      - tifffile
-      - scanpy
-      - squidpy
-      - anndata
       - pciseq
       - tangram-sc
       - stardist
       - cellpose
-      - torch
-      - tensorflow==2.15
       - opencv-python
       - imageio
       - diplib
       - matplotlib-scalebar
-      - jupyter
-      - ipykernel
-      # Install current project (non-editable)
-      - .
+      - -e .              # your own package in editable mode

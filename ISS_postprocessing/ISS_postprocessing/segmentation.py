@@ -42,7 +42,6 @@ from skimage.segmentation import expand_labels
 
 from tifffile import imread, imwrite
 
-from cellpose import models
 
 
 # ========= StarDist segmentation (quiet, GPU-enabled) =========
@@ -122,6 +121,7 @@ def cell_pose_segmentation_to_coo(
     Segment nuclei from a DAPI-stained image using Cellpose, refine with watershed,
     expand labels, and save outputs in {input_dir}/{region}/postprocessing/segmentation.
     """
+    from cellpose import models
 
     print(f"\n\033[1mProcessing region: {region}\033[0m")
 
@@ -309,3 +309,114 @@ def plot_segmentation_mask_colored(
         plt.rcParams["svg.fonttype"] = "none"
         plt.savefig(str(output_file), dpi=600)
         plt.show()
+
+
+"""
+Segmentation overlay and contour mask extraction for ISS_postprocessing.
+
+Loads sparse Stardist/Cellpose masks, overlays on raw image,
+and extracts contour masks for QC/visualization.
+"""
+import matplotlib.pyplot as plt
+from scipy.sparse import coo_matrix
+from skimage.io import imread
+from tifffile import imwrite
+from skimage.segmentation import mark_boundaries, find_boundaries
+from skimage.morphology import binary_dilation, disk
+
+
+
+def load_sparse_mask(mask_file: Path) -> np.ndarray:
+    """Load sparse mask stored as .npz into dense label image."""
+    data = np.load(mask_file)
+    row, col, vals, shape = data["row"], data["col"], data["data"], data["shape"]
+    mask_sparse = coo_matrix((vals, (row, col)), shape=shape)
+    labels = mask_sparse.toarray().astype(np.int32)
+    print(f"Loaded segmentation mask from: {mask_file}")
+    print(f" - Shape: {labels.shape}")
+    print(f" - Unique labels: {len(np.unique(labels))}")
+    return labels
+
+
+def load_dapi_image(input_dir: Path, region: str, DAPI_ch: int) -> np.ndarray:
+    """Load DAPI / fluorescence image for a region."""
+    DAPI_file = Path(input_dir) / region / "preprocessing" / "Cycle1" / "3_stitched" / f"Cycle1_ch{int(DAPI_ch)}.tif"
+    image_wh = imread(DAPI_file)
+    print("Loaded image:", DAPI_file)
+    print("Shape:", image_wh.shape, "dtype:", image_wh.dtype)
+    return image_wh
+
+
+def plot_segmentation_overlay(
+    image, labels,
+    crop_coords=None,
+    brightness_factor=4,
+    figsize=(8, 8), dpi=300,
+    title="Segmentation Overlay (Brightened)"
+):
+    """Overlay segmentation labels on an image."""
+    # Crop if requested
+    if crop_coords:
+        y_start, y_end, x_start, x_end = crop_coords
+        if y_end > image.shape[0] or x_end > image.shape[1]:
+            print(f"Crop larger than image. Showing full image instead.")
+        else:
+            image = image[y_start:y_end, x_start:x_end]
+            labels = labels[y_start:y_end, x_start:x_end]
+            print(f"Cropped image shape: {image.shape}")
+    else:
+        print(f"Using full image, shape: {image.shape}")
+
+    # Normalize and brighten
+    image_min, image_max = image.min(), image.max()
+    image_range = image_max - image_min if image_max > image_min else 1
+    image_norm = (image - image_min) / image_range
+    image_bright = np.clip(image_norm * brightness_factor, 0, 1)
+
+    # Overlay boundaries
+    overlay = mark_boundaries(
+        image_bright, labels,
+        color=(1, 1, 0),
+        mode="outer",
+        background_label=0
+    )
+
+    # Plot
+    plt.figure(figsize=figsize, dpi=dpi)
+    plt.imshow(overlay)
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+
+def extract_contour_mask(labels: np.ndarray, thickness: int = 2) -> np.ndarray:
+    """Extract a contour mask from label image."""
+    contour = find_boundaries(labels, mode="outer")
+    thick_contour = binary_dilation(contour, footprint=disk(thickness))
+    contour_image = (thick_contour.astype(np.uint8)) * 255
+    return contour_image
+
+
+def save_contour_mask(segmentation_dir: Path, region: str, segmentation_method: str, contour_image: np.ndarray):
+    """Save contour mask as TIFF."""
+    out_path = segmentation_dir / f"{region}_{segmentation_method}_contour_mask.tif"
+    imwrite(out_path, contour_image.astype(np.uint8))
+    print(f"Contour mask saved to: {out_path}")
+    return out_path
+
+
+# --- Example main function for running end-to-end ---
+def inspect_and_work_with_segmentation(input_dir: str, region: str, segmentation_method: str, DAPI_ch: int = 4, crop_coords=None):
+    segmentation_dir = Path(input_dir) / region / "postprocessing" / "segmentation"
+    mask_file = segmentation_dir / f"{region}_{segmentation_method}_expanded.npz"
+
+    labels = load_sparse_mask(mask_file)
+    image_wh = load_dapi_image(input_dir, region, DAPI_ch)
+
+    plot_segmentation_overlay(image_wh, labels, crop_coords=crop_coords)
+
+    contour_image = extract_contour_mask(labels, thickness=3)
+    save_contour_mask(segmentation_dir, region, segmentation_method, contour_image)
+
+
+
