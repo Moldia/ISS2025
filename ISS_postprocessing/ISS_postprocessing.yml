@@ -4,37 +4,32 @@ channels:
   - nvidia
 dependencies:
   - python=3.11
+  - cudatoolkit=11.8        # CUDA runtime (for GPU support)
+  - cudnn=8.9               # cuDNN runtime (for GPU support)
   - pip
-  # GPU + core deps
-  - cudatoolkit=11.8
-  - cudnn=8.9
-  # scientific python stack (stable builds from conda-forge)
-  - numpy=1.26
-  - scipy
-  - pandas
-  - matplotlib
-  - seaborn
-  - scikit-learn
-  - scikit-image
-  - tifffile
-  - jupyter
-  - ipykernel
-  # spatial & clustering
-  - scanpy
-  - squidpy
-  - anndata
-  - python-igraph        # required for Leiden clustering
-  # deep learning frameworks (CUDA 11.x compatible)
-  - pytorch              # from conda-forge/nvidia
-  - tensorflow=2.15
-  # pip-only packages (pure Python / niche ISS tools)
   - pip:
-      - pciseq
-      - tangram-sc
+      - "numpy<2"           # StarDist & TF2.15 not yet compatible with NumPy 2.x
+      - scanpy
+      - squidpy
+      - anndata
+      - python-igraph       # needed for Leiden clustering in Scanpy
+      - torch
+      - "tensorflow==2.15"  # last TF release for CUDA 11.x
       - stardist
       - cellpose
+      - pciseq
+      - tangram-sc
+      - scikit-image
+      - tifffile
+      - matplotlib
+      - seaborn
+      - pandas
+      - scipy
+      - scikit-learn
       - opencv-python
       - imageio
       - diplib
       - matplotlib-scalebar
-      - . # package in non-editable mode
+      - jupyter
+      - ipykernel
+      - .                   # install your own package (non-editable)
