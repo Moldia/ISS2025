@@ -8,7 +8,7 @@ dependencies:
   # GPU + core deps
   - cudatoolkit=11.8
   - cudnn=8.9
-  # scientific python stack (conda-forge builds are safer/faster)
+  # scientific python stack (stable builds from conda-forge)
   - numpy=1.26
   - scipy
   - pandas
@@ -24,10 +24,10 @@ dependencies:
   - squidpy
   - anndata
   - python-igraph        # required for Leiden clustering
-  # (optional, keeps deps consistent in conda)
-  - pytorch              # installs torch GPU via conda-forge/pytorch channel
-  - tensorflow=2.15      # last TF version working with CUDA 11.x
-  # install the rest via pip (pure python / niche ISS tools)
+  # deep learning frameworks (CUDA 11.x compatible)
+  - pytorch              # from conda-forge/nvidia
+  - tensorflow=2.15
+  # pip-only packages (pure Python / niche ISS tools)
   - pip:
       - pciseq
       - tangram-sc
@@ -37,4 +37,4 @@ dependencies:
       - imageio
       - diplib
       - matplotlib-scalebar
-      - - .              # package in non-editable mode
+      - . # package in non-editable mode
