@@ -37,4 +37,4 @@ dependencies:
       - imageio
       - diplib
       - matplotlib-scalebar
-      - -e .              # your own package in editable mode
+      - - .              # package in non-editable mode
