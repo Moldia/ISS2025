@@ -14,9 +14,9 @@ git pull --ff-only
 
 # 3) Create the conda environment from the postprocessing YML
 # (auto-installs the ISS_postprocessing package in non-editable mode)
-conda env create -n ISS_postprocessing -f ISS_postprocessing/ISS_postprocessing.yml
+conda env create --name ISS_postprocessing --file ISS_postprocessing/ISS_postprocessing.yml
 # If the env already exists, update instead:
-# conda env update -n ISS_postprocessing -f ISS_postprocessing/ISS_postprocessing.yml --prune
+# conda env update --name ISS_postprocessing --file ISS_postprocessing/ISS_postprocessing.yml --prune
 
 # 4) Activate the environment
 conda activate ISS_postprocessing
