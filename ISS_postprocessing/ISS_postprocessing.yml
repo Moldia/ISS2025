@@ -6,7 +6,7 @@ dependencies:
   - python=3.10
   - pip
   # Core scientific stack
-  - numpy<2
+  - numpy=1.26        # avoids NumPy 2.x breakage
   - scipy
   - pandas
   - matplotlib
@@ -29,6 +29,7 @@ dependencies:
   - pyzmq               # avoid "No module named 'zmq'" error
   # Pip-only tools
   - pip:
+      - numpy==1.26     # avoids NumPy 2.x breakage
       - pciseq
       - tangram-sc
       - stardist
