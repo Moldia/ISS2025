@@ -75,9 +75,10 @@ class ISS2DAuxTileFetcher(TileFetcher):
 
     # Returns an ISSTile2D object for a given tile, cycle, and z-plane (fixed nuclei channel)
     def get_tile(self, tile: int, c: int, ch: int, z: int) -> FetchedTile:
+        nuclei_ch = self.nuclei_channel -1 # change to 0-indexed
         cycle = self.cycle_names[c]
         path = self.region_directory / "preprocessing" / cycle / "4_retiled"
-        file_path = path / f"{cycle}_s{tile}_ch{self.nuclei_channel}.tif"
+        file_path = path / f"{cycle}_s{tile}_ch{nuclei_ch}.tif"
         #print(f"Fetching aux tile: {file_path}")
         return ISSTile2D(file_path, tile, self.tilexy[cycle], self.tile_dims, self.pixelscale)
 
@@ -88,7 +89,7 @@ def make_spacetx_format(input_dir,
                         pixelscale=0.1625,
                         channels=["DAPI", "Cy3", "Cy5", "AF750", "AF488"],
                         DO_decorators=["AF750", "Cy5", "Cy3", "AF488"],
-                        nuclei_channel=1):
+                        nuclei_channel="DAPI"):
     """
     Prepare a SpaceTx-format experiment directory, tile fetchers, and codebook for ISS/starfish analysis.
     
@@ -111,7 +112,9 @@ def make_spacetx_format(input_dir,
     print(f"Processing directory: {input_dir}")
 
     codebook_csv = Path(codebook_csv)
-    print('Codebook: ', codebook_csv)  
+    print('Codebook: ', codebook_csv) 
+
+    nuclei_channel = channels.index("DAPI") + 1 # 1-indexed
 
     # --- Step 1: Find all region directories matching R\d+ ---
     region_pattern = re.compile(r'^R\d+$')

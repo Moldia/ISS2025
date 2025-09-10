@@ -87,13 +87,14 @@ def deconvolve_image(input_image, psf_image, output_image, iterations, tilesize=
 # -------------------------------------------------------------------------------------
 # MAIN FUNCTION FOR LEICA PREPROCESSING
 # -------------------------------------------------------------------------------------
-def preprocessing_main_leica(input_dir,
+def preprocessing_main_leica(input_dirs,
+                            cycles,
                             output_dir_prefix,
-                            cycle,
                             mode,
                             deconvolution_method=None,
                             PSF_metadata=None, 
                             align_channel=4, 
+                            n_total_cycles=5,
                             mip=True,
                             tile_dimension=6000,  
                             chunk_size=None):
@@ -165,12 +166,12 @@ def preprocessing_main_leica(input_dir,
 
     if deconvolution_method is not None and PSF_metadata is None:
         raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
- 
+
     # DECONVOLUTION
     region_directories = deconvolve_leica(
-                            input_dir=input_dir,
+                            input_dirs=input_dirs,
+                            cycles=cycles,
                             output_dir_prefix=output_dir_prefix, 
-                            cycle=cycle,
                             mode=mode,
                             deconvolution_method=deconvolution_method,
                             PSF_metadata=PSF_metadata, 
@@ -180,16 +181,17 @@ def preprocessing_main_leica(input_dir,
     # OME TIFFS
     mipped_to_OME_tiffs(
         region_directories=region_directories, 
-        cycle=cycle)
+        cycles=cycles)
 
     # Align and stitch images
     align_and_stitch(region_directories=region_directories, 
-                   cycle=cycle,
+                   cycles=cycles,
+                   n_total_cycles=n_total_cycles,
                    align_channel=align_channel)
 
     # retile stitched images
     retile_stitched_images(region_directories=region_directories, 
-                    cycle=cycle, 
+                    cycles=cycles, 
                     tile_dimension=tile_dimension) 
 
 
@@ -203,9 +205,9 @@ def preprocessing_main_leica(input_dir,
    
 
 def deconvolve_leica(
-    input_dir: Path, 
+    input_dirs, 
+    cycles ,
     output_dir_prefix: Path,
-    cycle: int,
     mode: str,
     deconvolution_method: Optional[str] = None,
     PSF_metadata: Optional[dict] = None, 
@@ -227,6 +229,7 @@ def deconvolve_leica(
     Returns:
         List of directories for each region. Saves output images and metadata files to disk.
     """ 
+    print(f"\033[1;96mDeconvolution and mipping\033[0m")
     
     valid_modes = {'tif_autosaved', 'tif_exported', 'lif'}
     if mode not in valid_modes:
@@ -236,442 +239,443 @@ def deconvolve_leica(
     if deconvolution_method not in valid_methods:
         raise ValueError(f"Unsupported deconvolution method: {deconvolution_method}. Choose from {valid_methods - {None}} or None.")
 
-    width = 80
-  
-    print("=" * width + "\033[0m")
-    print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
-    print('Processing directory: ', input_dir)  
-    print(f"Mode: {mode}".ljust(width))
-    print(f"Deconvolution method: {deconvolution_method}".ljust(width))
+    for cycle, input_dir in zip(cycles, input_dirs):
 
-    if deconvolution_method is not None and PSF_metadata is None:
-        raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
+        width = 80
+      
+        print("=" * width + "\033[0m")
+        print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
+        print('Processing directory: ', input_dir)  
+        print(f"Mode: {mode}".ljust(width))
+        print(f"Deconvolution method: {deconvolution_method}".ljust(width))
     
-    input_dir = Path(input_dir)
-    output_dir_prefix = Path(output_dir_prefix)  
-
-    # STEP 1: Detect regions to process
-    
-    # --- Processing Leica .tif files ---
-    if mode == 'tif_exported':
-        tif_files = [
-            f.name
-            for f in input_dir.iterdir()
-            if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
-        ]
-        # Use underscore split
-        region_names = set()
-        for f in tif_files:
-            base = f.rsplit('.', 1)[0]
-            chunks = base.split('_')
-            region_name = chunks[0]
-            region_names.add(region_name)
-        regions = sorted(region_names)
-        num_regions = len(regions)
-    
-    elif mode == 'tif_autosaved':
-        tif_files = [
-            f.name
-            for f in input_dir.iterdir()
-            if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
-        ]
-        # Use double-dash split
-        region_names = set()
-        for f in tif_files:
-            base = f.rsplit('.', 1)[0]
-            chunks = base.split('--')
-            region_name = chunks[0]
-            region_names.add(region_name)
-        regions = sorted(region_names)
-        num_regions = len(regions)
-    
-    # --- Processing Leica .lif files ---
-    elif mode == 'lif':
-        lif_files = [f for f in input_dir.iterdir() if f.suffix == '.lif']
-        num_files = len(lif_files)
-
-        image_names = []   # To store names of images inside .lif files
+        if deconvolution_method is not None and PSF_metadata is None:
+            raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
         
-        if num_files > 1:
-            # Case: one file per region
-            num_regions = num_files                           # one file for each region
-            for file in lif_files:
-                lif_file = LifFile(file)
-                image_dict = lif_file.image_list[0]           # Each .lif has one image per region
-                image_names.append(image_dict['name'])    
+        input_dir = Path(input_dir)
+        output_dir_prefix = Path(output_dir_prefix)  
+    
+        # STEP 1: Detect regions to process
         
-        elif num_files == 1:
-            # Case: one .lif file containing multiple regions
-            lif_file = LifFile(lif_files[0])
-            num_regions = len(lif_file.image_list)            # number of images = number of regions
-            for image_dict in lif_file.image_list:
-                image_names.append(image_dict['name'])
-
-        # Use unique image names directly as region names 
-        regions = sorted(set(image_names))
-    # rename regions    
-    region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
-
-    print("Regions to be processed:", regions) 
-    print("=" * width + "\033[0m")
-
-    region_directories = []  # To collect all processed region directories
-
-    print(f"\033[1;96mDeconvolution and mipping\033[0m")
-    # Process each region
-    for region_index, region in enumerate(regions):
-        print(f"\033[1;90mProcessing R{region_numbers[region_index]}\033[0m")
-
-        # Define output directory for this region, always append "R{region_number}" to distinguish them
-        region_directory = output_dir_prefix / f"R{region_numbers[region_index]}"
-
-        region_directories.append(str(region_directory))
-        # Create region directory (with parent folders, if needed)
-        region_directory.mkdir(parents=True, exist_ok=True)
-
-        # Create cycle directory inside region directory: "preprocessing/Cycle{cycle}"
-        cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
-        cycle_directory.mkdir(parents=True, exist_ok=True)  
-    
-        # Create directory to store MIP (Maximum Intensity Projection) images
-        mipped_directory = cycle_directory / '1_mipped'
-        mipped_directory.mkdir(exist_ok=True)
-
-        # Prepare directory to store stacked images
-        stacked_directory = cycle_directory / '1_stacked'
-    
-        # Create directory to store metadata files
-        metadata_directory = cycle_directory / 'MetaData'
-        metadata_directory.mkdir(exist_ok=True)
-    
-        # ----- Step 1: Prepare file lists based on mode -----
-        if mode in ('tif_autosaved', 'tif_exported'):
-            # List all .tif files in input_dir (skip ".txt" and "dw" files)
+        # --- Processing Leica .tif files ---
+        if mode == 'tif_exported':
             tif_files = [
-                f for f in input_dir.iterdir() 
-                if f.suffix == '.tif' and 'dw' not in f.name and not f.name.endswith('.txt')
+                f.name
+                for f in input_dir.iterdir()
+                if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
             ]
-            # Filter only files for the current region
-            filtered_tifs = [f for f in tif_files if region in f.name]
-
-            # --- Find all channels from filenames ---
-            channel_set = set()
-            if mode == 'tif_autosaved':
-                channel_pattern = re.compile(r'--C(\d{2})')
-            elif mode == 'tif_exported':
-                channel_pattern = re.compile(r'_ch(\d+)')
-            for f in filtered_tifs:
-                if (m := channel_pattern.search(f.name)):
-                    channel_set.add(int(m.group(1)))
-            channels = sorted(channel_set)
-            print(f"Detected channels: {channels}")
-
-    
-            # Select regex pattern and sample indicator depending on mode
-            if mode == 'tif_autosaved':
-                tile_pattern = re.compile(r'--Stage(\d+)--')    # tile number in "--StageXX--"
-                sample_indicator = '--Stage00--'
-            elif mode == 'tif_exported':
-                tile_pattern = re.compile(r'_s(\d+)_')          # tile number in "_sX_"
-                sample_indicator = '_s0_'
-    
-            # Extract tile numbers and collect sample tile files
-            tiles = set()      # unique tile numbers
-            sample_tiles = []  # files belonging to tile 0 (used to calculate size_z)
-            
-            for f in filtered_tifs:
-                if (m := tile_pattern.search(f.name)):
-                    tiles.add(m.group(1))
-                if sample_indicator in f.name:
-                    sample_tiles.append(f)
-    
-            # Sort tile list and compute total number of tiles
-            tiles = sorted(tiles, key=int)
-            n_tiles = len(tiles)
-            # Infer Z-size from number of sample_tile files divided by number of channels
-            size_z = int(len(sample_tiles) / len(channels))
-            # Infer image dimensions (X, Y) from the first sample tile
-            sample_tile = tifffile.imread(sample_tiles[0])
-            image_dimensions = sample_tile.shape[::-1]  # (width, height)
-    
-            # --- Pre-index files by tile and channel to speed up lookups ---
-            tile_to_files = {}
-            for tile in tiles:
-                if mode == 'tif_autosaved':
-                    tile_files = [f for f in filtered_tifs if f"--Stage{tile}--" in str(f)]
-                else:
-                    tile_files = [f for f in filtered_tifs if f"_s{tile}_" in str(f)]
-                tile_to_files[tile] = tile_files
-    
-            tile_channel_files = {}
-            for tile, files_in_tile in tile_to_files.items():
-                for channel in channels:
-    
-                    if mode == 'tif_autosaved':
-                        pattern = f"--C{str(channel).zfill(2)}"
-                    else:
-                        pattern = f"_ch{channel}"
-                    channel_files = [f for f in files_in_tile if pattern in f.name]
-                    tile_channel_files[(tile, channel)] = channel_files
-    
+            # Use underscore split
+            region_names = set()
+            for f in tif_files:
+                base = f.rsplit('.', 1)[0]
+                chunks = base.split('_')
+                region_name = chunks[0]
+                region_names.add(region_name)
+            regions = sorted(region_names)
+            num_regions = len(regions)
+        
+        elif mode == 'tif_autosaved':
+            tif_files = [
+                f.name
+                for f in input_dir.iterdir()
+                if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
+            ]
+            # Use double-dash split
+            region_names = set()
+            for f in tif_files:
+                base = f.rsplit('.', 1)[0]
+                chunks = base.split('--')
+                region_name = chunks[0]
+                region_names.add(region_name)
+            regions = sorted(region_names)
+            num_regions = len(regions)
+        
+        # --- Processing Leica .lif files ---
         elif mode == 'lif':
-            # List all .lif files in input_dir
             lif_files = [f for f in input_dir.iterdir() if f.suffix == '.lif']
             num_files = len(lif_files)
+    
+            image_names = []   # To store names of images inside .lif files
             
             if num_files > 1:
-                # Case: multiple .lif files → one file per region
-                filepath = lif_files[region_index]
-                file = LifFile(filepath)
-                image_dict = file.image_list[0]  # always take first image from multi-file set
-                image_name = image_dict['name']
-                image = file.get_image(0)
+                # Case: one file per region
+                num_regions = num_files                           # one file for each region
+                for file in lif_files:
+                    lif_file = LifFile(file)
+                    image_dict = lif_file.image_list[0]           # Each .lif has one image per region
+                    image_names.append(image_dict['name'])    
+            
             elif num_files == 1:
-                # Case: single .lif file → contains multiple regions
-                filepath = lif_files[0]
-                file = LifFile(filepath)
-                image_dict = file.image_list[region_index]  # select image by region_index if single file
-                image_name = image_dict['name']
-                image = file.get_image(region_index)
-        
-            print(f"Image name: {image_name}")
-            # Replace "/" with "_" in image name (prevent file system issues)
-            image_name = image_name.replace('/', '_')
+                # Case: one .lif file containing multiple regions
+                lif_file = LifFile(lif_files[0])
+                num_regions = len(lif_file.image_list)            # number of images = number of regions
+                for image_dict in lif_file.image_list:
+                    image_names.append(image_dict['name'])
     
-            dims = image_dict['dims']                        # Extract dimensions
-            image_dimensions = (dims.x, dims.y)  # (width, height)
-            size_z = dims.z                                  # number of Z slices
-            n_tiles = dims.m                                 # number of mosaic tiles (if any)
-            tiles = list(range(n_tiles))                     # tile indices 0..n_tiles-1
-            mosaic = image_dict.get('mosaic_position', None) # Get mosaic positions
-            num_channels = image_dict['channels']
-            channels = list(range(num_channels))  # [0, 1, 2, 3, 4, 5]
-
-
-        # Check what files are expected to exist
-        expected_files = [
-            (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
-            for tile in tiles
-            for channel in channels
-        ]
-        
-        print(f"Expected number of output files in {mipped_directory if mip else stacked_directory}: {len(expected_files)} ({len(tiles)} tiles × {len(channels)} channels)")
-        
-        # Identify which files are missing
-        missing_files = [f for f in expected_files if not f.exists()]
-        
-        if not missing_files:
-            print(f"All expected files for Cycle {cycle} already exist in {mipped_directory if mip else stacked_directory} directory. Skipping processing.")
-            continue
-        
-        # Extract unique tile numbers from missing file names
-        missing_tiles = sorted(set(
-            match.group(1)
-            for f in missing_files
-            if (match := re.search(r'_s(\d+)_ch', f.name))
-        ))
-        
-        # Update the tiles list to only those with missing outputs
-        tiles = missing_tiles
-        
-        print(f"{len(tiles)} tile(s) have missing outputs. Proceeding with processing only these.")
-
-        
+            # Use unique image names directly as region names 
+            regions = sorted(set(image_names))
+        # rename regions    
+        region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
     
-        # ----- Step 2: Copy metadata if available -----
-        print('Extracting metadata')
+        print("Regions to be processed:", regions) 
+        print("=" * width + "\033[0m")
+    
+        region_directories = []  # To collect all processed region directories
+    
+        # Process each region
+        for region_index, region in enumerate(regions):
+            print(f"\033[1;90mProcessing R{region_numbers[region_index]}\033[0m")
+    
+            # Define output directory for this region, always append "R{region_number}" to distinguish them
+            region_directory = output_dir_prefix / f"R{region_numbers[region_index]}"
+    
+            region_directories.append(str(region_directory))
+            # Create region directory (with parent folders, if needed)
+            region_directory.mkdir(parents=True, exist_ok=True)
+    
+            # Create cycle directory inside region directory: "preprocessing/Cycle{cycle}"
+            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
+            cycle_directory.mkdir(parents=True, exist_ok=True)  
         
-        if mode in ('tif_autosaved', 'tif_exported'):
-            # Look for Metadata subdirectory inside the input directory
-            input_metadata_dir = input_dir / 'Metadata'
-            
-            if input_metadata_dir.exists():
-                # Find metadata files matching the current region
-                metadata_files = [f for f in input_metadata_dir.iterdir() if region in f.name]
+            # Create directory to store MIP (Maximum Intensity Projection) images
+            mipped_directory = cycle_directory / '1_mipped'
+            mipped_directory.mkdir(exist_ok=True)
+    
+            # Prepare directory to store stacked images
+            stacked_directory = cycle_directory / '1_stacked'
+        
+            # Create directory to store metadata files
+            metadata_directory = cycle_directory / 'MetaData'
+            metadata_directory.mkdir(exist_ok=True)
+        
+            # ----- Step 1: Prepare file lists based on mode -----
+            if mode in ('tif_autosaved', 'tif_exported'):
+                # List all .tif files in input_dir (skip ".txt" and "dw" files)
+                tif_files = [
+                    f for f in input_dir.iterdir() 
+                    if f.suffix == '.tif' and 'dw' not in f.name and not f.name.endswith('.txt')
+                ]
+                # Filter only files for the current region
+                filtered_tifs = [f for f in tif_files if region in f.name]
+    
+                # --- Find all channels from filenames ---
+                channel_set = set()
+                if mode == 'tif_autosaved':
+                    channel_pattern = re.compile(r'--C(\d{2})')
+                elif mode == 'tif_exported':
+                    channel_pattern = re.compile(r'_ch(\d+)')
+                for f in filtered_tifs:
+                    if (m := channel_pattern.search(f.name)):
+                        channel_set.add(int(m.group(1)))
+                channels = sorted(channel_set)
+                print(f"Detected channels: {channels}")
+    
+        
+                # Select regex pattern and sample indicator depending on mode
+                if mode == 'tif_autosaved':
+                    tile_pattern = re.compile(r'--Stage(\d+)--')    # tile number in "--StageXX--"
+                    sample_indicator = '--Stage00--'
+                elif mode == 'tif_exported':
+                    tile_pattern = re.compile(r'_s(\d+)_')          # tile number in "_sX_"
+                    sample_indicator = '_s0_'
+        
+                # Extract tile numbers and collect sample tile files
+                tiles = set()      # unique tile numbers
+                sample_tiles = []  # files belonging to tile 0 (used to calculate size_z)
                 
-                # Select the first metadata file that is NOT a 'properties' file
-                metadata_file = next((f for f in metadata_files if 'properties' not in f.name), None)
-                
-                # Copy the selected metadata file to the metadata output directory
-                if metadata_file:
-                    custom_copy(metadata_file, metadata_directory)
+                for f in filtered_tifs:
+                    if (m := tile_pattern.search(f.name)):
+                        tiles.add(m.group(1))
+                    if sample_indicator in f.name:
+                        sample_tiles.append(f)
         
-        elif mode == 'lif' and mosaic is not None:
-            # If in LIF mode and mosaic info is available, generate XML metadata
-            
-            # Build XML structure: <Data> -> <Image> -> <Attachment> -> multiple <Tile> elements
-            data = ET.Element("Data")
-            image_elem = ET.SubElement(data, "Image", TextDescription="")
-            
-            attachment = ET.SubElement(
-                image_elem, 
-                "Attachment", 
-                Name="TileScanInfo", 
-                Application="LAS AF", 
-                FlipX="0", 
-                FlipY="0", 
-                SwapXY="0"
-            )
+                # Sort tile list and compute total number of tiles
+                tiles = sorted(tiles, key=int)
+                n_tiles = len(tiles)
+                # Infer Z-size from number of sample_tile files divided by number of channels
+                size_z = int(len(sample_tiles) / len(channels))
+                # Infer image dimensions (X, Y) from the first sample tile
+                sample_tile = tifffile.imread(sample_tiles[0])
+                image_dimensions = sample_tile.shape[::-1]  # (width, height)
         
-            # Add a <Tile> element for each mosaic tile with positional info
-            for x, y, pos_x, pos_y in mosaic:
-                ET.SubElement(
-                    attachment, 
-                    "Tile", 
-                    FieldX=str(x), 
-                    FieldY=str(y),
-                    PosX=f"{pos_x:.10f}", 
-                    PosY=f"{pos_y:.10f}"
-                )
-        
-            # Write the XML tree to a file in the metadata output directory
-            tree = ET.ElementTree(data)
-            tree.write(metadata_directory / f"{image_name}.xml", encoding="utf-8", xml_declaration=True)
-    
-        # ----- Step 3: Generate PSFs for all channels -----
-        print('Calculating the PSF')
-    
-        if deconvolution_method is None:
-            print("Skipping PSF generation — deconvolution method is None.")
-            psf_dict = {}  # Initialize empty dict for compatibility
-    
-        elif deconvolution_method == 'redlionfish': 
-            psf_dict = {}
-            for channel, info in PSF_metadata['channels'].items():
-    
-                print(f"Generating PSF for channel {channel}")
-                psf_volume = fd_psf.GibsonLanni(
-                    na=float(PSF_metadata['na']),
-                    m=float(PSF_metadata['m']),
-                    ni0=float(PSF_metadata['ni0']),
-                    res_lateral=float(PSF_metadata['res_lateral']),
-                    res_axial=float(PSF_metadata['res_axial']),
-                    wavelength=float(info['wavelength']),
-                    size_x=image_dimensions[0],
-                    size_y=image_dimensions[1],
-                    size_z=size_z
-                ).generate()
-    
-                psf_dict[channel] = psf_volume  
-                
-        elif deconvolution_method == 'deconwolf':
-    
-            # Prepare output directory for PSF files
-            psf_dir = cycle_directory / 'PSF'
-            psf_dir.mkdir(parents=True, exist_ok=True)
-            
-            psf_dict = {}
-            # Generate PSF files for each channel using the external generate_psf function
-            for channel, info in PSF_metadata['channels'].items():
-                wavelength_nm = float(info['wavelength']) * 1000      # Convert wavelength to nanometers
-                psf_filename = psf_dir / f"PSF_channel_{channel}.tif" # Output file path for this channel's PSF
-                
-                # Call PSF generation function with parameters in nanometers
-                generate_psf(
-                    psf_output=psf_filename,
-                    resxy=PSF_metadata['res_lateral'] * 1000,         # Lateral resolution in nm
-                    resz=PSF_metadata['res_axial'] * 1000,            # Axial resolution in nm
-                    wavelength=wavelength_nm,
-                    NA=PSF_metadata['na'],
-                    ni=PSF_metadata['ni0'])
-                
-                # Store path to generated PSF file in dictionary
-                psf_dict[channel] = psf_filename
-    
-        # ----- Step 4: Deconvolve each tile and channel -----
-        print("Single tile imaging." if n_tiles == 1 else f"Number of tiles to process: {n_tiles}")
-
-        # Prepare directory to save stacked images
-        
-        stacked_directory.mkdir(exist_ok=True, parents=True)
-
-        # Loop over each tile (spatial subdivision of the image)
-        for tile in tqdm(tiles, desc="Processing tiles", leave=False):
-           
-            # Loop over each fluorescence channel in the PSF metadata
-            for channel in channels:
-                print(f"\033[90m[\033[96mCycle {cycle}\033[90m] Tile {tile}, Channel {channel}...\033[0m")
-                tile_channel_start = time.time()
-                
-                # Choose output path depending on whether MIP (max intensity projection) is requested
-                output_file_path = (mipped_directory if mip else stacked_directory) / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
-    
-                # Skip processing if output file already exists
-                if output_file_path.exists():
-                    print(f"File {output_file_path} already exists. Skipping.")
-                    continue
-    
-                # Load stacked images depending on mode
-                if mode in ('tif_autosaved', 'tif_exported'):
-                    channel_files = tile_channel_files.get((tile, channel), [])
-                    stacked_images = np.stack([tifffile.imread(f) for f in channel_files])
-                elif mode == 'lif':
-                    # For lif files, iterate through z-planes in the tile and channel
-                    z_planes = [np.array(z_frame) for z_frame in image.get_iter_z(m=tile, c=channel)]
-                    stacked_images = np.stack(z_planes, axis=0)
-    
-                # Deconvolution with RedLionFish method
-                if deconvolution_method == 'redlionfish':
-                    deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=50)
-                    # Save max projection if MIP requested, otherwise full stack
-                    processed_img = np.max(deconvolved_images, axis=0).astype('uint16') if mip else deconvolved_images.astype('uint16')
-                    tifffile.imwrite(output_file_path, processed_img)
-                    print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
-                    
-    
-                # Deconvolution with Deconwolf method
-                elif deconvolution_method == 'deconwolf':
-                    # Create temporary directory for Deconwolf input
-                    dw_input_directory = cycle_directory / 'deconwolf input tmp'
-                    dw_input_directory.mkdir(parents=True, exist_ok=True)
-                    
-                    dw_input_path = dw_input_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
-                    tifffile.imwrite(dw_input_path, stacked_images)    # Write input stack for Deconwolf
-                    
-                    dw_output_path = stacked_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
-    
-                    # Run Deconwolf deconvolution externally
-                    deconvolve_image(
-                        input_image=dw_input_path,
-                        psf_image=psf_dict[str(channel)],
-                        output_image=dw_output_path,
-                        iterations=20,
-                        tilesize=chunk_size)
-    
-                    # If MIP requested, generate max projection from deconvolved images and save
-                    if mip:
-                        deconvolved_images = tifffile.imread(dw_output_path)
-                        mipped_img = np.max(deconvolved_images, axis=0).astype('uint16')
-                        tifffile.imwrite(output_file_path, mipped_img)
-                        print(f"Mipped images saved in directory: {mipped_directory}")
-                        
+                # --- Pre-index files by tile and channel to speed up lookups ---
+                tile_to_files = {}
+                for tile in tiles:
+                    if mode == 'tif_autosaved':
+                        tile_files = [f for f in filtered_tifs if f"--Stage{tile}--" in str(f)]
                     else:
-                        print(f"Stacked files saved in directory: {stacked_directory}")
-    
-                    # Remove temporary Deconwolf input directory after processing
-                    if dw_input_directory.exists():
-                        shutil.rmtree(dw_input_directory)
-                        print(f"Deleted directory: {dw_input_directory}")
-    
-                # No deconvolution, just save max projection or stack
-                elif deconvolution_method is None:
-                    processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
-                    tifffile.imwrite(output_file_path, processed_img)
-                    print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
-
-
-                tile_channel_end = time.time()
-                print(f"\033[1;37m[Timing] Full deconvolution cycle for Tile {tile}, Channel {channel} took {tile_channel_end - tile_channel_start:.2f} seconds\033[0m")
+                        tile_files = [f for f in filtered_tifs if f"_s{tile}_" in str(f)]
+                    tile_to_files[tile] = tile_files
         
-        # After all tiles and channels are done
-        if mip and stacked_directory.exists():
-            shutil.rmtree(stacked_directory)
-            print(f"Deleted stacked directory: {stacked_directory}")
-
+                tile_channel_files = {}
+                for tile, files_in_tile in tile_to_files.items():
+                    for channel in channels:
+        
+                        if mode == 'tif_autosaved':
+                            pattern = f"--C{str(channel).zfill(2)}"
+                        else:
+                            pattern = f"_ch{channel}"
+                        channel_files = [f for f in files_in_tile if pattern in f.name]
+                        tile_channel_files[(tile, channel)] = channel_files
+        
+            elif mode == 'lif':
+                # List all .lif files in input_dir
+                lif_files = [f for f in input_dir.iterdir() if f.suffix == '.lif']
+                num_files = len(lif_files)
+                
+                if num_files > 1:
+                    # Case: multiple .lif files → one file per region
+                    filepath = lif_files[region_index]
+                    file = LifFile(filepath)
+                    image_dict = file.image_list[0]  # always take first image from multi-file set
+                    image_name = image_dict['name']
+                    image = file.get_image(0)
+                elif num_files == 1:
+                    # Case: single .lif file → contains multiple regions
+                    filepath = lif_files[0]
+                    file = LifFile(filepath)
+                    image_dict = file.image_list[region_index]  # select image by region_index if single file
+                    image_name = image_dict['name']
+                    image = file.get_image(region_index)
+            
+                print(f"Image name: {image_name}")
+                # Replace "/" with "_" in image name (prevent file system issues)
+                image_name = image_name.replace('/', '_')
+        
+                dims = image_dict['dims']                        # Extract dimensions
+                image_dimensions = (dims.x, dims.y)  # (width, height)
+                size_z = dims.z                                  # number of Z slices
+                n_tiles = dims.m                                 # number of mosaic tiles (if any)
+                tiles = list(range(n_tiles))                     # tile indices 0..n_tiles-1
+                mosaic = image_dict.get('mosaic_position', None) # Get mosaic positions
+                num_channels = image_dict['channels']
+                channels = list(range(num_channels))  # [0, 1, 2, 3, 4, 5]
+    
+    
+            # Check what files are expected to exist
+            expected_files = [
+                (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
+                for tile in tiles
+                for channel in channels
+            ]
+            
+            print(f"Expected number of output files in {mipped_directory if mip else stacked_directory}: {len(expected_files)} ({len(tiles)} tiles × {len(channels)} channels)")
+            
+            # Identify which files are missing
+            missing_files = [f for f in expected_files if not f.exists()]
+            
+            if not missing_files:
+                print(f"All expected files for Cycle {cycle} already exist in {mipped_directory if mip else stacked_directory} directory. Skipping processing.")
+                continue
+            
+            # Extract unique tile numbers from missing file names
+            missing_tiles = sorted(set(
+                match.group(1)
+                for f in missing_files
+                if (match := re.search(r'_s(\d+)_ch', f.name))
+            ))
+            
+            # Update the tiles list to only those with missing outputs
+            tiles = missing_tiles
+            
+            print(f"{len(tiles)} tile(s) have missing outputs. Proceeding with processing only these.")
+    
+            
+        
+            # ----- Step 2: Copy metadata if available -----
+            print('Extracting metadata')
+            
+            if mode in ('tif_autosaved', 'tif_exported'):
+                # Look for Metadata subdirectory inside the input directory
+                input_metadata_dir = input_dir / 'Metadata'
+                
+                if input_metadata_dir.exists():
+                    # Find metadata files matching the current region
+                    metadata_files = [f for f in input_metadata_dir.iterdir() if region in f.name]
+                    
+                    # Select the first metadata file that is NOT a 'properties' file
+                    metadata_file = next((f for f in metadata_files if 'properties' not in f.name), None)
+                    
+                    # Copy the selected metadata file to the metadata output directory
+                    if metadata_file:
+                        custom_copy(metadata_file, metadata_directory)
+            
+            elif mode == 'lif' and mosaic is not None:
+                # If in LIF mode and mosaic info is available, generate XML metadata
+                
+                # Build XML structure: <Data> -> <Image> -> <Attachment> -> multiple <Tile> elements
+                data = ET.Element("Data")
+                image_elem = ET.SubElement(data, "Image", TextDescription="")
+                
+                attachment = ET.SubElement(
+                    image_elem, 
+                    "Attachment", 
+                    Name="TileScanInfo", 
+                    Application="LAS AF", 
+                    FlipX="0", 
+                    FlipY="0", 
+                    SwapXY="0"
+                )
+            
+                # Add a <Tile> element for each mosaic tile with positional info
+                for x, y, pos_x, pos_y in mosaic:
+                    ET.SubElement(
+                        attachment, 
+                        "Tile", 
+                        FieldX=str(x), 
+                        FieldY=str(y),
+                        PosX=f"{pos_x:.10f}", 
+                        PosY=f"{pos_y:.10f}"
+                    )
+            
+                # Write the XML tree to a file in the metadata output directory
+                tree = ET.ElementTree(data)
+                tree.write(metadata_directory / f"{image_name}.xml", encoding="utf-8", xml_declaration=True)
+        
+            # ----- Step 3: Generate PSFs for all channels -----
+            print('Calculating the PSF')
+        
+            if deconvolution_method is None:
+                print("Skipping PSF generation — deconvolution method is None.")
+                psf_dict = {}  # Initialize empty dict for compatibility
+        
+            elif deconvolution_method == 'redlionfish': 
+                psf_dict = {}
+                for channel, info in PSF_metadata['channels'].items():
+        
+                    print(f"Generating PSF for channel {channel}")
+                    psf_volume = fd_psf.GibsonLanni(
+                        na=float(PSF_metadata['na']),
+                        m=float(PSF_metadata['m']),
+                        ni0=float(PSF_metadata['ni0']),
+                        res_lateral=float(PSF_metadata['res_lateral']),
+                        res_axial=float(PSF_metadata['res_axial']),
+                        wavelength=float(info['wavelength']),
+                        size_x=image_dimensions[0],
+                        size_y=image_dimensions[1],
+                        size_z=size_z
+                    ).generate()
+        
+                    psf_dict[channel] = psf_volume  
+                    
+            elif deconvolution_method == 'deconwolf':
+        
+                # Prepare output directory for PSF files
+                psf_dir = cycle_directory / 'PSF'
+                psf_dir.mkdir(parents=True, exist_ok=True)
+                
+                psf_dict = {}
+                # Generate PSF files for each channel using the external generate_psf function
+                for channel, info in PSF_metadata['channels'].items():
+                    wavelength_nm = float(info['wavelength']) * 1000      # Convert wavelength to nanometers
+                    psf_filename = psf_dir / f"PSF_channel_{channel}.tif" # Output file path for this channel's PSF
+                    
+                    # Call PSF generation function with parameters in nanometers
+                    generate_psf(
+                        psf_output=psf_filename,
+                        resxy=PSF_metadata['res_lateral'] * 1000,         # Lateral resolution in nm
+                        resz=PSF_metadata['res_axial'] * 1000,            # Axial resolution in nm
+                        wavelength=wavelength_nm,
+                        NA=PSF_metadata['na'],
+                        ni=PSF_metadata['ni0'])
+                    
+                    # Store path to generated PSF file in dictionary
+                    psf_dict[channel] = psf_filename
+        
+            # ----- Step 4: Deconvolve each tile and channel -----
+            print("Single tile imaging." if n_tiles == 1 else f"Number of tiles to process: {n_tiles}")
+    
+            # Prepare directory to save stacked images
+            
+            stacked_directory.mkdir(exist_ok=True, parents=True)
+    
+            # Loop over each tile (spatial subdivision of the image)
+            for tile in tqdm(tiles, desc="Processing tiles", leave=False):
+               
+                # Loop over each fluorescence channel in the PSF metadata
+                for channel in channels:
+                    print(f"\033[90m[\033[96mCycle {cycle}\033[90m] Tile {tile}, Channel {channel}...\033[0m")
+                    tile_channel_start = time.time()
+                    
+                    # Choose output path depending on whether MIP (max intensity projection) is requested
+                    output_file_path = (mipped_directory if mip else stacked_directory) / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
+        
+                    # Skip processing if output file already exists
+                    if output_file_path.exists():
+                        print(f"File {output_file_path} already exists. Skipping.")
+                        continue
+        
+                    # Load stacked images depending on mode
+                    if mode in ('tif_autosaved', 'tif_exported'):
+                        channel_files = tile_channel_files.get((tile, channel), [])
+                        stacked_images = np.stack([tifffile.imread(f) for f in channel_files])
+                    elif mode == 'lif':
+                        # For lif files, iterate through z-planes in the tile and channel
+                        z_planes = [np.array(z_frame) for z_frame in image.get_iter_z(m=tile, c=channel)]
+                        stacked_images = np.stack(z_planes, axis=0)
+        
+                    # Deconvolution with RedLionFish method
+                    if deconvolution_method == 'redlionfish':
+                        deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=50)
+                        # Save max projection if MIP requested, otherwise full stack
+                        processed_img = np.max(deconvolved_images, axis=0).astype('uint16') if mip else deconvolved_images.astype('uint16')
+                        tifffile.imwrite(output_file_path, processed_img)
+                        print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
+                        
+        
+                    # Deconvolution with Deconwolf method
+                    elif deconvolution_method == 'deconwolf':
+                        # Create temporary directory for Deconwolf input
+                        dw_input_directory = cycle_directory / 'deconwolf input tmp'
+                        dw_input_directory.mkdir(parents=True, exist_ok=True)
+                        
+                        dw_input_path = dw_input_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
+                        tifffile.imwrite(dw_input_path, stacked_images)    # Write input stack for Deconwolf
+                        
+                        dw_output_path = stacked_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
+        
+                        # Run Deconwolf deconvolution externally
+                        deconvolve_image(
+                            input_image=dw_input_path,
+                            psf_image=psf_dict[str(channel)],
+                            output_image=dw_output_path,
+                            iterations=20,
+                            tilesize=chunk_size)
+        
+                        # If MIP requested, generate max projection from deconvolved images and save
+                        if mip:
+                            deconvolved_images = tifffile.imread(dw_output_path)
+                            mipped_img = np.max(deconvolved_images, axis=0).astype('uint16')
+                            tifffile.imwrite(output_file_path, mipped_img)
+                            print(f"Mipped images saved in directory: {mipped_directory}")
+                            
+                        else:
+                            print(f"Stacked files saved in directory: {stacked_directory}")
+        
+                        # Remove temporary Deconwolf input directory after processing
+                        if dw_input_directory.exists():
+                            shutil.rmtree(dw_input_directory)
+                            print(f"Deleted directory: {dw_input_directory}")
+        
+                    # No deconvolution, just save max projection or stack
+                    elif deconvolution_method is None:
+                        processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
+                        tifffile.imwrite(output_file_path, processed_img)
+                        print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
+    
+    
+                    tile_channel_end = time.time()
+                    print(f"\033[1;37m[Timing] Full deconvolution cycle for Tile {tile}, Channel {channel} took {tile_channel_end - tile_channel_start:.2f} seconds\033[0m")
+            
+            # After all tiles and channels are done
+            if mip and stacked_directory.exists():
+                shutil.rmtree(stacked_directory)
+                print(f"Deleted stacked directory: {stacked_directory}")
+    
     return region_directories
 
 
-def mipped_to_OME_tiffs(region_directories, cycle):
+def mipped_to_OME_tiffs(region_directories, cycles):
     """
     Convert Leica TIFF tiles into an OME-TIFF with spatial metadata.
 
@@ -684,107 +688,111 @@ def mipped_to_OME_tiffs(region_directories, cycle):
     """
 
     print(f"\033[1;96mConverting to OME-TIFFs\033[0m")
-    
-    for region_directory in region_directories:
-        region_suffix = region_directory[-2:]
-        if re.match(r"R\d+", region_suffix):
-            print(f"\033[1mProcessing {region_suffix}\033[0m")
-        
-        region_directory = Path(region_directory)
-        cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'            
-        mipped_directory = cycle_directory / '1_mipped'
-        ome_tiff_directory = cycle_directory / '2_ome_tiffs'
-        ome_tiff_path = ome_tiff_directory / f'Cycle{cycle}.ome.tiff'
-        metadata_directory = cycle_directory / 'MetaData'
-    
-        ome_tiff_directory.mkdir(parents=True, exist_ok=True)
-    
-        if ome_tiff_path.exists():
-            print(f"OME-TIFF already exists: {ome_tiff_path}. Skipping.")
-            continue
-    
-        tif_files = list(mipped_directory.glob('*.tif'))
-        if not tif_files:
-            print(f"No TIFF files found in {mipped_directory}. Skipping.")
-            continue
-    
-        # Build file index: tile → channel → filepath
-        file_index = defaultdict(dict)
-        for f in tif_files:
-            match = re.search(r'_s(\d+)_ch(\d+)', f.name)
-            if match:
-                tile, channel = match.groups()
-                file_index[tile][channel] = f
-    
-        tiles = sorted(file_index.keys(), key=int)
-        channels = sorted({ch for chs in file_index.values() for ch in chs}, key=int)
-    
-        if not channels:
-            print(f"[WARN] No channels found in {mipped_directory}. Check filename pattern.")
-            continue
-    
-        # Load tile positions from XML
-        metadata_files = list(metadata_directory.glob('*.xml')) + list(metadata_directory.glob('*.xlif'))
-        if not metadata_files:
-            print(f"No metadata found in {metadata_directory}. Skipping.")
-            continue
-    
-        root = ET.parse(metadata_files[0]).getroot()
-        tile_elements = root.findall(".//Tile")
-        x_coords = np.array([float(t.attrib['PosX']) for t in tile_elements])
-        y_coords = np.array([float(t.attrib['PosY']) for t in tile_elements])
-    
-        pixel_size_um = 0.1625
-        scale = 3.21e-7  # Leica-provided scaling
-    
-        x_scaled = ((x_coords - x_coords.min()) / scale + 1).astype(int)
-        y_scaled = ((y_coords - y_coords.min()) / scale + 1).astype(int)
-        positions = np.column_stack((x_scaled, y_scaled))
-       
-        pd.DataFrame({'x': x_scaled, 'y': y_scaled}).to_csv(
-            ome_tiff_directory / f'Cycle{cycle}_coords.csv', index=False)
-    
-        # Get image shape
-        first_tile = next(iter(file_index.values()))
-        first_channel = next(iter(first_tile.values()))
-        height, width = tifffile.imread(first_channel).shape
-        
-        # Write tile-by-tile into OME-TIFF file
-        with tifffile.TiffWriter(ome_tiff_path, bigtiff=True, ome=True) as tif:
-            for tile_index, tile in enumerate(tiles):
-                position = positions[tile_index]
-                image_stack = np.empty((len(channels), height, width), dtype=np.uint16)
-    
-                for channel_index, channel in enumerate(channels):
-                    try:
-                        image_stack[channel_index] = tifffile.imread(file_index[tile][channel]).astype(np.uint16)
-                    except Exception as e:
-                        print(f"[WARN] Tile {tile}, Channel {channel} missing or unreadable: {e}")
-                        image_stack[channel_index] = np.zeros((height, width), dtype=np.uint16)
-    
-                metadata = {
-                    'Pixels': {
-                        'PhysicalSizeX': pixel_size_um,
-                        'PhysicalSizeXUnit': 'µm',
-                        'PhysicalSizeY': pixel_size_um,
-                        'PhysicalSizeYUnit': 'µm'
-                    },
-                    'Plane': {
-                        'PositionX': [position[0] * pixel_size_um] * len(channels),
-                        'PositionY': [position[1] * pixel_size_um] * len(channels)
-                    }
-                }
 
-                tif.write(image_stack, metadata=metadata)
+    for cycle in cycles:
+        print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
     
-        print(f"[DONE] Wrote OME-TIFF: {ome_tiff_path}")
-  
+        for region_directory in region_directories:
+            region_suffix = region_directory[-2:]
+            if re.match(r"R\d+", region_suffix):
+                print(f"\033[1mProcessing {region_suffix}\033[0m")
+            
+            region_directory = Path(region_directory)
+            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'            
+            mipped_directory = cycle_directory / '1_mipped'
+            ome_tiff_directory = cycle_directory / '2_ome_tiffs'
+            ome_tiff_path = ome_tiff_directory / f'Cycle{cycle}.ome.tiff'
+            metadata_directory = cycle_directory / 'MetaData'
+        
+            ome_tiff_directory.mkdir(parents=True, exist_ok=True)
+        
+            if ome_tiff_path.exists():
+                print(f"OME-TIFF already exists: {ome_tiff_path}. Skipping.")
+                continue
+        
+            tif_files = list(mipped_directory.glob('*.tif'))
+            if not tif_files:
+                print(f"No TIFF files found in {mipped_directory}. Skipping.")
+                continue
+        
+            # Build file index: tile → channel → filepath
+            file_index = defaultdict(dict)
+            for f in tif_files:
+                match = re.search(r'_s(\d+)_ch(\d+)', f.name)
+                if match:
+                    tile, channel = match.groups()
+                    file_index[tile][channel] = f
+        
+            tiles = sorted(file_index.keys(), key=int)
+            channels = sorted({ch for chs in file_index.values() for ch in chs}, key=int)
+        
+            if not channels:
+                print(f"[WARN] No channels found in {mipped_directory}. Check filename pattern.")
+                continue
+        
+            # Load tile positions from XML
+            metadata_files = list(metadata_directory.glob('*.xml')) + list(metadata_directory.glob('*.xlif'))
+            if not metadata_files:
+                print(f"No metadata found in {metadata_directory}. Skipping.")
+                continue
+        
+            root = ET.parse(metadata_files[0]).getroot()
+            tile_elements = root.findall(".//Tile")
+            x_coords = np.array([float(t.attrib['PosX']) for t in tile_elements])
+            y_coords = np.array([float(t.attrib['PosY']) for t in tile_elements])
+        
+            pixel_size_um = 0.1625
+            scale = 3.21e-7  # Leica-provided scaling
+        
+            x_scaled = ((x_coords - x_coords.min()) / scale + 1).astype(int)
+            y_scaled = ((y_coords - y_coords.min()) / scale + 1).astype(int)
+            positions = np.column_stack((x_scaled, y_scaled))
+           
+            pd.DataFrame({'x': x_scaled, 'y': y_scaled}).to_csv(
+                ome_tiff_directory / f'Cycle{cycle}_coords.csv', index=False)
+        
+            # Get image shape
+            first_tile = next(iter(file_index.values()))
+            first_channel = next(iter(first_tile.values()))
+            height, width = tifffile.imread(first_channel).shape
+            
+            # Write tile-by-tile into OME-TIFF file
+            with tifffile.TiffWriter(ome_tiff_path, bigtiff=True, ome=True) as tif:
+                for tile_index, tile in enumerate(tiles):
+                    position = positions[tile_index]
+                    image_stack = np.empty((len(channels), height, width), dtype=np.uint16)
+        
+                    for channel_index, channel in enumerate(channels):
+                        try:
+                            image_stack[channel_index] = tifffile.imread(file_index[tile][channel]).astype(np.uint16)
+                        except Exception as e:
+                            print(f"[WARN] Tile {tile}, Channel {channel} missing or unreadable: {e}")
+                            image_stack[channel_index] = np.zeros((height, width), dtype=np.uint16)
+        
+                    metadata = {
+                        'Pixels': {
+                            'PhysicalSizeX': pixel_size_um,
+                            'PhysicalSizeXUnit': 'µm',
+                            'PhysicalSizeY': pixel_size_um,
+                            'PhysicalSizeYUnit': 'µm'
+                        },
+                        'Plane': {
+                            'PositionX': [position[0] * pixel_size_um] * len(channels),
+                            'PositionY': [position[1] * pixel_size_um] * len(channels)
+                        }
+                    }
+    
+                    tif.write(image_stack, metadata=metadata)
+        
+            print(f"[DONE] Wrote OME-TIFF: {ome_tiff_path}")
+      
 #---------
 
 
 def align_and_stitch(
     region_directories,
-    cycle,
+    cycles,
+    n_total_cycles,
     align_channel=4, 
     flip_x=False, 
     flip_y=True, 
@@ -802,8 +810,8 @@ def align_and_stitch(
     Wrapper function for the Ashlar tool for image alignment and mosaicking.
 
     Args:
-        cycle_directory (str or Path): Directory containing OME-TIFFs for a given cycle.
-        cycle (int): Cycle number to identify the correct TIFFs.
+        region_directories (list): List of directories for all regions.
+        cycles (list): List of cycle numbers to identify the correct TIFFs.
         align_channel (int): Channel to use for alignment.
         flip_x (bool): Flip images along the X-axis.
         flip_y (bool): Flip images along the Y-axis.
@@ -823,6 +831,7 @@ def align_and_stitch(
     """
 
     print("\033[1;96mAligning and stitching tiles\033[0m")
+    print("\033[1mProcessing all cycles \033[0m")
     ashlar.configure_terminal()
     
     for region_directory in region_directories:
@@ -831,39 +840,70 @@ def align_and_stitch(
             print(f"\033[1mProcessing {region_suffix}\033[0m")
         
         region_directory = Path(region_directory)
-    
-        cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
-        ome_tiff_directory = cycle_directory / '2_ome_tiffs'
-        stitched_directory = cycle_directory / '3_stitched'
-        stitched_directory.mkdir(exist_ok=True)
-    
-        # **Gather OME-TIFF files for the specified cycle**
+
+        # --- STEP 1: Make directories for each cycle ---
+        for cycle in cycles:
+            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
+            ome_tiff_directory = cycle_directory / '2_ome_tiffs'
+            stitched_directory = cycle_directory / '3_stitched'
+            stitched_directory.mkdir(exist_ok=True)
+
+        # --- STEP 2: Collect OME-TIFFs and validate cycles ---
         ome_tiffs = natsorted([
-            f for f in ome_tiff_directory.iterdir()
-            if f.name.endswith(('.ome.tif', '.ome.tiff'))
+            f for f in (region_directory / "preprocessing").rglob("*.ome.tiff")
         ])
-        ome_tiff_files = [f for f in ome_tiffs if f"{cycle}" in f.name]
-    
-        if not ome_tiff_files:
-            print(f"No OME-TIFFs found for cycle {cycle} in {ome_tiff_directory}")
-            continue
-    
-        # ** skip existing files **
-        # Extract number of channels from first TIFF
-        with tifffile.TiffFile(ome_tiff_files[0]) as tif:
+        
+       # Extract cycle numbers from filenames like Cycle1_xxx.ome.tif
+        found_cycles = sorted(set(
+            int(re.search(r"Cycle(\d+)", f.name).group(1))
+            for f in ome_tiffs if re.search(r"Cycle(\d+)", f.name)
+        ))
+                
+        # Define the expected full range of cycles
+        expected_cycles = list(range(1, n_total_cycles + 1))
+        
+        # Sanity check: must match exactly
+        if found_cycles != expected_cycles:
+            missing = [c for c in expected_cycles if c not in found_cycles]
+            extra = [c for c in found_cycles if c not in expected_cycles]
+        
+            print(f"Expected cycles {expected_cycles}, but found {found_cycles}. OME tiffs for all expected cycles need to be available before stitching and aligning.")
+            if missing:
+                print(f"   Missing cycles: {missing}")
+            if extra:
+                print(f"   Unexpected cycles: {extra}")
+        
+            raise RuntimeError(
+                f"Cycle mismatch. Expected {expected_cycles}, but found {found_cycles}."
+            )
+        else:
+            print(f"Found all {n_total_cycles} cycles: {found_cycles}")
+
+
+        # --- STEP 3: Define expected outputs ---
+        # Get number of channels from first OME-TIFF
+        with tifffile.TiffFile(ome_tiffs[0]) as tif:
             n_channels = tif.series[0].shape[tif.series[0].axes.index('C')]
-    
-        # Prepare expected output file paths
-        ashlar_filename_pattern = f'Cycle{cycle}_ch{{channel}}.tif'
-        ashlar_outputs = [
-            stitched_directory / ashlar_filename_pattern.format(channel=ch)
+
+       # Define the stitched output pattern as a format string
+        ashlar_filename_pattern = str(
+            region_directory / "preprocessing" / "Cycle{cycle}" / "3_stitched" / "Cycle{cycle}_ch{channel}.tif"
+        )
+        
+        # Build a list of expected outputs for all cycles + channels
+        expected_outputs = [
+            Path(ashlar_filename_pattern.format(cycle=cyc, channel=ch))
+            for cyc in expected_cycles
             for ch in range(n_channels)
         ]
-    
-        if all(p.exists() for p in ashlar_outputs):
-            print(f"Stitched images already exist for all channels in: {stitched_directory}. Skipping.")
+
+        # Skip only if *all* expected outputs exist
+        if all(p.exists() for p in expected_outputs):
+            print(f"Stitched images already exist for all {n_total_cycles} cycles. Skipping.")
             continue
-    
+       
+
+        # --- STEP 4: Validate Ashlar parameters ---
         # **Validate pyramid/tile size configuration**
         warnings.filterwarnings("ignore")
         if tile_size and not pyramid:
@@ -876,19 +916,19 @@ def align_and_stitch(
         # **Normalize FFP/DFP paths if provided**
         ffp_paths = ffp
         if ffp_paths:
-            if len(ffp_paths) not in (0, 1, len(ome_tiff_files)):
-                ashlar.print_error(f"Wrong number of flat-field profiles. Must be 1, or {len(ome_tiff_files)}")
+            if len(ffp_paths) not in (0, 1, len(ome_tiffs)):
+                ashlar.print_error(f"Wrong number of flat-field profiles. Must be 1, or {len(ome_tiffs)}")
                 continue
             if len(ffp_paths) == 1:
-                ffp_paths *= len(ome_tiff_files)
+                ffp_paths *= len(ome_tiffs)
     
         dfp_paths = dfp
         if dfp_paths:
-            if len(dfp_paths) not in (0, 1, len(ome_tiff_files)):
-                ashlar.print_error(f"Wrong number of dark-field profiles. Must be 1, or {len(ome_tiff_files)}")
+            if len(dfp_paths) not in (0, 1, len(ome_tiffs)):
+                ashlar.print_error(f"Wrong number of dark-field profiles. Must be 1, or {len(ome_tiffs)}")
                 continue
             if len(dfp_paths) == 1:
-                dfp_paths *= len(ome_tiff_files)
+                dfp_paths *= len(ome_tiffs)
     
         # **Set Ashlar aligner and mosaic parameters**
         aligner_args = {
@@ -905,35 +945,64 @@ def align_and_stitch(
             mosaic_args['tile_size'] = tile_size
         if not quiet:
             mosaic_args['verbose'] = True
+
+        # Define temporary Ashlar output pattern (0-indexed cycles)
+        tmp_pattern = str(
+            region_directory / "preprocessing" / "ashlar_tmp" / "Cycle{cycle}_ch{channel}.tif"
+        )
+        Path(tmp_pattern).parent.mkdir(parents=True, exist_ok=True)
     
-        # **Run Ashlar stitching process**
+        # --- STEP 5: Run Ashlar ---
         try:
-            ome_tiff_files = [str(f) for f in ome_tiff_files]
+            ome_tiff_files = [str(f) for f in ome_tiffs]
+         
             if plates:
                 ashlar.process_plates(
-                    ome_tiff_files, stitched_directory, ashlar_filename_pattern,
+                    ome_tiff_files,
+                    None,                      # don’t give a base output dir
+                    tmp_pattern,   # full pattern string
                     flip_x, flip_y, ffp_paths, dfp_paths,
-                    0.0,                      # barrel_correction
+                    0.0,                       # barrel_correction
                     aligner_args, mosaic_args,
                     pyramid, quiet
                 )
             else:
-                mosaic_path_format = str(stitched_directory / ashlar_filename_pattern)
                 ashlar.process_single(
-                    ome_tiff_files, mosaic_path_format,
+                    ome_tiff_files,
+                    tmp_pattern,   # same pattern string
                     flip_x, flip_y, ffp_paths, dfp_paths,
-                    0.0,                      # barrel_correction (use None or a path/config if you have one)
+                    0.0,                       # barrel_correction
                     aligner_args, mosaic_args,
                     pyramid, quiet
                 )
+
+            
         except ashlar.ProcessingError as e:
             ashlar.print_error(str(e))
             continue
-    
+
+        # --- STEP 6: Remap Cycle0..N-1 → Cycle1..N and move files ---
+        tmp_dir = Path(tmp_pattern).parent
+        for cyc_idx, cyc in enumerate(expected_cycles):
+            stitched_dir = region_directory / "preprocessing" / f"Cycle{cyc}" / "3_stitched"
+            stitched_dir.mkdir(parents=True, exist_ok=True)
+
+            for ch in range(n_channels):
+                tmp_file = tmp_dir / f"Cycle{cyc_idx}_ch{ch}.tif"
+                if not tmp_file.exists():
+                    raise FileNotFoundError(f"Expected {tmp_file} not found")
+                final_file = stitched_dir / f"Cycle{cyc}_ch{ch}.tif"
+                tmp_file.rename(final_file)
+                print(f"Moved {tmp_file} → {final_file}")
+
+        # Clean up temporary folder
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        
     
 def retile_stitched_images(
     region_directories,
-    cycle,
+    cycles,
     tile_dimension=6000
 ):
     """
@@ -949,108 +1018,111 @@ def retile_stitched_images(
     """
     print(f"\033[1;96mRetiling stitched images\033[0m")
 
-    for region_directory in region_directories:
-        region_suffix = region_directory[-2:]
-        if re.match(r"R\d+", region_suffix):
-            print(f"\033[1mProcessing {region_suffix}\033[0m")
-        
-        region_directory = Path(region_directory)
+    for cycle in cycles:
+        print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
 
-        cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
-        stitched_directory = cycle_directory / '3_stitched'
-        retiled_directory = cycle_directory / '4_retiled'
-        retiled_directory.mkdir(exist_ok=True, parents=True)
-
-        tif_files = sorted([
-            f for f in stitched_directory.iterdir()
-            if f.is_file() and f.suffix == '.tif'
-        ])
-
-        if not tif_files:
-            print(f"No stitched TIFFs found for cycle {cycle} in {stitched_directory}")
-            continue
-
-        # === Pre-check: Skip if all expected tile files already exist ===
-        sample_img = tifffile.imread(tif_files[0])  # input stitched image
-        pad_height = math.ceil(sample_img.shape[0] / tile_dimension) * tile_dimension - sample_img.shape[0]
-        pad_width = math.ceil(sample_img.shape[1] / tile_dimension) * tile_dimension - sample_img.shape[1]
-        padded_height = sample_img.shape[0] + pad_height
-        padded_width = sample_img.shape[1] + pad_width
-        
-        expected_tiles_per_img = (padded_height // tile_dimension) * (padded_width // tile_dimension)
-        expected_total_tiles = expected_tiles_per_img * len(tif_files)
-
-        existing_tiles = list(retiled_directory.glob(f'Cycle{cycle}_s*_ch*.tif'))
-
-        # If the number of tiles is correct, only then sample-check 1–2 tile shapes
-        if len(existing_tiles) == expected_total_tiles:
-            sample_tile = tifffile.imread(existing_tiles[0])
-            if sample_tile.shape != (tile_dimension, tile_dimension):
-                print(f"[WARN] Sample tile shape mismatch: expected ({tile_dimension}, {tile_dimension}), got {sample_tile.shape}")
+        for region_directory in region_directories:
+            region_suffix = region_directory[-2:]
+            if re.match(r"R\d+", region_suffix):
+                print(f"\033[1mProcessing {region_suffix}\033[0m")
+            
+            region_directory = Path(region_directory)
+    
+            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
+            stitched_directory = cycle_directory / '3_stitched'
+            retiled_directory = cycle_directory / '4_retiled'
+            retiled_directory.mkdir(exist_ok=True, parents=True)
+    
+            tif_files = sorted([
+                f for f in stitched_directory.iterdir()
+                if f.is_file() and f.suffix == '.tif'
+            ])
+    
+            if not tif_files:
+                print(f"No stitched TIFFs found for cycle {cycle} in {stitched_directory}")
+                continue
+    
+            # === Pre-check: Skip if all expected tile files already exist ===
+            sample_img = tifffile.imread(tif_files[0])  # input stitched image
+            pad_height = math.ceil(sample_img.shape[0] / tile_dimension) * tile_dimension - sample_img.shape[0]
+            pad_width = math.ceil(sample_img.shape[1] / tile_dimension) * tile_dimension - sample_img.shape[1]
+            padded_height = sample_img.shape[0] + pad_height
+            padded_width = sample_img.shape[1] + pad_width
+            
+            expected_tiles_per_img = (padded_height // tile_dimension) * (padded_width // tile_dimension)
+            expected_total_tiles = expected_tiles_per_img * len(tif_files)
+    
+            existing_tiles = list(retiled_directory.glob(f'Cycle{cycle}_s*_ch*.tif'))
+    
+            # If the number of tiles is correct, only then sample-check 1–2 tile shapes
+            if len(existing_tiles) == expected_total_tiles:
+                sample_tile = tifffile.imread(existing_tiles[0])
+                if sample_tile.shape != (tile_dimension, tile_dimension):
+                    print(f"[WARN] Sample tile shape mismatch: expected ({tile_dimension}, {tile_dimension}), got {sample_tile.shape}")
+                    for tile in existing_tiles:
+                        tile.unlink()
+                    print(f"Reprocessing due to tile shape mismatch.")
+                else:
+                    print(f"All expected tiles found and shape of first tile is correct (tile_dimension = {tile_dimension}) in {retiled_directory}. Skipping.")
+                    continue
+            else:
+                print(f"Missing tiles (expected {expected_total_tiles}, found {len(existing_tiles)}). Reprocessing all.")
                 for tile in existing_tiles:
                     tile.unlink()
-                print(f"Reprocessing due to tile shape mismatch.")
-            else:
-                print(f"All expected tiles found and shape of first tile is correct (tile_dimension = {tile_dimension}) in {retiled_directory}. Skipping.")
-                continue
-        else:
-            print(f"Missing tiles (expected {expected_total_tiles}, found {len(existing_tiles)}). Reprocessing all.")
-            for tile in existing_tiles:
-                tile.unlink()
-
-
-        # === Begin tiling ===
-        x_positions = []
-        y_positions = []
-
-        for tif_path in tif_files:
-            try:
-                image = tifffile.imread(tif_path)
-                print(f"Tiling: {tif_path.name}")
-
-                pad_height = math.ceil(image.shape[0] / tile_dimension) * tile_dimension - image.shape[0]
-                pad_width = math.ceil(image.shape[1] / tile_dimension) * tile_dimension - image.shape[1]
-
-                image_padded = cv2.copyMakeBorder(
-                    image,
-                    top=0, bottom=pad_height,
-                    left=0, right=pad_width,
-                    borderType=cv2.BORDER_CONSTANT
-                )
-
-                img_height, img_width = image_padded.shape
-                nrows = img_height // tile_dimension
-                ncols = img_width // tile_dimension
-
-                tiled_array = image_padded.reshape(nrows, tile_dimension, ncols, tile_dimension)
-                tiled_array = tiled_array.swapaxes(1, 2)
-
-                filename_stem = tif_path.stem
-                channel_match = re.search(r'ch(\d+)', filename_stem)
-                channel_num = int(channel_match.group(1)) if channel_match else 0
-
-                tile_count = 0
-                for row in range(nrows):
-                    for col in range(ncols):
-                        x_positions.append(col * tile_dimension)
-                        y_positions.append(row * tile_dimension)
-
-                        tile_img = tiled_array[row, col]
-                        tile_filename = retiled_directory / f'Cycle{cycle}_s{tile_count}_ch{channel_num}.tif'
-                        tifffile.imwrite(tile_filename, tile_img)
-                        tile_count += 1
-
-            except Exception as e:
-                print(f"[ERROR] Processing {tif_path.name}: {e}")
-                continue
-
-        # Save tile positions
-        tile_positions_df = pd.DataFrame({'x': x_positions, 'y': y_positions})
-        coords_csv_path = retiled_directory / f'Cycle{cycle}_retiled_coords.csv'
-        tile_positions_df.to_csv(coords_csv_path, header=False, index=False)
-
-        print(f"Tiling complete. Positions saved to {coords_csv_path}")
-
+    
+    
+            # === Begin tiling ===
+            x_positions = []
+            y_positions = []
+    
+            for tif_path in tif_files:
+                try:
+                    image = tifffile.imread(tif_path)
+                    print(f"Tiling: {tif_path.name}")
+    
+                    pad_height = math.ceil(image.shape[0] / tile_dimension) * tile_dimension - image.shape[0]
+                    pad_width = math.ceil(image.shape[1] / tile_dimension) * tile_dimension - image.shape[1]
+    
+                    image_padded = cv2.copyMakeBorder(
+                        image,
+                        top=0, bottom=pad_height,
+                        left=0, right=pad_width,
+                        borderType=cv2.BORDER_CONSTANT
+                    )
+    
+                    img_height, img_width = image_padded.shape
+                    nrows = img_height // tile_dimension
+                    ncols = img_width // tile_dimension
+    
+                    tiled_array = image_padded.reshape(nrows, tile_dimension, ncols, tile_dimension)
+                    tiled_array = tiled_array.swapaxes(1, 2)
+    
+                    filename_stem = tif_path.stem
+                    channel_match = re.search(r'ch(\d+)', filename_stem)
+                    channel_num = int(channel_match.group(1)) if channel_match else 0
+    
+                    tile_count = 0
+                    for row in range(nrows):
+                        for col in range(ncols):
+                            x_positions.append(col * tile_dimension)
+                            y_positions.append(row * tile_dimension)
+    
+                            tile_img = tiled_array[row, col]
+                            tile_filename = retiled_directory / f'Cycle{cycle}_s{tile_count}_ch{channel_num}.tif'
+                            tifffile.imwrite(tile_filename, tile_img)
+                            tile_count += 1
+    
+                except Exception as e:
+                    print(f"[ERROR] Processing {tif_path.name}: {e}")
+                    continue
+    
+            # Save tile positions
+            tile_positions_df = pd.DataFrame({'x': x_positions, 'y': y_positions})
+            coords_csv_path = retiled_directory / f'Cycle{cycle}_retiled_coords.csv'
+            tile_positions_df.to_csv(coords_csv_path, header=False, index=False)
+    
+            print(f"Tiling complete. Positions saved to {coords_csv_path}")
+    
 
 def process_czi(input_file, outpath, mip=True, cycle=0, tile_size_x=2048, tile_size_y=2048):
     """
