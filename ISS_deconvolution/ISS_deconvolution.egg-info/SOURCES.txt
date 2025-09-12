@@ -1,9 +1,0 @@
-README.md
-setup.py
-ISS_deconvolution/__init__.py
-ISS_deconvolution/deconvolution.py
-ISS_deconvolution/psf.py
-ISS_deconvolution.egg-info/PKG-INFO
-ISS_deconvolution.egg-info/SOURCES.txt
-ISS_deconvolution.egg-info/dependency_links.txt
-ISS_deconvolution.egg-info/top_level.txt

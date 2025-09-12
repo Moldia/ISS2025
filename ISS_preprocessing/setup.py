@@ -1,37 +1,49 @@
 from setuptools import setup, find_packages
-import codecs
 import os
+from pathlib import Path
 
-here = os.path.abspath(os.path.dirname(__file__))
+here = Path(__file__).resolve().parent
+readme_path = here / "README.md"
+long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
-with codecs.open(os.path.join(here, "README.md"), encoding="utf-8") as fh:
-    long_description = "\n" + fh.read()
+VERSION = "0.1.0"
+DESCRIPTION = "Preprocess and process ISS data"
+LONG_DESCRIPTION = (
+    "Process ISS data: align cycles, stitch/retile, export SpaceTx format, and decode."
+)
 
-VERSION = '0.0.0'
-DESCRIPTION = 'Package used to preprocess and process ISS data'
-LONG_DESCRIPTION = 'This package can be used to process ISS data, that includes the preprocessing of image data (aligning images across squencing cycles and the subsequent stitching of tiles and tiling). In addition, there are functions included which allows for the formatting of the data to SpaceTX format and the subsequent decoding.'
-
-# Setting up
 setup(
-    name="ISS_processing",
+    name="ISS_preprocessing",
     version=VERSION,
     author="Christoffer Mattsson Langseth",
-    author_email="<christoffer.langseth@scilifelab.se>",
+    author_email="christoffer.langseth@scilifelab.se",
     description=DESCRIPTION,
+    long_description=long_description or LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
-    long_description=long_description,
-    packages=find_packages(),
-    install_requires=[],
-    keywords=['python', 'spatial transcriptomics', 
-            'spatial resolved transcriptomics', 
-            'in situ sequencing', 
-            'ISS','decoding'],
+    packages=find_packages(exclude=("Notebooks", "tests", "tests.*")),
+    include_package_data=True,
+    install_requires=[
+        "numpy",
+        "scipy",
+        "tifffile",
+        "PyYAML",
+        # add other dependencies here
+    ],
+    python_requires=">=3.9",
+    keywords=[
+        "python",
+        "spatial transcriptomics",
+        "spatially resolved transcriptomics",
+        "in situ sequencing",
+        "ISS",
+        "decoding",
+    ],
     classifiers=[
-        "Development Status :: 1 - Planning",
-        "Intended Audience :: Researchers",
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
         "Programming Language :: Python :: 3",
-        "Operating System :: Unix",
-        "Operating System :: MacOS :: MacOS X",
-        "Operating System :: Microsoft :: Windows",
-    ]
+        "Programming Language :: Python :: 3 :: Only",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+    ],
 )

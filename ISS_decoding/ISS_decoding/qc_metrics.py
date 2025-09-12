@@ -3,144 +3,298 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-def quality_per_gene(reads,on='quality_mean',gene_name='target',format_base_quality=False):
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads['qc_base'+str(col+1)]=list(quality_per_base.loc[:,col])
-    score=on
-    ordervals=reads.groupby(gene_name).mean()[score].sort_values()
-    valsdict=dict(zip(ordervals.index,np.round(ordervals,2)))
-    reads['meangenequality']=list(reads[gene_name].map(valsdict))
-    reads=reads.sort_values(by='meangenequality')
-    plt.figure(figsize=(6,len(valsdict)/1.2))
-    sns.violinplot(y=gene_name, x=score, data=reads)
-    plt.title([score,'for each gene'])
+
+def quality_per_gene(
+    reads: pd.DataFrame,
+    on: str = 'quality_mean',
+    gene_name: str = 'target',
+    max_genes: int = 50
+):
+    """
+    Violin plot of a given quality score per gene/target,
+    ordered by mean quality. Limits to top-N by count to avoid crowding.
+
+    Parameters
+    ----------
+    reads : pd.DataFrame
+        Decoded reads with at least [gene_name, on].
+    on : str
+        Quality metric to plot (default = 'quality_mean').
+    gene_name : str
+        Column to group by (default = 'target').
+    max_genes : int
+        Maximum number of categories to display (default = 50).
+    """
+    df = reads.copy()
+    df[on] = pd.to_numeric(df[on], errors="coerce")
+
+    # Compute means
+    ordervals = df.groupby(gene_name)[on].mean().sort_values()
+
+    # Limit to top N (by number of reads)
+    top_genes = df[gene_name].value_counts().head(max_genes).index
+    df = df[df[gene_name].isin(top_genes)]
+    ordervals = ordervals.loc[ordervals.index.intersection(top_genes)]
+
+    # Figure height scales with categories but capped
+    height = max(4, min(20, len(ordervals) * 0.3))
+    plt.figure(figsize=(6, height))
+
+    sns.violinplot(
+        y=gene_name, x=on, data=df,
+        order=ordervals.index,
+        density_norm="width", inner="box"
+    )
+    plt.title(f"{on} per {gene_name} (top {len(ordervals)})")
+    plt.tight_layout()
+
     return ordervals
-def quality_per_cycle(reads,cycles=5,format_base_quality=False):
-    bases=cycles
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
+
+def quality_per_cycle(
+    reads,
+    cycles: int = 5,
+    format_base_quality: bool = False
+):
+    """
+    Violin plot of quality per sequencing cycle.
+    """
+    if not format_base_quality:
+        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace('[', '', regex=False)
+        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace(']', '', regex=False)
+        quality_per_base = pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
         for col in quality_per_base.columns:
-            reads['qc_cycle'+str(col+1)]=list(quality_per_base.loc[:,col])
-    ess=[]
-    for e in range(1,bases+1):
-        ess.append('qc_cycle'+str(e))
-    qualities=reads.loc[:,ess]
-    qlt=pd.DataFrame(columns=['quality','base'])
-    qualist=[]
-    baselist=[]
-    for qual in qualities.columns:
-        qualist=qualist+list(qualities[qual])
-        qa=[qual]*len(qualities)
-        baselist=baselist+list(qa)
-    output=pd.DataFrame(columns=['quality','cycle'])
-    output['quality']=qualist
-    output['cycle']=baselist
-    plt.figure(figsize=(bases*2,7))
+            reads[f'qc_cycle{col+1}'] = quality_per_base[col]
+
+    cycle_cols = [f'qc_cycle{i}' for i in range(1, cycles+1)]
+    qualities = reads.loc[:, cycle_cols]
+
+    output = pd.DataFrame({
+        'quality': qualities.values.ravel(),
+        'cycle': np.repeat(qualities.columns, len(qualities))
+    })
+
+    plt.figure(figsize=(cycles * 2, 7))
     sns.violinplot(y='quality', x='cycle', data=output)
     plt.title('Qualities for each cycle')
-def compare_scores(reads,score1='quality_minimum',score2='quality_mean',kind='kde',color='#3266a8',format_base_quality=False,hue=None): # option for kind are “scatter” | “kde” | “hist” | “hex” | “reg” | “resid” 
-    if hue=='assigned':
-        reads['assigned']=list(~reads['target'].isna())
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads['qc_base'+str(col+1)]=list(quality_per_base.loc[:,col])
-    sns.jointplot(x=reads.loc[:,score1], y=reads.loc[:,score2], kind=kind, color=color,hue=reads[hue])
 
-def plot_scores(reads,on='quality_mean',hue='None',log_scale=False,format_base_quality=False,palette='ch:rot=-.25,hue=1,light=.75'):
-    if hue=='assigned':
-        reads['assigned']=list(~reads['target'].isna())
-    if format_base_quality==False:
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace('[','')
-        reads['quality_all_bases']=reads['quality_all_bases'].str.replace(']','')
-        quality_per_base=pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
+
+def compare_scores(
+    reads,
+    score1: str = 'quality_minimum',
+    score2: str = 'quality_mean',
+    kind: str = 'kde',
+    color: str = '#3266a8',
+    format_base_quality: bool = False,
+    hue: str = None
+):
+    """
+    Jointplot comparing two quality scores.
+    kind options: 'scatter' | 'kde' | 'hist' | 'hex' | 'reg' | 'resid'
+    """
+    if hue == 'assigned':
+        reads['assigned'] = ~reads['target'].isna()
+
+    if not format_base_quality:
+        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace('[', '', regex=False)
+        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace(']', '', regex=False)
+        quality_per_base = pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
         for col in quality_per_base.columns:
-            reads['qc_base '+str(col+1)]=list(quality_per_base.loc[:,col])
-    sns.histplot(reads,x=on, hue=hue,multiple="stack",palette=palette,edgecolor=".3",linewidth=.5,log_scale=False)
-    if hue=='assigned':
+            reads[f'qc_base{col+1}'] = quality_per_base[col]
+
+    sns.jointplot(x=score1, y=score2, data=reads, kind=kind, color=color, hue=hue)
+
+def plot_scores(
+    reads: pd.DataFrame,
+    on: str = 'quality_mean',
+    hue: str = None,
+    log_scale: bool = False,
+    format_base_quality: bool = False,
+    palette: str = 'ch:rot=-.25,hue=1,light=.75'
+):
+    """
+    Makes two plots:
+      1) Histogram (stacked by hue)
+      2) KDE density plot (if hue is provided)
+    """
+    df = reads.copy()
+
+    # Assign 'assigned' if needed
+    if hue == 'assigned':
+        df['assigned'] = ~df['target'].isna()
+
+    # Expand base qualities if requested
+    if not format_base_quality and 'quality_all_bases' in df:
+        df['quality_all_bases'] = df['quality_all_bases'].str.replace('[', '', regex=False)
+        df['quality_all_bases'] = df['quality_all_bases'].str.replace(']', '', regex=False)
+        quality_per_base = pd.DataFrame(list(df['quality_all_bases'].str.split(','))).astype(float)
+        for col in quality_per_base.columns:
+            df[f'qc_base{col+1}'] = quality_per_base[col]
+
+    # Ensure numeric
+    if on in df.columns:
+        df[on] = pd.to_numeric(df[on], errors='coerce')
+
+    # --- Plot 1: histogram ---
+    plt.figure(figsize=(8, 6))
+    sns.histplot(
+        data=df, x=on, hue=hue,
+        multiple="stack", palette=palette,
+        edgecolor=".3", linewidth=.5,
+        log_scale=log_scale
+    )
+    plt.title(f"Histogram of {on}")
+    plt.tight_layout()
+
+    # --- Plot 2: KDE density (only if hue provided) ---
+    if hue is not None:
         sns.displot(
-        data=reads,
-        x=on, hue=hue,
-        kind="kde", height=6,
-        multiple="fill", clip=(0, None),
-        palette=palette,
+            data=df,
+            x=on, hue=hue,
+            kind="kde", height=6,
+            multiple="fill",   # <-- change to "layers" or "stack"
+            palette=palette,
+            alpha=0.7
         )
-def plot_frequencies(reads,on='targets'):
-    readssum=reads.groupby(on).count()
-    readssum[on]=list(readssum.index)
-    readssum=readssum.sort_values(by='fov')
-    plt.figure(figsize=(10,len(readssum)/4))
-    plt.title('Number of each '+on)
-    ax=sns.barplot(x="fov", y="target", data=readssum)
-    ax.set(xlabel='counts', ylabel=on)
-    subset=readssum.iloc[:,0:1]
-    subset.columns=['counts']
-    return subset
-def plot_expression(reads,key='target',colorcode="colorblind",xcolumn='xc',ycolumn='yc',genes='all',size=8,background='white',figuresize=(10,7),save=None,format='pdf',title_color='black'): 
-    adataobs=reads
-    sizecols=len(adataobs[key].unique())
-    cls=sns.color_palette(colorcode,sizecols)
-    cls2=cls.as_hex()
-    colors=dict(zip(adataobs[key].unique(),cls2))
-    #cl.apply(lambda x: colors[x])
+
+
+def plot_frequencies(reads, on: str = 'target', max_categories: int = 50):
+    """
+    Bar plot of counts per category (e.g. per gene, per target, per FOV).
+    Returns a DataFrame with counts.
+
+    Parameters
+    ----------
+    reads : pd.DataFrame
+        Input data containing the column to count.
+    on : str
+        Column name to count frequencies for.
+    max_categories : int
+        Maximum number of categories to show (most frequent).
+    """
+    if on not in reads.columns:
+        raise KeyError(f"Column '{on}' not found in reads")
+
+    counts = reads[on].value_counts()
+
+    # Limit to top N categories if too many
+    if len(counts) > max_categories:
+        counts = counts.head(max_categories)
+
+    plt.figure(figsize=(10, max(4, len(counts) * 0.3)))
+    sns.barplot(x=counts.values, y=counts.index, color="steelblue")
+    plt.xlabel('counts')
+    plt.ylabel(on)
+    plt.title(f'Number of each {on} (top {len(counts)})')
+    plt.tight_layout()
+
+    return counts.rename_axis(on).reset_index(name='counts')
+
+
+
+def plot_expression(
+    reads,
+    key: str = 'target',
+    colorcode: str = "colorblind",
+    xcolumn: str = 'xc',
+    ycolumn: str = 'yc',
+    genes='all',
+    size: int = 8,
+    background: str = 'white',
+    figuresize=(10, 7),
+    save: str | None = None,
+    fmt: str = 'pdf',
+    title_color: str = 'black'
+):
+    """
+    Scatter‐map of reads colored by `key`.
+    - genes='all': plot all categories
+    - genes='individual': plot each category separately
+    - genes=list: plot selected categories
+    """
+    adataobs = reads.copy()
+    sizecols = len(adataobs[key].unique())
+    cls = sns.color_palette(colorcode, sizecols)
+    cls2 = cls.as_hex()
+    colors = dict(zip(adataobs[key].unique(), cls2))
+
     plt.rcParams['figure.facecolor'] = background
-    if genes=='all':
-        cl=adataobs[key]
+
+    if genes == 'all':
+        cl = adataobs[key]
         plt.figure(figsize=figuresize)
-        figa=plt.scatter(x=adataobs[xcolumn],y=adataobs[ycolumn],c=cl.apply(lambda x: colors[x]),s=size,linewidths=0, edgecolors=None)
+        plt.scatter(
+            x=adataobs[xcolumn], y=adataobs[ycolumn],
+            c=cl.map(colors), s=size, linewidths=0
+        )
         plt.axis('off')
-        if not save==None:
-            plt.savefig(save +'/map_all_genes_'+str(size)+'_'+background+'_'+key+'.'+format)
-    elif genes=='individual':
-        cl=adataobs[key]
+        if save:
+            plt.savefig(f"{save}/map_all_genes_{size}_{background}_{key}.{fmt}")
+
+    elif genes == 'individual':
         for each in adataobs[key].unique():
-            adatasubobs=adataobs.loc[adataobs.loc[:,key]==each,:]
+            adatasubobs = adataobs[adataobs[key] == each]
             plt.figure(figsize=figuresize)
-            plt.scatter(x=adataobs[xcolumn],y=adataobs[ycolumn],c='grey',s=size/5,linewidths=0, edgecolors=None)
-            cl=adatasubobs[key]
-            plt.scatter(x=adatasubobs[xcolumn],y=adatasubobs[ycolumn],c=cl.apply(lambda x: colors[x]),s=size,linewidths=0, edgecolors=None)
+            plt.scatter(
+                x=adataobs[xcolumn], y=adataobs[ycolumn],
+                c='grey', s=size/5, linewidths=0
+            )
+            plt.scatter(
+                x=adatasubobs[xcolumn], y=adatasubobs[ycolumn],
+                c=adatasubobs[key].map(colors), s=size, linewidths=0
+            )
             plt.axis('off')
-            plt.title(str(each)+':' + str(len(adatasubobs))+' reads',color=title_color)
-            if not save==None:
-                plt.savefig(save +'/map_individual_cluster_'+str(each)+'_'+str(size)+background+'_'+key+'.'+format)
+            plt.title(f"{each}: {len(adatasubobs)} reads", color=title_color)
+            if save:
+                plt.savefig(f"{save}/map_individual_cluster_{each}_{size}{background}_{key}.{fmt}")
+
     else:
-        adatasubobs=adataobs.loc[adataobs[key].isin(genes),:]
+        adatasubobs = adataobs[adataobs[key].isin(genes)]
         plt.figure(figsize=figuresize)
-        plt.scatter(x=adataobs.X,y=adataobs.Y,c='grey',s=size/5,linewidths=0, edgecolors=None)
-        cl=adatasubobs[key]
-        plt.scatter(x=adatasubobs.X,y=adatasubobs.Y,c=cl.apply(lambda x: colors[x]),s=size,linewidths=0, edgecolors=None)
+        plt.scatter(
+            x=adataobs[xcolumn], y=adataobs[ycolumn],
+            c='grey', s=size/5, linewidths=0
+        )
+        plt.scatter(
+            x=adatasubobs[xcolumn], y=adatasubobs[ycolumn],
+            c=adatasubobs[key].map(colors), s=size, linewidths=0
+        )
         plt.axis('off')
         plt.legend()
-        if not save==None:
-                s=''
-                for element in genes:
-                    s=s+str(element)
-                print(s)
-                plt.savefig(save +'/map_group_of_clusters_'+str(s)+'_'+str(size)+background+'_'+key+'.'+format)
-    #        plt.title('Group: '+ paste(clusters))
+        if save:
+            gene_str = ''.join(map(str, genes))
+            plt.savefig(f"{save}/map_group_of_clusters_{gene_str}_{size}{background}_{key}.{fmt}")
+
     plt.rcParams['figure.facecolor'] = 'white'
-def filter_reads(reads,min_quality_mean=False,min_quality_minimum=False,max_distance=False,max_radius=False,min_radius=False,min_intensity=False,max_intensity=False):
-    readsfilt=reads
-    if not max_distance==False:
-        readsfilt=readsfilt.loc[readsfilt['distance']<max_distance,:]
-    if not min_quality_mean==False:
-        readsfilt=readsfilt.loc[readsfilt['quality_mean']>min_quality_mean,:]
-    if not min_quality_minimum==False:
-        readsfilt=readsfilt.loc[readsfilt['quality_minimum']>min_quality_minimum,:]
-    if not max_radius==False:
-        readsfilt=readsfilt.loc[readsfilt['radius']<max_radius,:]
-    if not min_radius==False:
-        readsfilt=readsfilt.loc[readsfilt['radius']>min_radius,:]
-    if not min_intensity==False:
-        readsfilt=readsfilt.loc[readsfilt['intensity']>min_intensity,:]
-    if not max_intensity==False:
-        readsfilt=readsfilt.loc[readsfilt['intensity']<max_intensity,:]
+
+
+def filter_reads(
+    reads,
+    min_quality_mean=False,
+    min_quality_minimum=False,
+    max_distance=False,
+    max_radius=False,
+    min_radius=False,
+    min_intensity=False,
+    max_intensity=False
+):
+    """
+    Filter reads by thresholds on various columns.
+    """
+    readsfilt = reads.copy()
+
+    if max_distance:
+        readsfilt = readsfilt[readsfilt['distance'] < max_distance]
+    if min_quality_mean:
+        readsfilt = readsfilt[readsfilt['quality_mean'] > min_quality_mean]
+    if min_quality_minimum:
+        readsfilt = readsfilt[readsfilt['quality_minimum'] > min_quality_minimum]
+    if max_radius:
+        readsfilt = readsfilt[readsfilt['radius'] < max_radius]
+    if min_radius:
+        readsfilt = readsfilt[readsfilt['radius'] > min_radius]
+    if min_intensity:
+        readsfilt = readsfilt[readsfilt['intensity'] > min_intensity]
+    if max_intensity:
+        readsfilt = readsfilt[readsfilt['intensity'] < max_intensity]
+
     return readsfilt

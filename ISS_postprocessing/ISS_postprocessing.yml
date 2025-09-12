@@ -1,0 +1,41 @@
+name: ISS_postprocessing
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.10
+  - pip
+  # Core scientific stack
+  - numpy=1.26        # avoids NumPy 2.x breakage
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scikit-image
+  - tifffile<2025.2.18
+  - anndata
+  - scanpy
+  - squidpy
+  - python-igraph       # needed for Leiden clustering
+  # GPU libraries
+  - cudatoolkit=11.8
+  - cudnn=8.9
+  - pytorch             # conda-forge/nvidia builds, stable with CUDA 11.8
+  - tensorflow=2.15     # last TF version for CUDA 11.x
+  # Jupyter support
+  - jupyter
+  - ipykernel
+  - pyzmq               # avoid "No module named 'zmq'" error
+  # Pip-only tools
+  - pip:
+      - numpy==1.26     # avoids NumPy 2.x breakage
+      - pciseq
+      - tangram-sc
+      - stardist
+      - cellpose
+      - opencv-python
+      - imageio
+      - diplib
+      - matplotlib-scalebar
+      - .

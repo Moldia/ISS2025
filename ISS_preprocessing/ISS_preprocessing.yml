@@ -1,0 +1,25 @@
+name: ISS_preprocessing
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - ipykernel
+  - numpy
+  - pandas
+  - dask
+  - opencv
+  - tqdm
+  - natsort
+  - aicspylibczi
+  - tifffile<2025.2.18
+  - zarr<3
+  # Optional GPU (comment out if not needed)
+  - cudatoolkit=11.2
+  - cudnn=8.1.0
+  - pip:
+      - ashlar
+      - readlif
+      - RedLionfish
+      # Install current project (non-editable)
+      - .
