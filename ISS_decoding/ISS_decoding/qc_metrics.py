@@ -5,32 +5,50 @@ import matplotlib.pyplot as plt
 
 
 def quality_per_gene(
-    reads,
+    reads: pd.DataFrame,
     on: str = 'quality_mean',
     gene_name: str = 'target',
-    format_base_quality: bool = False
+    max_genes: int = 50
 ):
     """
-    Violin plot of a given quality score per gene, ordered by mean quality.
-    Returns the ordered mean-quality Series.
+    Violin plot of a given quality score per gene/target,
+    ordered by mean quality. Limits to top-N by count to avoid crowding.
+
+    Parameters
+    ----------
+    reads : pd.DataFrame
+        Decoded reads with at least [gene_name, on].
+    on : str
+        Quality metric to plot (default = 'quality_mean').
+    gene_name : str
+        Column to group by (default = 'target').
+    max_genes : int
+        Maximum number of categories to display (default = 50).
     """
-    if not format_base_quality:
-        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace('[', '', regex=False)
-        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace(']', '', regex=False)
-        quality_per_base = pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
-        for col in quality_per_base.columns:
-            reads[f'qc_base{col+1}'] = quality_per_base[col]
+    df = reads.copy()
+    df[on] = pd.to_numeric(df[on], errors="coerce")
 
-    ordervals = reads.groupby(gene_name).mean()[on].sort_values()
-    valsdict = dict(zip(ordervals.index, np.round(ordervals, 2)))
-    reads['meangenequality'] = reads[gene_name].map(valsdict)
-    reads = reads.sort_values(by='meangenequality')
+    # Compute means
+    ordervals = df.groupby(gene_name)[on].mean().sort_values()
 
-    plt.figure(figsize=(6, len(valsdict) / 1.2))
-    sns.violinplot(y=gene_name, x=on, data=reads)
-    plt.title(f"{on} per {gene_name}")
+    # Limit to top N (by number of reads)
+    top_genes = df[gene_name].value_counts().head(max_genes).index
+    df = df[df[gene_name].isin(top_genes)]
+    ordervals = ordervals.loc[ordervals.index.intersection(top_genes)]
+
+    # Figure height scales with categories but capped
+    height = max(4, min(20, len(ordervals) * 0.3))
+    plt.figure(figsize=(6, height))
+
+    sns.violinplot(
+        y=gene_name, x=on, data=df,
+        order=ordervals.index,
+        density_norm="width", inner="box"
+    )
+    plt.title(f"{on} per {gene_name} (top {len(ordervals)})")
+    plt.tight_layout()
+
     return ordervals
-
 
 def quality_per_cycle(
     reads,
@@ -85,9 +103,8 @@ def compare_scores(
 
     sns.jointplot(x=score1, y=score2, data=reads, kind=kind, color=color, hue=hue)
 
-
 def plot_scores(
-    reads,
+    reads: pd.DataFrame,
     on: str = 'quality_mean',
     hue: str = None,
     log_scale: bool = False,
@@ -95,52 +112,83 @@ def plot_scores(
     palette: str = 'ch:rot=-.25,hue=1,light=.75'
 ):
     """
-    Histogram (stacked by hue) of a quality score.
+    Makes two plots:
+      1) Histogram (stacked by hue)
+      2) KDE density plot (if hue is provided)
     """
+    df = reads.copy()
+
+    # Assign 'assigned' if needed
     if hue == 'assigned':
-        reads['assigned'] = ~reads['target'].isna()
+        df['assigned'] = ~df['target'].isna()
 
-    if not format_base_quality:
-        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace('[', '', regex=False)
-        reads['quality_all_bases'] = reads['quality_all_bases'].str.replace(']', '', regex=False)
-        quality_per_base = pd.DataFrame(list(reads['quality_all_bases'].str.split(','))).astype(float)
+    # Expand base qualities if requested
+    if not format_base_quality and 'quality_all_bases' in df:
+        df['quality_all_bases'] = df['quality_all_bases'].str.replace('[', '', regex=False)
+        df['quality_all_bases'] = df['quality_all_bases'].str.replace(']', '', regex=False)
+        quality_per_base = pd.DataFrame(list(df['quality_all_bases'].str.split(','))).astype(float)
         for col in quality_per_base.columns:
-            reads[f'qc_base{col+1}'] = quality_per_base[col]
+            df[f'qc_base{col+1}'] = quality_per_base[col]
 
+    # Ensure numeric
+    if on in df.columns:
+        df[on] = pd.to_numeric(df[on], errors='coerce')
+
+    # --- Plot 1: histogram ---
+    plt.figure(figsize=(8, 6))
     sns.histplot(
-        reads, x=on, hue=hue,
+        data=df, x=on, hue=hue,
         multiple="stack", palette=palette,
         edgecolor=".3", linewidth=.5,
         log_scale=log_scale
     )
+    plt.title(f"Histogram of {on}")
+    plt.tight_layout()
 
-    if hue == 'assigned':
+    # --- Plot 2: KDE density (only if hue provided) ---
+    if hue is not None:
         sns.displot(
-            data=reads,
+            data=df,
             x=on, hue=hue,
             kind="kde", height=6,
-            multiple="fill", clip=(0, None),
-            palette=palette
+            multiple="fill",   # <-- change to "layers" or "stack"
+            palette=palette,
+            alpha=0.7
         )
 
 
-def plot_frequencies(reads, on: str = 'target'):
+def plot_frequencies(reads, on: str = 'target', max_categories: int = 50):
     """
-    Bar plot of counts per category (e.g. per gene or per FOV).
+    Bar plot of counts per category (e.g. per gene, per target, per FOV).
     Returns a DataFrame with counts.
+
+    Parameters
+    ----------
+    reads : pd.DataFrame
+        Input data containing the column to count.
+    on : str
+        Column name to count frequencies for.
+    max_categories : int
+        Maximum number of categories to show (most frequent).
     """
-    readssum = reads.groupby(on).count()
-    readssum[on] = readssum.index
-    readssum = readssum.sort_values(by='fov')
+    if on not in reads.columns:
+        raise KeyError(f"Column '{on}' not found in reads")
 
-    plt.figure(figsize=(10, len(readssum) / 4))
-    plt.title(f'Number of each {on}')
-    ax = sns.barplot(x="fov", y=on, data=readssum)
-    ax.set(xlabel='counts', ylabel=on)
+    counts = reads[on].value_counts()
 
-    subset = readssum.iloc[:, 0:1]
-    subset.columns = ['counts']
-    return subset
+    # Limit to top N categories if too many
+    if len(counts) > max_categories:
+        counts = counts.head(max_categories)
+
+    plt.figure(figsize=(10, max(4, len(counts) * 0.3)))
+    sns.barplot(x=counts.values, y=counts.index, color="steelblue")
+    plt.xlabel('counts')
+    plt.ylabel(on)
+    plt.title(f'Number of each {on} (top {len(counts)})')
+    plt.tight_layout()
+
+    return counts.rename_axis(on).reset_index(name='counts')
+
 
 
 def plot_expression(
