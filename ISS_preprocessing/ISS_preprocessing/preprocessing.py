@@ -83,6 +83,26 @@ def deconvolve_image(input_image, psf_image, output_image, iterations, tilesize=
     except Exception as e:
         print(f"\033[91mUnexpected error: {e}\033[0m")
 
+def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
+    """
+    Check if a file exists and is larger than a minimum size (default 1 KB).
+    This helps detect corrupted or empty files from failed previous runs.
+
+    Parameters
+    ----------
+    path : Path
+        Path to the file being checked.
+    min_size : int, optional
+        Minimum file size in bytes. Default is 1024 (1 KB).
+
+    Returns
+    -------
+    bool
+        True if the file exists and is valid, False otherwise.
+    """
+    return path.exists() and path.stat().st_size > min_size
+
+
 
 # -------------------------------------------------------------------------------------
 # MAIN FUNCTION FOR LEICA PREPROCESSING
@@ -804,7 +824,7 @@ def align_and_stitch(
     ffp=None,
     dfp=None,
     plates=False,
-    quiet=False,
+    quiet=True,
     version=False):
     """
     Wrapper function for the Ashlar tool for image alignment and mosaicking.
@@ -947,8 +967,9 @@ def align_and_stitch(
             mosaic_args['verbose'] = True
 
         # Define temporary Ashlar output pattern (0-indexed cycles)
+        tmp_path = region_directory / "preprocessing" / "ashlar_tmp"
         tmp_pattern = str(
-            region_directory / "preprocessing" / "ashlar_tmp" / "Cycle{cycle}_ch{channel}.tif"
+            tmp_path / "Cycle{cycle}_ch{channel}.tif"
         )
         Path(tmp_pattern).parent.mkdir(parents=True, exist_ok=True)
     
@@ -993,7 +1014,7 @@ def align_and_stitch(
                     raise FileNotFoundError(f"Expected {tmp_file} not found")
                 final_file = stitched_dir / f"Cycle{cyc}_ch{ch}.tif"
                 tmp_file.rename(final_file)
-                print(f"Moved {tmp_file} → {final_file}")
+        print(f"Moved stitched and aligned images from {tmp_path} → {stitched_dir}")
 
         # Clean up temporary folder
         if tmp_dir.exists():
