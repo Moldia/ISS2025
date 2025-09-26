@@ -14,6 +14,7 @@ dependencies:
   - aicspylibczi
   - tifffile<2025.2.18
   - zarr<3
+  - openjdk=11
   # Optional GPU (comment out if not needed)
   - cudatoolkit=11.2
   - cudnn=8.1.0
