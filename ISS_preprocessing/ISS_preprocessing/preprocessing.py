@@ -1,4 +1,5 @@
 
+
 # --- Standard Library ---
 import os
 import re
@@ -23,6 +24,7 @@ from tqdm import tqdm
 from natsort import natsorted
 from aicspylibczi import CziFile
 from readlif.reader import LifFile
+import nd2
 
 # --- Local Modules ---
 import RedLionfishDeconv as rl
@@ -102,12 +104,121 @@ def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
     """
     return path.exists() and path.stat().st_size > min_size
 
+def normalize_czi_array(arr, dims):
+    """
+    Normalize CZI numpy array into shape (M, Z, C, Y, X).
+    Missing dimensions are inserted as singleton axes.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Array from CziFile.asarray().
+    dims : dict
+        Dimension sizes from CziFile.dims.
+
+    Returns
+    -------
+    np.ndarray
+        Array reshaped to (M, Z, C, Y, X).
+    """
+
+    # Extract sizes (default to 1 if missing)
+    s = dims.get("S", 1)   # scenes
+    m = dims.get("M", 1)   # mosaic tiles
+    z = dims.get("Z", 1)   # z-slices
+    c = dims.get("C", 1)   # channels
+    y = dims.get("Y")
+    x = dims.get("X")
+
+    # Collapse S and M into one "M"
+    msize = s * m
+
+    expected_size = msize * z * c * y * x
+    if arr.size != expected_size:
+        raise ValueError(
+            f"Array size mismatch: got {arr.shape}, "
+            f"expected total {expected_size} "
+            f"from sizes M={msize}, Z={z}, C={c}, Y={y}, X={x}"
+        )
+
+    arr = arr.reshape((msize, z, c, y, x))
+    return arr
+
+def normalize_dims_shape(czi):
+    """
+    Normalize dims_shape from aicspylibczi.CziFile.get_dims_shape() to always be a dict {axis: size}.
+    Flexible for different versions of aicspylibczi:
+      - dict already → return as-is
+      - list of dicts → unpack axis: (start, size) → keep only size
+      - list of tuples → take first two items (axis, size)
+    """
+    dims_shape = czi.get_dims_shape()
+
+    if isinstance(dims_shape, dict):
+        return dims_shape
+
+    if isinstance(dims_shape, list):
+        out = {}
+        for elem in dims_shape:
+            if isinstance(elem, dict):
+                # Example: {'X': (0, 2048), 'Y': (0, 2048), ...}
+                for axis, rng in elem.items():
+                    if isinstance(rng, tuple) and len(rng) == 2:
+                        out[axis] = rng[1]  # take size only
+                    else:
+                        raise ValueError(f"Unexpected value for axis {axis}: {rng}")
+
+            elif isinstance(elem, tuple) and len(elem) >= 2:
+                # Example: ("X", 2048)
+                axis, size = elem[0], elem[1]
+                out[axis] = size
+
+            else:
+                raise ValueError(f"Unexpected element in dims_shape: {elem}")
+
+        return out
+
+    raise TypeError(f"Unexpected dims_shape type: {type(dims_shape)}")
+
+
+def normalize_nd2_array(arr, sizes):
+    """
+    Normalize ND2 numpy array into shape (M, Z, C, Y, X).
+    Missing dimensions are inserted as singleton axes (size=1).
+
+    Parameters:
+        arr (np.ndarray): array from nd2.imread() or f.to_dask().compute()
+        sizes (dict): dimension sizes from ND2File.sizes
+
+    Returns:
+        np.ndarray: array reshaped to (M, Z, C, Y, X)
+    """
+    m = sizes.get("M", 1)
+    z = sizes.get("Z", 1)
+    c = sizes.get("C", 1)
+    y = sizes.get("Y")
+    x = sizes.get("X")
+
+    # Make sure array has the right number of elements
+    expected_size = m * z * c * y * x
+    if arr.size != expected_size:
+        raise ValueError(
+            f"Array size mismatch: got {arr.shape}, expected total {expected_size} "
+            f"from sizes M={m}, Z={z}, C={c}, Y={y}, X={x}"
+        )
+
+    # Reshape into consistent 5D layout
+    arr = arr.reshape((m, z, c, y, x))
+    return arr
+
+
+
 
 
 # -------------------------------------------------------------------------------------
-# MAIN FUNCTION FOR LEICA PREPROCESSING
+# MAIN FUNCTION FOR PREPROCESSING
 # -------------------------------------------------------------------------------------
-def preprocessing_main_leica(input_dirs,
+def preprocessing_main(input_dirs,
                             cycles,
                             output_dir_prefix,
                             mode,
@@ -120,10 +231,10 @@ def preprocessing_main_leica(input_dirs,
                             chunk_size=None):
     
     """
-    Main preprocessing pipeline for Leica microscopy image data.
+    Main preprocessing pipeline for microscopy image data.
 
     This function processes microscopy images stored in various formats/modes 
-    (autosaved TIFF, exported TIFF, or LIF files) and performs operations such as 
+    (autosaved TIFF, exported TIFF, LIF, CZI and Nd2 files) and performs operations such as 
     region detection, deconvolution, and creation of OME-TIFF files. It organizes 
     outputs into directories, manages PSF generation, and optionally applies 
     Maximum Intensity Projection (MIP).
@@ -176,7 +287,7 @@ def preprocessing_main_leica(input_dirs,
     
     script_start_time = time.time()
 
-    valid_modes = {'tif_autosaved', 'tif_exported', 'lif'}
+    valid_modes = {'tif_autosaved', 'tif_exported', 'lif', 'nd2', 'czi'}
     if mode not in valid_modes:
         raise ValueError(f"Unsupported mode: {mode}. Choose from {valid_modes}.")
 
@@ -188,7 +299,7 @@ def preprocessing_main_leica(input_dirs,
         raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
 
     # DECONVOLUTION
-    region_directories = deconvolve_leica(
+    region_directories = deconvolve_and_mip(
                             input_dirs=input_dirs,
                             cycles=cycles,
                             output_dir_prefix=output_dir_prefix, 
@@ -224,7 +335,7 @@ def preprocessing_main_leica(input_dirs,
 
    
 
-def deconvolve_leica(
+def deconvolve_and_mip(
     input_dirs, 
     cycles ,
     output_dir_prefix: Path,
@@ -251,7 +362,7 @@ def deconvolve_leica(
     """ 
     print(f"\033[1;96mDeconvolution and mipping\033[0m")
     
-    valid_modes = {'tif_autosaved', 'tif_exported', 'lif'}
+    valid_modes = {'tif_autosaved', 'tif_exported', 'lif', 'nd2', 'czi'}
     if mode not in valid_modes:
         raise ValueError(f"Unsupported mode: {mode}. Choose from {valid_modes}.")
 
@@ -334,6 +445,50 @@ def deconvolve_leica(
     
             # Use unique image names directly as region names 
             regions = sorted(set(image_names))
+
+       # --- Processing Zeiss .czi files ---
+        elif mode == 'czi':
+            czi_files = [f for f in input_dir.iterdir() if f.suffix == '.czi']
+            if not czi_files:
+                raise ValueError("No CZI files found in input_dir")
+        
+            file = czi_files[0] if len(czi_files) == 1 else czi_files[region_index]
+            print(f"Using CZI file: {file.name}")
+        
+            czi = CziFile(str(file))
+            dims = normalize_dims_shape(czi)
+        
+            print("CZI dims:", dims)
+        
+            # --- Regions (Scenes = S dimension) ---
+            num_regions = dims.get("S", 1)
+            regions = [f"Region_{i+1}" for i in range(num_regions)]        
+    
+
+        # --- Processing Nikon .nd2 files ---
+        elif mode == 'nd2':
+            nd2_files = [f for f in input_dir.iterdir() if f.suffix == '.nd2']
+            num_files = len(nd2_files)
+        
+            image_names = []
+            if num_files > 1:
+                # One ND2 per region
+                num_regions = num_files
+                for file in nd2_files:
+                    ndfile = nd2.ND2File(file)
+                    image_names.append(file.stem)
+                    ndfile.close()
+            elif num_files == 1:
+                # One ND2 with multiple regions
+                ndfile = nd2.ND2File(nd2_files[0])
+                num_regions = ndfile.sizes.get("M", 1)  # number of mosaic positions
+                image_names = [f"Region_{i+1}" for i in range(num_regions)]
+                ndfile.close()
+            else:
+                raise ValueError("No ND2 files found in input_dir")
+        
+            regions = sorted(set(image_names))
+
         # rename regions    
         region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
     
@@ -381,33 +536,48 @@ def deconvolve_leica(
                 # --- Find all channels from filenames ---
                 channel_set = set()
                 if mode == 'tif_autosaved':
-                    channel_pattern = re.compile(r'--C(\d{2})')
+                    channel_pattern = re.compile(r'--C(\d{2})')    # channels in format "--C01", "--C02", ...
                 elif mode == 'tif_exported':
-                    channel_pattern = re.compile(r'_ch(\d+)')
+                    # Match "_ch00", "_Ch00", "_CH00", "_ch0", etc. (case-insensitive)
+                    channel_pattern = re.compile(r'_c[hH](\d+)', re.IGNORECASE)
+
+            
+                # Populate channel set by scanning filenames
                 for f in filtered_tifs:
                     if (m := channel_pattern.search(f.name)):
-                        channel_set.add(int(m.group(1)))
+                        channel_set.add(int(m.group(1)))           # store channels as integers
+            
                 channels = sorted(channel_set)
-                print(f"Detected channels: {channels}")
-    
-        
-                # Select regex pattern and sample indicator depending on mode
+                if not channels:
+                    raise RuntimeError(f"No channels detected in files for region {region}")
+
+                # --- Detect tiles and find sample tile(s) ---
                 if mode == 'tif_autosaved':
-                    tile_pattern = re.compile(r'--Stage(\d+)--')    # tile number in "--StageXX--"
-                    sample_indicator = '--Stage00--'
+                    tile_pattern = re.compile(r'--Stage(\d+)--')      # tile number in "--StageXX--"
+                    sample_indicator = re.compile(r'--Stage0+--')     # matches "--Stage0--", "--Stage00--", etc.
                 elif mode == 'tif_exported':
-                    tile_pattern = re.compile(r'_s(\d+)_')          # tile number in "_sX_"
-                    sample_indicator = '_s0_'
-        
+                    tile_pattern = re.compile(r'_s(\d+)_')            # capture tile number in "_s###_"
+                    sample_indicator = re.compile(r'_s0+_')           # matches "_s0_", "_s00_", "_s000_", etc.
+                
                 # Extract tile numbers and collect sample tile files
-                tiles = set()      # unique tile numbers
-                sample_tiles = []  # files belonging to tile 0 (used to calculate size_z)
+                tiles = set()        # unique tile numbers
+                sample_tiles = []    # files belonging to tile 0 (any form of 0-padded index)
                 
                 for f in filtered_tifs:
-                    if (m := tile_pattern.search(f.name)):
-                        tiles.add(m.group(1))
-                    if sample_indicator in f.name:
+                    if tile_pattern.search(f.name):
+                        tiles.add(tile_pattern.search(f.name).group(1))   # collect tile numbers
+                    if sample_indicator.search(f.name):                   # regex match for "tile 0"
                         sample_tiles.append(f)
+
+                # Safe fallback: if no tile 0 exists, pick the lowest available tile
+                if not sample_tiles and tiles:
+                    lowest_tile = min(int(t) for t in tiles)
+                    # Build regex dynamically depending on mode
+                    if mode == 'tif_exported':
+                        fallback_pattern = re.compile(rf'_s0*{lowest_tile}_')
+                    else:  # tif_autosaved
+                        fallback_pattern = re.compile(rf'--Stage0*{lowest_tile}--')
+                    sample_tiles = [f for f in filtered_tifs if fallback_pattern.search(f.name)]
         
                 # Sort tile list and compute total number of tiles
                 tiles = sorted(tiles, key=int)
@@ -417,6 +587,9 @@ def deconvolve_leica(
                 # Infer image dimensions (X, Y) from the first sample tile
                 sample_tile = tifffile.imread(sample_tiles[0])
                 image_dimensions = sample_tile.shape[::-1]  # (width, height)
+
+                print(f"Tiles: {n_tiles}, Z-slices: {size_z}, Channels: {len(channels)}")
+                print(f"Image dimensions: {image_dimensions[0]} × {image_dimensions[1]} (X × Y)")
         
                 # --- Pre-index files by tile and channel to speed up lookups ---
                 tile_to_files = {}
@@ -467,11 +640,84 @@ def deconvolve_leica(
                 size_z = dims.z                                  # number of Z slices
                 n_tiles = dims.m                                 # number of mosaic tiles (if any)
                 tiles = list(range(n_tiles))                     # tile indices 0..n_tiles-1
+                tiles = sorted(tiles, key=int)
                 mosaic = image_dict.get('mosaic_position', None) # Get mosaic positions
                 num_channels = image_dict['channels']
                 channels = list(range(num_channels))  # [0, 1, 2, 3, 4, 5]
-    
-    
+
+            elif mode == 'czi':
+                # For each region, get tile, channel, and Z info
+                size_z = dims.get("Z", 1)
+                num_channels = dims.get("C", 1)
+                n_tiles = dims.get("M", 1)
+                image_dimensions = (dims.get("X"), dims.get("Y"))
+                channels = list(range(num_channels))
+                tiles = list(range(n_tiles))
+                tiles = sorted(tiles, key=int)
+            
+                print(
+                    f"{n_tiles} tiles, {size_z} Z-slices, {num_channels} channels, "
+                    f"image size {image_dimensions[0]} × {image_dimensions[1]}"
+                )
+
+            
+            elif mode == 'nd2':
+                print(f"\033[1;93m[ND2 MODE] Initializing Nikon ND2 processing for region {region}\033[0m")
+            
+                # Collect all .nd2 files in the input directory
+                nd2_files = [f for f in input_dir.iterdir() if f.suffix == '.nd2']
+                print(f"Found {len(nd2_files)} ND2 file(s) in input directory")
+            
+                # Pick the correct file depending on acquisition setup
+                filepath = nd2_files[0] if len(nd2_files) == 1 else nd2_files[region_index]
+                print(f"Using ND2 file: {filepath.name}")
+            
+                # --- Load ND2 and normalize to (M, Z, C, Y, X) ---
+                with nd2.ND2File(filepath) as f:
+                    sizes = f.sizes
+                    print("ND2 sizes:", sizes)   # e.g. {'X': 3789, 'Y': 3789, 'M': 5}
+            
+                    # Load full array
+                    arr = f.to_dask().compute()
+                    arr = normalize_nd2_array(arr, sizes)  # -> (M, Z, C, Y, X)
+            
+                    # Try extracting stage coordinates
+                    coords = []
+                    exp = f.experiment
+                    if hasattr(exp, "points") and exp.points:
+                        for p in exp.points:
+                            coords.append((p.x, p.y))
+                        print(f"Extracted {len(coords)} stage coordinate(s) from experiment.points")
+                    else:
+                        exp_str = str(exp)
+                        for match in re.finditer(r"x=([-+]?\d*\.?\d+), y=([-+]?\d*\.?\d+)", exp_str):
+                            coords.append((float(match.group(1)), float(match.group(2))))
+                        if coords:
+                            print(f"Extracted {len(coords)} stage coordinate(s) from regex parsing")
+                        else:
+                            print("\033[91m[WARN] No stage coordinates found in ND2 metadata\033[0m")
+                            print("Experiment object (repr):", repr(exp))
+                            print("Experiment object (str):", exp_str[:500], "..." if len(exp_str) > 500 else "")
+            
+                            # Debug raw metadata for deeper inspection
+                            try:
+                                meta = f.metadata
+                                print("Top-level ND2 metadata keys:", list(meta.keys()))
+                            except Exception as e:
+                                print(f"[DEBUG] Could not access f.metadata: {e}")
+            
+                # --- Assign variables for downstream code ---
+                msize = arr.shape[0]                       # number of tiles (M)
+                size_z = arr.shape[1]                      # z-slices
+                channels = list(range(arr.shape[2]))       # channel indices
+                image_dimensions = (arr.shape[4], arr.shape[3])  # (X, Y)
+                tiles = list(range(msize))
+                n_tiles = msize
+            
+                print(f"Normalized ND2 array shape: {arr.shape} (M, Z, C, Y, X)")
+                print(f"Tiles: {n_tiles}, Z-slices: {size_z}, Channels: {len(channels)}")
+                print(f"Image dimensions: {image_dimensions[0]} × {image_dimensions[1]} (X × Y)")
+
             # Check what files are expected to exist
             expected_files = [
                 (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
@@ -551,7 +797,52 @@ def deconvolve_leica(
                 # Write the XML tree to a file in the metadata output directory
                 tree = ET.ElementTree(data)
                 tree.write(metadata_directory / f"{image_name}.xml", encoding="utf-8", xml_declaration=True)
-        
+
+            elif mode == 'nd2':
+                data = ET.Element("Data")
+                image_elem = ET.SubElement(data, "Image", TextDescription="")
+            
+                attachment = ET.SubElement(
+                    image_elem,
+                    "Attachment",
+                    Name="TileScanInfo",
+                    Application="NIS-Elements",
+                    FlipX="0", FlipY="0", SwapXY="0"
+                )
+            
+                if coords:
+                    print(f"Extracting {len(coords)} stage coordinate(s) from ND2")
+                    for idx, (x, y) in enumerate(coords):
+                        ET.SubElement(
+                            attachment, "Tile",
+                            FieldX=str(idx),
+                            FieldY="0",
+                            PosX=f"{x:.10f}",
+                            PosY=f"{y:.10f}"
+                        )
+                else:
+                    if n_tiles == 1:
+                        print("[INFO] ND2 file has no stage coords but only one tile → writing dummy (0,0)")
+                        ET.SubElement(
+                            attachment, "Tile",
+                            FieldX="0",
+                            FieldY="0",
+                            PosX="0.0000000000",
+                            PosY="0.0000000000"
+                        )
+                    else:
+                        raise ValueError(
+                            f"No stage coordinates found in ND2 file {filepath.name}, "
+                            f"but multiple tiles detected ({n_tiles}). Cannot generate OME-TIFF without positions."
+                        )
+            
+                # Save XML file
+                xml_path = metadata_directory / f"{region}.xml"
+                tree = ET.ElementTree(data)
+                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                print(f"Metadata XML written: {xml_path}")
+            
+
             # ----- Step 3: Generate PSFs for all channels -----
             print('Calculating the PSF')
         
@@ -618,7 +909,7 @@ def deconvolve_leica(
                     tile_channel_start = time.time()
                     
                     # Choose output path depending on whether MIP (max intensity projection) is requested
-                    output_file_path = (mipped_directory if mip else stacked_directory) / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
+                    output_file_path = (mipped_directory if mip else stacked_directory) / f'Cycle{cycle}_s{tile}_ch{int(channel)}.tif'
         
                     # Skip processing if output file already exists
                     if output_file_path.exists():
@@ -633,6 +924,30 @@ def deconvolve_leica(
                         # For lif files, iterate through z-planes in the tile and channel
                         z_planes = [np.array(z_frame) for z_frame in image.get_iter_z(m=tile, c=channel)]
                         stacked_images = np.stack(z_planes, axis=0)
+
+                    elif mode == 'czi':
+                        # For CZI files: extract one region (S), one tile (M), all Z planes, one channel (C), full XY
+                        z_planes = []
+                        for z in range(size_z):
+                            img, shp = czi.read_image(
+                                S=int(region_index),   # current region
+                                M=int(tile),           # tile index
+                                C=int(channel),        # channel index
+                                Z=int(z)               # z-slice index
+                            )
+                            # img comes out as a numpy array, shape typically (1, 1, 1, Y, X)
+                            z_planes.append(img.squeeze())
+                    
+                        stacked_images = np.stack(z_planes, axis=0)  # shape: (Z, Y, X)
+                        
+
+                    
+
+                    elif mode == 'nd2':
+                        # ND2 array has shape (M, Z, C, Y, X)
+                        # Select one tile (M), all Z, one channel (C), full XY
+                        stacked_images = arr[int(tile), :, int(channel), :, :]
+
         
                     # Deconvolution with RedLionFish method
                     if deconvolution_method == 'redlionfish':
@@ -1145,588 +1460,7 @@ def retile_stitched_images(
             print(f"Tiling complete. Positions saved to {coords_csv_path}")
     
 
-def process_czi(input_file, outpath, mip=True, cycle=0, tile_size_x=2048, tile_size_y=2048):
-    """
-    Process CZI files, apply maximum intensity projection (if specified), 
-    and create an associated XML with metadata.
-    
-    Parameters:
-    - input_file: Path to the input CZI file.
-    - outpath: Directory where the processed images and XML will be saved.
-    - mip: Boolean to decide whether to apply maximum intensity projection. Default is True.
-    - cycle: Int to specify the cycle number. Default is 0.
-    - tile_size_x: Size of the tile in X dimension. Default is 2048.
-    - tile_size_y: Size of the tile in Y dimension. Default is 2048.
-    
-    Returns:
-    - A string indicating that processing is complete.
-    """
-    
-    # import packages 
-    import os
-    import xml.etree.ElementTree as ET
-    from aicspylibczi import CziFile
-    import aicspylibczi
-    from xml.dom import minidom
-    import numpy as np
-    from tqdm import tqdm
-    import pandas as pd
-    import tifffile
-    
-    # Create the output directory if it doesn't exist.
-    if not os.path.exists(outpath):
-        os.makedirs(outpath)
 
 
-    # Load the CZI file and retrieve its dimensions.
-    czi = aicspylibczi.CziFile(input_file)
-    dimensions = czi.get_dims_shape() 
-    chsize = dimensions[0]['C'][1]
-    try:
-        msize=dimensions[0]['M'][1]
-    except:
-        msize=0 
-    ssize = dimensions[0]['S'][1]
 
-    # Check if mip is True and cycle is not zero.
-    if mip and cycle != 0:
-        # Initialize placeholders for metadata.
-        Bxcoord = []
-        Bycoord = []
-        Btile_index = []
-        filenamesxml = []
-        Bchindex = []
 
-        # Loop through each mosaic tile and each channel.
-        for m in tqdm(range(0, msize)):
-            for ch in range (0, chsize):
-                # Get metadata and image data for the current tile and channel.
-                meta = czi.get_mosaic_tile_bounding_box(M=m, Z=0, C=ch)
-                img, shp = czi.read_image(M=m, C=ch)
-                
-                # Apply maximum intensity projection.
-                IM_MAX = np.max(img, axis=3)
-                IM_MAX = np.squeeze(IM_MAX, axis=(0,1,2,3))
-                
-                # Construct filename for the processed image.
-                n = str(0)+str(m+1) if m < 9 else str(m+1)
-                filename = 'Base_' + str(cycle) + '_c' + str(ch+1) + 'm' + str(n) + '_ORG.tif'
-                
-                # Save the processed image.
-                
-                tifffile.imwrite(outpath + filename, IM_MAX.astype('uint16'))
-                
-                # Append metadata to the placeholders.
-                Bchindex.append(ch)
-                Bxcoord.append(meta.x)
-                Bycoord.append(meta.y)
-                Btile_index.append(m)
-                filenamesxml.append(filename)
-
-        # Adjust the XY coordinates to be relative.
-        nBxcord = [x - min(Bxcoord) for x in Bxcoord]
-        nBycord = [y - min(Bycoord) for y in Bycoord]
-        
-        # Create a DataFrame to organize the collected metadata.
-        metadatalist = pd.DataFrame({
-            'Btile_index': Btile_index, 
-            'Bxcoord': nBxcord, 
-            'Bycoord': nBycord, 
-            'filenamesxml': filenamesxml,
-            'channelindex': Bchindex
-        })
-        
-        metadatalist = metadatalist.sort_values(by=['channelindex','Btile_index'])
-        metadatalist.reset_index(drop=True)
-
-        # Initialize the XML document structure.
-        export_doc = ET.Element('ExportDocument')
-        
-        # Populate the XML document with metadata.
-        for index, row in metadatalist.iterrows():
-            image_elem = ET.SubElement(export_doc, 'Image')
-            filename_elem = ET.SubElement(image_elem, 'Filename')
-            filename_elem.text = row['filenamesxml']
-            
-            bounds_elem = ET.SubElement(image_elem, 'Bounds')
-            bounds_elem.set('StartX', str(row['Bxcoord']))
-            bounds_elem.set('SizeX', str(tile_size_x))
-            bounds_elem.set('StartY', str(row['Bycoord']))
-            bounds_elem.set('SizeY', str(tile_size_y))
-            bounds_elem.set('StartZ', '0')
-            bounds_elem.set('StartC', '0')
-            bounds_elem.set('StartM', str(row['Btile_index']))
-            
-            zoom_elem = ET.SubElement(image_elem, 'Zoom')
-            zoom_elem.text = '1'
-
-        
-        # Save the constructed XML document to a file.
-        xml_str = ET.tostring(export_doc)
-        with open(outpath + 'Base_' + str(cycle) + '_info.xml', 'wb') as f:
-            f.write(xml_str)
-
-    return "Processing complete."
-
-def max_project_z(image, m, c):
-    # Initialize a list to hold all Z-plane data
-    z_planes = []
-
-    # Iterate over all Z-planes for the given timepoint and channel
-    for z_frame in image.get_iter_z(m=m, c=c):
-        # Convert the Pillow Image to a NumPy array
-        z_data = np.array(z_frame)
-        #print (z_data.shape)
-        z_planes.append(z_data)
-
-    # Stack all Z-planes along a new axis
-    z_stack = np.stack(z_planes, axis=0)
-    #print (z_stack.shape)
-
-    # Perform maximum intensity projection along the Z-axis (axis=0)
-    max_projection = np.max(z_stack, axis=0)
-
-    return max_projection
-    
-
-
-    
-def zen_OME_tiff(exported_directory, output_directory, channel_split=2, cycle_split=1, num_channels=5):
-    '''
-    This function makes OME-TIFF files from files exported from as tiff from ZEN, through the process_czi or to the deconvolve_czi functions.
-    
-    Note: This function assumes that you are using the Nilsson SOP for naming files. It will work on 1-tile sections.
-    Args:
-    - exported_directory: directory containing exported TIFF files.
-    - output_directory: directory to save the processed files.
-    - channel_split, cycle_split: indices for splitting filenames.
-    - num_channels: number of channels in the images.
-    
-    Returns:
-    - None. Writes processed images to output_directory.
-    '''
-
-    # Create the output directory if it doesn't exist
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-
-    # Filter out TIFF files from the directory
-    all_files = os.listdir(exported_directory)
-    tiff_files = [file for file in all_files if '.tif' in file]
-
-    # Split the filenames to extract tiles, channels, and rounds
-    split_tiles_df = pd.DataFrame(tiff_files)[0].str.split('m', expand=True)
-    split_channels_df = split_tiles_df[0].str.split('_', expand=True)
-    tiles = list(np.unique(split_tiles_df[1]))
-    channels = list(np.unique(split_channels_df[channel_split]))
-    rounds = list(np.unique(split_channels_df[cycle_split]))
-
-    # Iterate through rounds to process files
-    for _, round_number in enumerate(rounds):
-        tiff_files_round = [file for file in tiff_files if f'Base_{round_number}_' in file]
-        metadata_files = [file for file in all_files if 'info.xml' in file]
-        metadata_files_round = [file for file in metadata_files if f'_{round_number}_' in file]
-
-        # Parse metadata XML files to extract tile positions
-        for metadata_file in metadata_files_round:
-            xml_doc = minidom.parse(os.path.join(exported_directory, metadata_file))
-            tiles_xml, x_coords, y_coords = [], [], []
-            bounds_elements = xml_doc.getElementsByTagName('Bounds')
-            for elem in bounds_elements:
-                tiles_xml.append(int(elem.attributes['StartM'].value))
-                x_coords.append(float(elem.attributes['StartX'].value))
-                y_coords.append(float(elem.attributes['StartY'].value))
-                
-            unique_tiles_xml = list(np.unique(tiles_xml))
-            position_df = pd.DataFrame({
-                'x': x_coords[:len(unique_tiles_xml)],
-                'y': y_coords[:len(unique_tiles_xml)]
-            })
-            positions = np.array(position_df).astype(int)
-
-        # Write processed images to OME-TIFF format
-        with tifffile.TiffWriter(os.path.join(output_directory, f'cycle_{round_number}.ome.tif'), bigtiff=True) as tif:
-            for i in tqdm(range(len(tiles))):
-                position = positions[i]
-                tile = tiles[i]
-                tiff_files_tile = [file for file in tiff_files_round if f'm{tile}' in file and '._' not in file]
-                stacked_images = np.empty((num_channels, 2048, 2048))
-
-                for idx, image_file in enumerate(sorted(tiff_files_tile)):
-                    image_data = tifffile.imread(os.path.join(exported_directory, image_file))
-                    stacked_images[idx] = image_data.astype('uint16')
-
-                pixel_size = 0.1625
-                metadata = {
-                    'Pixels': {
-                        'PhysicalSizeX': pixel_size,
-                        'PhysicalSizeXUnit': 'µm',
-                        'PhysicalSizeY': pixel_size,
-                        'PhysicalSizeYUnit': 'µm'
-                    },
-                    'Plane': {
-                        'PositionX': [position[0] * pixel_size] * stacked_images.shape[0],
-                        'PositionY': [position[1] * pixel_size] * stacked_images.shape[0]
-                    }
-                }
-                tif.write(stacked_images.astype('uint16'), metadata=metadata)
-
-
-def lif_mipping(lif_path, output_folder, cycle):
-    file = LifFile(lif_path)
-    
-    os.makedirs(output_folder, exist_ok=True)
-    if len(file.image_list) > 1:
-        for index, image_dict in enumerate(file.image_list):
-            image_name = image_dict['name']
-            print (image_name)
-            mosaic=image_dict.get('mosaic_position', None)
-            #print (mosaic)
-            
-            # Build XML structure
-            data = ET.Element("Data")
-            image = ET.SubElement(data, "Image", TextDescription="")
-            attachment = ET.SubElement(image, "Attachment", Name="TileScanInfo", Application="LAS AF", FlipX="0", FlipY="0", SwapXY="0")
-
-            for x, y, pos_x, pos_y in mosaic:
-                ET.SubElement(attachment, "Tile", FieldX=str(x), FieldY=str(y),
-                              PosX=f"{pos_x:.10f}", PosY=f"{pos_y:.10f}")
-
-            # Create tree and write to file
-            tree = ET.ElementTree(data)
-
-            regionID=index+1
-            output_region=f'_R{regionID}'
-            output_subfolder=os.path.join(output_folder, output_region)
-            mipped_subfolder = f"{output_subfolder}/preprocessing/mipped/Base_{cycle}"
-            os.makedirs(mipped_subfolder, exist_ok=True)
-            os.makedirs(mipped_subfolder+'/MetaData', exist_ok=True)
-            print(f"Extracting metadata for: {image_name}")
-            image_name = image_name.replace('/', '_')
-            tree.write(f"{mipped_subfolder}/MetaData/{image_name}.xml", encoding="utf-8", xml_declaration=True)
-            print(f"Processing Image {index}: {image_name}")
-            image = file.get_image(index)
-            channels = image_dict['channels']
-            dims = image_dict['dims']
-
-            if dims.m == 1:
-                print("Single tile imaging.")
-                for c in range(channels):  # Loop through each channel
-                    max_projected = max_project_z(image, c)  # (y, x)
-                    # Clean filename
-                    clean_name = f"Base_{cycle}"
-                    filename = f"{clean_name}_s00_C0{c}.tif"
-                    output_path = os.path.join(mipped_subfolder, filename)
-
-                    tifffile.imwrite(output_path, max_projected.astype(np.uint16))
-                    print(f"Saved: {output_path}")
-
-            else:
-                for m in range(dims.m):  # Loop through each tile
-                    for c in range(channels):  # Loop through each channel
-                        max_projected = max_project_z(image,m, c)  # (y, x)
-                        # Clean filename
-                        clean_name = f"Base_{cycle}"
-                        filename = f"{clean_name}_s{m:02d}_C0{c}.tif"
-                        output_path = os.path.join(mipped_subfolder, filename)
-
-                        tifffile.imwrite(output_path, max_projected.astype(np.uint16))
-                        print(f"Saved: {output_path}")
-    else:
-        mipped_subfolder = f"{output_folder}/preprocessing/mipped/Base_{cycle}"
-        os.makedirs(mipped_subfolder, exist_ok=True)
-        os.makedirs(mipped_subfolder+'/MetaData', exist_ok=True)
-
-        for index, image_dict in enumerate(file.image_list):
-            image_name = image_dict['name']
-            mosaic=image_dict.get('mosaic_position', None)
-            #print (mosaic)
-            
-            # Build XML structure
-            data = ET.Element("Data")
-            image = ET.SubElement(data, "Image", TextDescription="")
-            attachment = ET.SubElement(image, "Attachment", Name="TileScanInfo", Application="LAS AF", FlipX="0", FlipY="0", SwapXY="0")
-
-            for x, y, pos_x, pos_y in mosaic:
-                ET.SubElement(attachment, "Tile", FieldX=str(x), FieldY=str(y),
-                              PosX=f"{pos_x:.10f}", PosY=f"{pos_y:.10f}")
-
-            # Create tree and write to file
-            tree = ET.ElementTree(data)
-            print(f"Extracting metadata for: {image_name}")
-            tree.write(f"{mipped_subfolder}/MetaData/{image_name}.xml", encoding="utf-8", xml_declaration=True)
-            
-            print(f"Processing Image {index}: {image_name}")
-            image = file.get_image(index)
-            channels = image_dict['channels']
-            dims = image_dict['dims']
-
-            if dims.m == 1:
-                print("Single tile imaging.")
-                for c in range(channels):  # Loop through each channel
-                    max_projected = max_project_z(image, c)  # (y, x)
-                    # Clean filename
-                    clean_name = f"Base_{cycle}"
-                    filename = f"{clean_name}_s00_C0{c}.tif"
-                    output_path = os.path.join(mipped_subfolder, filename)
-
-                    tifffile.imwrite(output_path, max_projected.astype(np.uint16))
-                    print(f"Saved: {output_path}")
-
-            else:
-                for m in range(dims.m):  # Loop through each tile
-                    for c in range(channels):  # Loop through each channel
-                        max_projected = max_project_z(image,m, c)  # (y, x)
-                        # Clean filename
-                        clean_name = f"Base_{cycle}"
-                        filename = f"{clean_name}_s{m:02d}_C0{c}.tif"
-                        output_path = os.path.join(mipped_subfolder, filename)
-
-                        tifffile.imwrite(output_path, max_projected.astype(np.uint16))
-                        print(f"Saved: {output_path}")
-
-'''
-This function has been developed around a dataset that is not representative of the typical nd2 format
-Tiles should be in the 'm' loop while in this case they are in the 'p' loop which I think it is for positions of
-single FOVs.
-
-def process_nd2(input_file, outpath, mip=True, cycle=0):
-    """
-    Process nd2 files, apply maximum intensity projection (if specified), 
-    and create an associated XML with metadata.
-    
-    Parameters:
-    - input_file: Path to the input nd2 file.
-    - outpath: Directory where the processed images and XML will be saved.
-    - mip: Boolean to decide whether to apply maximum intensity projection. Default is True.
-    - cycle: Int to specify the cycle number. Default is 0.
-    
-    Returns:
-    - A string indicating that processing is complete.
-    """
-    
-    # import packages 
-    import os
-    import pandas as pd
-    import re
-
-    import xml.etree.ElementTree as ET
-    import nd2
-    from xml.dom import minidom
-    import numpy as np
-    from tqdm import tqdm
-    import pandas as pd
-    import tifffile
-    
-    # Create the output directory if it doesn't exist.
-    if not os.path.exists(outpath):
-        os.makedirs(outpath)
-
-
-    # Load the nd2 into array and retrieve its dimensions.
-    big_file = nd2.imread(input_file)
-     
-    chsize = big_file.shape[2]
-    msize=big_file.shape[0]
-    ndfile = nd2.ND2File(input_file)
-   
-
-    # Check if mip is True and cycle is not zero.
-    if mip and cycle != 0:
-        # Initialize placeholders for metadata.
-        Bxcoord = []
-        Bycoord = []
-        Btile_index = []
-        filenamesxml = []
-        Bchindex = []
-        data_str=str(ndfile.experiment)
-        ndfile.close()
-        split_data = data_str.split('points=', 1)
-        positions_str = split_data[1]
-
-        # Remove the '])' from the end of the positions string
-        positions_str = positions_str[:-2]
-
-        # Split the positions string at each 'Position('
-        positions_list = positions_str.split('Position(')[1:]
-
-        # Initialize an empty list to store the Position() lines
-        positions_lines = []
-
-        # Iterate through the positions list and extract each line
-        for position in positions_list:
-            # Remove the trailing ')' from the line
-            position_line = position.split(')')[0]
-            # Append the position line to the positions_lines list
-            positions_lines.append('Position(' + position_line + ')')
-
-        # Initialize an empty list to store the extracted coordinates
-        coordinates = []
-
-        # Iterate through each line of Position() and extract x and y coordinates
-        for line in positions_lines:
-            # Use regular expressions to extract x and y coordinates
-            match = re.search(r'x=([-+]?\d*\.\d+|\d+), y=([-+]?\d*\.\d+|\d+)', line)
-            if match:
-                x = float(match.group(1))
-                y = float(match.group(2))
-                coordinates.append({'x': x, 'y': y})
-
-        # Create a DataFrame from the extracted coordinates
-        df_coord = pd.DataFrame(coordinates)
-
-        # Loop through each mosaic tile and each channel.
-        for m in tqdm(range(0, msize)):
-            for ch in range (0, chsize):
-                # Get metadata and image data for the current tile and channel.
-                #meta = czi.get_mosaic_tile_bounding_box(M=m, Z=0, C=ch)
-                IM_MAX = np.max(big_file[m, :, ch, :, :], axis=0)
-                
-                # Construct filename for the processed image.
-                n = str(0)+str(m+1) if m < 9 else str(m+1)
-                filename = 'Base_' + str(cycle) + '_c' + str(ch+1) + 'm' + str(n) + '_ORG.tif'
-                
-                # Save the processed image.
-                
-                tifffile.imwrite(outpath + filename, IM_MAX.astype('uint16'))
-                
-                # Append metadata to the placeholders.
-                Bchindex.append(ch)
-                Bxcoord.append(df_coord.loc[m][0])
-                Bycoord.append(df_coord.loc[m][1])
-                Btile_index.append(m)
-                filenamesxml.append(filename)
-
-        # Adjust the XY coordinates to be relative.
-        nBxcord = [x - min(Bxcoord) for x in Bxcoord]
-        nBycord = [y - min(Bycoord) for y in Bycoord]
-        
-        # Create a DataFrame to organize the collected metadata.
-        metadatalist = pd.DataFrame({
-            'Btile_index': Btile_index, 
-            'Bxcoord': nBxcord, 
-            'Bycoord': nBycord, 
-            'filenamesxml': filenamesxml,
-            'channelindex': Bchindex
-        })
-        
-        metadatalist = metadatalist.sort_values(by=['channelindex','Btile_index'])
-        metadatalist.reset_index(drop=True)
-
-        # Initialize the XML document structure.
-        export_doc = ET.Element('ExportDocument')
-        
-        # Populate the XML document with metadata.
-        for index, row in metadatalist.iterrows():
-            image_elem = ET.SubElement(export_doc, 'Image')
-            filename_elem = ET.SubElement(image_elem, 'Filename')
-            filename_elem.text = row['filenamesxml']
-            
-            bounds_elem = ET.SubElement(image_elem, 'Bounds')
-            bounds_elem.set('StartX', str(row['Bxcoord']))
-            bounds_elem.set('SizeX', str(big_file.shape[3]))
-            bounds_elem.set('StartY', str(row['Bycoord']))
-            bounds_elem.set('SizeY', str(big_file.shape[4]))
-            bounds_elem.set('StartZ', '0')
-            bounds_elem.set('StartC', '0')
-            bounds_elem.set('StartM', str(row['Btile_index']))
-            
-            zoom_elem = ET.SubElement(image_elem, 'Zoom')
-            zoom_elem.text = '1'
-
-        
-        # Save the constructed XML document to a file.
-        xml_str = ET.tostring(export_doc)
-        with open(outpath + 'Base_' + str(cycle) + '_info.xml', 'wb') as f:
-            f.write(xml_str)
-
-    return "Processing complete."
-
-'''
-
-
-
-'''
-This function is actually OK, but it's useless if the mipping and dv functions don't do the right job.
-To be restored when things are properly tested
-
-def nd2_OME_tiff(exported_directory, output_directory, channel_split=2, cycle_split=1, num_channels=5):
-    """
-    This function makes OME-TIFF files from files exported from as tiff from .nd2, through the process_nd2 or to the deconvolve_nd2 functions.
-    
-    Note: This function assumes that you are using the Nilsson SOP for naming files. It will work on 1-tile sections.
-    Args:
-    - exported_directory: directory containing exported TIFF files.
-    - output_directory: directory to save the processed files.
-    - channel_split, cycle_split: indices for splitting filenames.
-    - num_channels: number of channels in the images.
-    
-    Returns:
-    - None. Writes processed images to output_directory.
-   """
-
-    # Create the output directory if it doesn't exist
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-
-    # Filter out TIFF files from the directory
-    all_files = os.listdir(exported_directory)
-    tiff_files = [file for file in all_files if '.tif' in file]
-
-    # Split the filenames to extract tiles, channels, and rounds
-    split_tiles_df = pd.DataFrame(tiff_files)[0].str.split('m', expand=True)
-    split_channels_df = split_tiles_df[0].str.split('_', expand=True)
-    tiles = list(np.unique(split_tiles_df[1]))
-    channels = list(np.unique(split_channels_df[channel_split]))
-    rounds = list(np.unique(split_channels_df[cycle_split]))
-
-    # Iterate through rounds to process files
-    for _, round_number in enumerate(rounds):
-        tiff_files_round = [file for file in tiff_files if f'Base_{round_number}_' in file]
-        metadata_files = [file for file in all_files if 'info.xml' in file]
-        metadata_files_round = [file for file in metadata_files if f'_{round_number}_' in file]
-
-        # Parse metadata XML files to extract tile positions
-        for metadata_file in metadata_files_round:
-            xml_doc = minidom.parse(os.path.join(exported_directory, metadata_file))
-            tiles_xml, x_coords, y_coords = [], [], []
-            bounds_elements = xml_doc.getElementsByTagName('Bounds')
-            for elem in bounds_elements:
-                tiles_xml.append(int(elem.attributes['StartM'].value))
-                x_coords.append(float(elem.attributes['StartX'].value))
-                y_coords.append(float(elem.attributes['StartY'].value))
-                
-            unique_tiles_xml = list(np.unique(tiles_xml))
-            position_df = pd.DataFrame({
-                'x': x_coords[:len(unique_tiles_xml)],
-                'y': y_coords[:len(unique_tiles_xml)]
-            })
-            positions = np.array(position_df).astype(int)
-
-        # Write processed images to OME-TIFF format
-        with tifffile.TiffWriter(os.path.join(output_directory, f'cycle_{round_number}.ome.tif'), bigtiff=True) as tif:
-            for i in tqdm(range(len(tiles))):
-                position = positions[i]
-                tile = tiles[i]
-                tiff_files_tile = [file for file in tiff_files_round if f'm{tile}' in file and '._' not in file]
-                stacked_images = np.empty((num_channels, 2048, 2048))
-
-                for idx, image_file in enumerate(sorted(tiff_files_tile)):
-                    image_data = tifffile.imread(os.path.join(exported_directory, image_file))
-                    stacked_images[idx] = image_data.astype('uint16')
-
-                pixel_size = 0.1625
-                metadata = {
-                    'Pixels': {
-                        'PhysicalSizeX': pixel_size,
-                        'PhysicalSizeXUnit': 'µm',
-                        'PhysicalSizeY': pixel_size,
-                        'PhysicalSizeYUnit': 'µm'
-                    },
-                    'Plane': {
-                        'PositionX': [position[0] * pixel_size] * stacked_images.shape[0],
-                        'PositionY': [position[1] * pixel_size] * stacked_images.shape[0]
-                    }
-                }
-                tif.write(stacked_images.astype('uint16'), metadata=metadata)
-'''
