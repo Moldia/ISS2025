@@ -144,6 +144,42 @@ def normalize_czi_array(arr, dims):
     arr = arr.reshape((msize, z, c, y, x))
     return arr
 
+def normalize_dims_shape(czi):
+    """
+    Normalize dims_shape from aicspylibczi.CziFile.get_dims_shape() to always be a dict {axis: size}.
+    Flexible for different versions of aicspylibczi:
+      - dict already → return as-is
+      - list of dicts → unpack axis: (start, size) → keep only size
+      - list of tuples → take first two items (axis, size)
+    """
+    dims_shape = czi.get_dims_shape()
+
+    if isinstance(dims_shape, dict):
+        return dims_shape
+
+    if isinstance(dims_shape, list):
+        out = {}
+        for elem in dims_shape:
+            if isinstance(elem, dict):
+                # Example: {'X': (0, 2048), 'Y': (0, 2048), ...}
+                for axis, rng in elem.items():
+                    if isinstance(rng, tuple) and len(rng) == 2:
+                        out[axis] = rng[1]  # take size only
+                    else:
+                        raise ValueError(f"Unexpected value for axis {axis}: {rng}")
+
+            elif isinstance(elem, tuple) and len(elem) >= 2:
+                # Example: ("X", 2048)
+                axis, size = elem[0], elem[1]
+                out[axis] = size
+
+            else:
+                raise ValueError(f"Unexpected element in dims_shape: {elem}")
+
+        return out
+
+    raise TypeError(f"Unexpected dims_shape type: {type(dims_shape)}")
+
 
 def normalize_nd2_array(arr, sizes):
     """
@@ -410,7 +446,7 @@ def deconvolve_and_mip(
             # Use unique image names directly as region names 
             regions = sorted(set(image_names))
 
-        # --- Processing Zeiss .czi files ---
+       # --- Processing Zeiss .czi files ---
         elif mode == 'czi':
             czi_files = [f for f in input_dir.iterdir() if f.suffix == '.czi']
             if not czi_files:
@@ -420,15 +456,14 @@ def deconvolve_and_mip(
             print(f"Using CZI file: {file.name}")
         
             czi = CziFile(str(file))
-            dims = czi.dims
+            dims = normalize_dims_shape(czi)
+        
             print("CZI dims:", dims)
         
             # --- Regions (Scenes = S dimension) ---
             num_regions = dims.get("S", 1)
-            regions = [f"Region_{i+1}" for i in range(num_regions)]
-        
-            print(f"[CZI MODE] Detected {num_regions} region(s): {regions}")
-
+            regions = [f"Region_{i+1}" for i in range(num_regions)]        
+    
 
         # --- Processing Nikon .nd2 files ---
         elif mode == 'nd2':
@@ -605,6 +640,7 @@ def deconvolve_and_mip(
                 size_z = dims.z                                  # number of Z slices
                 n_tiles = dims.m                                 # number of mosaic tiles (if any)
                 tiles = list(range(n_tiles))                     # tile indices 0..n_tiles-1
+                tiles = sorted(tiles, key=int)
                 mosaic = image_dict.get('mosaic_position', None) # Get mosaic positions
                 num_channels = image_dict['channels']
                 channels = list(range(num_channels))  # [0, 1, 2, 3, 4, 5]
@@ -617,12 +653,13 @@ def deconvolve_and_mip(
                 image_dimensions = (dims.get("X"), dims.get("Y"))
                 channels = list(range(num_channels))
                 tiles = list(range(n_tiles))
+                tiles = sorted(tiles, key=int)
             
                 print(
-                    f"[CZI MODE] {region}: "
                     f"{n_tiles} tiles, {size_z} Z-slices, {num_channels} channels, "
                     f"image size {image_dimensions[0]} × {image_dimensions[1]}"
                 )
+
             
             elif mode == 'nd2':
                 print(f"\033[1;93m[ND2 MODE] Initializing Nikon ND2 processing for region {region}\033[0m")
@@ -888,11 +925,28 @@ def deconvolve_and_mip(
                         z_planes = [np.array(z_frame) for z_frame in image.get_iter_z(m=tile, c=channel)]
                         stacked_images = np.stack(z_planes, axis=0)
 
+                    elif mode == 'czi':
+                        # For CZI files: extract one region (S), one tile (M), all Z planes, one channel (C), full XY
+                        z_planes = []
+                        for z in range(size_z):
+                            img, shp = czi.read_image(
+                                S=int(region_index),   # current region
+                                M=int(tile),           # tile index
+                                C=int(channel),        # channel index
+                                Z=int(z)               # z-slice index
+                            )
+                            # img comes out as a numpy array, shape typically (1, 1, 1, Y, X)
+                            z_planes.append(img.squeeze())
+                    
+                        stacked_images = np.stack(z_planes, axis=0)  # shape: (Z, Y, X)
+                        
+
+                    
+
                     elif mode == 'nd2':
                         # ND2 array has shape (M, Z, C, Y, X)
                         # Select one tile (M), all Z, one channel (C), full XY
                         stacked_images = arr[int(tile), :, int(channel), :, :]
-                        print(f"ND2 stacked_images shape (tile {tile}, ch {channel}): {stacked_images.shape}")
 
         
                     # Deconvolution with RedLionFish method
