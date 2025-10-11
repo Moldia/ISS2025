@@ -652,13 +652,23 @@ def deconvolve_and_mip(
                 n_tiles = dims.get("M", 1)
                 image_dimensions = (dims.get("X"), dims.get("Y"))
                 channels = list(range(num_channels))
-                tiles = list(range(n_tiles))
-                tiles = sorted(tiles, key=int)
+            
+                # Filter only tiles that actually contain data
+                tiles = []
+                for m in range(n_tiles):
+                    try:
+                        # probe first Z and channel 0 at full resolution
+                        img, shp = czi.read_image(S=int(region_index), M=m, C=0, Z=0, B=0)
+                        if img is not None:
+                            tiles.append(m)
+                    except RuntimeError:
+                        print(f"[INFO] Skipping empty tile {m}")
             
                 print(
-                    f"{n_tiles} tiles, {size_z} Z-slices, {num_channels} channels, "
-                    f"image size {image_dimensions[0]} × {image_dimensions[1]}"
+                    f"{len(tiles)} valid tiles (out of {n_tiles}), {size_z} Z-slices, "
+                    f"{num_channels} channels, image size {image_dimensions[0]} × {image_dimensions[1]}"
                 )
+            
 
             
             elif mode == 'nd2':
@@ -798,6 +808,60 @@ def deconvolve_and_mip(
                 tree = ET.ElementTree(data)
                 tree.write(metadata_directory / f"{image_name}.xml", encoding="utf-8", xml_declaration=True)
 
+            elif mode == 'czi':
+                try:
+                    import xml.etree.ElementTree as ET
+            
+                    # Build XML structure similar to LIF/ND2 exports
+                    data = ET.Element("Data")
+                    image_elem = ET.SubElement(data, "Image", TextDescription="")
+            
+                    attachment = ET.SubElement(
+                        image_elem,
+                        "Attachment",
+                        Name="TileScanInfo",
+                        Application="Zeiss CZI",
+                        FlipX="0", FlipY="0", SwapXY="0"
+                    )
+            
+                    # --- Use bounding boxes for reliable tile positions ---
+                    valid_tiles = []
+                    for m in range(dims.get("M", 1)):
+                        try:
+                            # Query bounding box for this tile (channel 0, Z=0 is enough for XY)
+                            meta = czi.get_mosaic_tile_bounding_box(M=m, Z=0, C=0)
+                            pos_x, pos_y = float(meta.x), float(meta.y)
+            
+                            ET.SubElement(
+                                attachment,
+                                "Tile",
+                                FieldX=str(m), FieldY="0",
+                                PosX=f"{pos_x:.10f}", PosY=f"{pos_y:.10f}"
+                            )
+                            valid_tiles.append(m)
+                        except Exception as e:
+                            print(f"[WARN] Could not get bounding box for tile {m}: {e}")
+            
+                    if valid_tiles:
+                        print(f"Extracted {len(valid_tiles)} tile positions from CZI bounding boxes")
+                    else:
+                        print("[WARN] No bounding box info found → writing dummy (0,0)")
+                        ET.SubElement(
+                            attachment, "Tile",
+                            FieldX="0", FieldY="0",
+                            PosX="0.0000000000", PosY="0.0000000000"
+                        )
+            
+                    # Save XML file
+                    xml_path = metadata_directory / f"{region}.xml"
+                    tree = ET.ElementTree(data)
+                    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+                    print(f"Metadata XML written: {xml_path}")
+            
+                except Exception as e:
+                    print(f"[WARN] Could not parse/write CZI metadata: {e}")
+            
+
             elif mode == 'nd2':
                 data = ET.Element("Data")
                 image_elem = ET.SubElement(data, "Image", TextDescription="")
@@ -926,22 +990,34 @@ def deconvolve_and_mip(
                         stacked_images = np.stack(z_planes, axis=0)
 
                     elif mode == 'czi':
-                        # For CZI files: extract one region (S), one tile (M), all Z planes, one channel (C), full XY
+                        dim_sizes = dict(zip(czi.dims, czi.size))
+                        max_Z = dim_sizes.get("Z", 1)
+                    
                         z_planes = []
-                        for z in range(size_z):
-                            img, shp = czi.read_image(
-                                S=int(region_index),   # current region
-                                M=int(tile),           # tile index
-                                C=int(channel),        # channel index
-                                Z=int(z)               # z-slice index
-                            )
-                            # img comes out as a numpy array, shape typically (1, 1, 1, Y, X)
-                            z_planes.append(img.squeeze())
+                        for z in range(max_Z):
+                            try:
+                                kwargs = {"Z": int(z)}
+                                if "S" in dim_sizes: kwargs["S"] = int(region_index)
+                                if "M" in dim_sizes: kwargs["M"] = int(tile)
+                                if "C" in dim_sizes: kwargs["C"] = int(channel)
+                                if "B" in dim_sizes: kwargs["B"] = 0  # base resolution if pyramid exists
                     
-                        stacked_images = np.stack(z_planes, axis=0)  # shape: (Z, Y, X)
-                        
+                                img, shp = czi.read_image(**kwargs)
+                                z_planes.append(img.squeeze())
+                            except RuntimeError as e:
+                                # This (M,C) likely has fewer Z than global. Stop early instead of crashing.
+                                if "Not enough data read" in str(e):
+                                    print(f"[WARN] Missing plane at Tile {tile}, Channel {channel}, Z {z}. Using {len(z_planes)} planes.")
+                                    break
+                                raise  # different error → surface it
+                    
+                        if not z_planes:
+                            print(f"[WARN] No Z planes for Tile {tile}, Channel {channel} (Cycle {cycle}). Skipping.")
+                            continue
+                    
+                        stacked_images = np.stack(z_planes, axis=0)  # (Z_actual, Y, X)
 
-                    
+
 
                     elif mode == 'nd2':
                         # ND2 array has shape (M, Z, C, Y, X)
@@ -1188,31 +1264,21 @@ def align_and_stitch(
             f for f in (region_directory / "preprocessing").rglob("*.ome.tiff")
         ])
         
-       # Extract cycle numbers from filenames like Cycle1_xxx.ome.tif
+        # Extract cycle numbers from filenames like Cycle1_xxx.ome.tif
         found_cycles = sorted(set(
             int(re.search(r"Cycle(\d+)", f.name).group(1))
             for f in ome_tiffs if re.search(r"Cycle(\d+)", f.name)
         ))
-                
-        # Define the expected full range of cycles
-        expected_cycles = list(range(1, n_total_cycles + 1))
         
-        # Sanity check: must match exactly
-        if found_cycles != expected_cycles:
-            missing = [c for c in expected_cycles if c not in found_cycles]
-            extra = [c for c in found_cycles if c not in expected_cycles]
-        
-            print(f"Expected cycles {expected_cycles}, but found {found_cycles}. OME tiffs for all expected cycles need to be available before stitching and aligning.")
-            if missing:
-                print(f"   Missing cycles: {missing}")
-            if extra:
-                print(f"   Unexpected cycles: {extra}")
-        
+        # Sanity check: must match the expected number of cycles
+        if len(found_cycles) != n_total_cycles:
+            print(f"Expected {n_total_cycles} cycles, but found {len(found_cycles)}: {found_cycles}")
             raise RuntimeError(
-                f"Cycle mismatch. Expected {expected_cycles}, but found {found_cycles}."
+                f"Cycle mismatch. Expected {n_total_cycles} cycles, but found {found_cycles}."
             )
         else:
             print(f"Found all {n_total_cycles} cycles: {found_cycles}")
+
 
 
         # --- STEP 3: Define expected outputs ---
@@ -1228,9 +1294,10 @@ def align_and_stitch(
         # Build a list of expected outputs for all cycles + channels
         expected_outputs = [
             Path(ashlar_filename_pattern.format(cycle=cyc, channel=ch))
-            for cyc in expected_cycles
+            for cyc in cycles
             for ch in range(n_channels)
         ]
+
 
         # Skip only if *all* expected outputs exist
         if all(p.exists() for p in expected_outputs):
@@ -1317,11 +1384,13 @@ def align_and_stitch(
             ashlar.print_error(str(e))
             continue
 
-        # --- STEP 6: Remap Cycle0..N-1 → Cycle1..N and move files ---
+ 
+        # --- STEP 6: Remap cycles provided by user ---
         tmp_dir = Path(tmp_pattern).parent
-        for cyc_idx, cyc in enumerate(expected_cycles):
+        for cyc_idx, cyc in enumerate(cycles):
             stitched_dir = region_directory / "preprocessing" / f"Cycle{cyc}" / "3_stitched"
             stitched_dir.mkdir(parents=True, exist_ok=True)
+
 
             for ch in range(n_channels):
                 tmp_file = tmp_dir / f"Cycle{cyc_idx}_ch{ch}.tif"
