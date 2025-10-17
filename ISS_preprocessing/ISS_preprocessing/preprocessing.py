@@ -1082,8 +1082,8 @@ def deconvolve_and_mip(
             if mip and stacked_directory.exists():
                 shutil.rmtree(stacked_directory)
                 print(f"Deleted stacked directory: {stacked_directory}")
-
-    print('region_directories:', region_directories)
+    
+    print("\n🔹 region_directories:\n", region_directories)
     
     return region_directories
 
