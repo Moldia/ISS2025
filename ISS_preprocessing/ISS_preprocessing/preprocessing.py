@@ -990,17 +990,44 @@ def deconvolve_and_mip(
             # --- tif metadata (Leica → LAS/CZI-style; positions written in µm with explicit provenance) ---
             if mode in ('tif_autosaved', 'tif_exported'):
                 # --- Read Leica XML from INPUT/Metadata ---
-                input_metadata_dir = input_dir / 'Metadata'
-                metadata_file = next(
-                    f for f in input_metadata_dir.iterdir()
-                    if region in f.name
-                    and f.suffix.lower() in ('.xml', '.xlif')
-                    and 'properties' not in f.name.lower()
+                # --- Locate Leica metadata folder (case-insensitive) ---
+                input_metadata_dir = next(
+                    (p for p in input_dir.iterdir()
+                     if p.is_dir() and p.name.lower() == 'metadata'),
+                    None
                 )
-            
-                # Parse Leica XML
-                root = ET.parse(metadata_file).getroot()
-            
+                
+                if input_metadata_dir is None:
+                    print(f"[WARN] No Leica metadata folder found in {input_dir} (case-insensitive search).")
+                    pixel_to_um_calc = None
+                    unit_hint_raw = ""
+                else:
+                    # Gather all plausible XML/XLF files (ignore property dumps)
+                    md_files = [
+                        f for f in input_metadata_dir.iterdir()
+                        if f.suffix.lower() in ('.xml', '.xlif') and 'properties' not in f.name.lower()
+                    ]
+                
+                    if not md_files:
+                        print(f"[WARN] No Leica XML/XLF files found in {input_metadata_dir}.")
+                        pixel_to_um_calc = None
+                        unit_hint_raw = ""
+                    else:
+                        # Heuristic: prefer files whose stem contains a region token; else newest file
+                        region_token = None
+                        if filtered_tifs:
+                            region_token = Path(filtered_tifs[0]).stem.split('_')[0]
+                
+                        prio = [f for f in md_files if region_token and region_token in f.stem]
+                        md_file = prio[0] if prio else max(md_files, key=lambda p: p.stat().st_mtime)
+                
+                        print(f"[META] Using Leica XML: {md_file.name} ({md_file})")
+                        try:
+                            root = ET.parse(md_file).getroot()
+                        except Exception as e:
+                            print(f"[WARN] Could not parse {md_file.name}: {e}. Falling back to no-XML path.")
+                            root = None
+
                 # ---------- Helpers ----------
                 def _f(x):
                     try:
@@ -1923,8 +1950,8 @@ def align_and_stitch(
     flip_x=False, 
     flip_y=True, 
     output_channels=None, 
-    maximum_shift=10, 
-    filter_sigma=2.5, 
+    maximum_shift=500, 
+    filter_sigma=5, 
     pyramid=False,
     tile_size=None,
     ffp=None,
@@ -1959,6 +1986,9 @@ def align_and_stitch(
     print("\033[1;96mAligning and stitching tiles\033[0m")
     print("\033[1mProcessing all cycles \033[0m")
     ashlar.configure_terminal()
+
+    maximum_shift=200
+    filter_sigma=3
     
     for region_directory in region_directories:
         region_suffix = region_directory[-2:]
