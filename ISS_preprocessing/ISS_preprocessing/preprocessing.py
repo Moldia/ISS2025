@@ -867,14 +867,16 @@ def deconvolve_and_mip(
                 tile_channel_files = {}
                 for tile, files_in_tile in tile_to_files.items():
                     for channel in channels:
-        
+                
                         if mode == 'tif_autosaved':
-                            pattern = f"--C{str(channel).zfill(2)}"
-
+                            # Example filenames:  ...--C01--..., ...--C10--...
+                            pattern = re.compile(rf"--C{str(channel).zfill(2)}", re.IGNORECASE)
+                
                         else:
-                            # Robust channel matching: supports 1–N digits and any zero-padding
+                            # tif_exported: supports 1–N digits, any zero padding, any case
+                            # Matches: _ch0, _ch00, _ch000, _Ch02, _CH2, etc.
                             pattern = re.compile(rf"_ch0*{channel}\b", re.IGNORECASE)
-                        
+                
                         channel_files = [f for f in files_in_tile if pattern.search(f.name)]
                         tile_channel_files[(tile, channel)] = channel_files
 
