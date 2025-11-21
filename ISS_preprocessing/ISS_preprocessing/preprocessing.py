@@ -31,6 +31,15 @@ import RedLionfishDeconv as rl
 import ISS_preprocessing.psf as fd_psf
 import ashlar.scripts.ashlar as ashlar
 
+from skimage import io, img_as_ubyte
+from skimage.exposure import rescale_intensity
+
+def convert_16bit_to_8bit_auto(image_16):
+    # Stretch intensities based on actual data range
+    image_rescaled = rescale_intensity(image_16, in_range='image', out_range='dtype')
+    image_8 = img_as_ubyte(image_rescaled)
+    return image_8
+
 
 def custom_copy(src, dest):
     """Custom function to copy a file to a destination."""
@@ -476,7 +485,8 @@ def preprocessing_main(input_dirs,
                             mip=True,
                             tile_dimension=6000, 
                             pixel_to_um = None,
-                            chunk_size=None):
+                            chunk_size=None,
+                            num_iterations = 50):
     
     """
     Main preprocessing pipeline for microscopy image data.
@@ -556,7 +566,8 @@ def preprocessing_main(input_dirs,
                             PSF_metadata=PSF_metadata, 
                             mip=mip,
                             pixel_to_um=pixel_to_um,
-                            chunk_size=chunk_size)
+                            chunk_size=chunk_size,
+                            num_iterations=num_iterations)
 
     # OME TIFFS
     mipped_to_OME_tiffs(
@@ -594,7 +605,8 @@ def deconvolve_and_mip(
     PSF_metadata: Optional[dict] = None, 
     mip: bool = True,
     pixel_to_um = None,
-    chunk_size: Optional[int] = None
+    chunk_size: Optional[int] = None,
+    num_iterations = 50
 ) -> list:
     """
     Deconvolve Leica microscopy data for a given cycle.
@@ -629,7 +641,7 @@ def deconvolve_and_mip(
         print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
         print('Processing directory: ', input_dir)  
         print(f"Mode: {mode}".ljust(width))
-        print(f"Deconvolution method: {deconvolution_method}".ljust(width))
+        print(f"Deconvolution method: {deconvolution_method}, iterations: {num_iterations}".ljust(width))
     
         if deconvolution_method is not None and PSF_metadata is None:
             raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
@@ -858,10 +870,14 @@ def deconvolve_and_mip(
         
                         if mode == 'tif_autosaved':
                             pattern = f"--C{str(channel).zfill(2)}"
+
                         else:
-                            pattern = f"_ch{channel}"
-                        channel_files = [f for f in files_in_tile if pattern in f.name]
+                            # Robust channel matching: supports 1–N digits and any zero-padding
+                            pattern = re.compile(rf"_ch0*{channel}\b", re.IGNORECASE)
+                        
+                        channel_files = [f for f in files_in_tile if pattern.search(f.name)]
                         tile_channel_files[(tile, channel)] = channel_files
+
                         
             # --- lif file preparations ---
             elif mode == 'lif':
@@ -998,9 +1014,9 @@ def deconvolve_and_mip(
                 )
                 
                 if input_metadata_dir is None:
-                    print(f"[WARN] No Leica metadata folder found in {input_dir} (case-insensitive search).")
-                    pixel_to_um_calc = None
-                    unit_hint_raw = ""
+                    print(f"[ERROR] No Leica metadata folder found in {input_dir} (case-insensitive search). Skipping region.")
+                    continue
+
                 else:
                     # Gather all plausible XML/XLF files (ignore property dumps)
                     md_files = [
@@ -1009,24 +1025,32 @@ def deconvolve_and_mip(
                     ]
                 
                     if not md_files:
-                        print(f"[WARN] No Leica XML/XLF files found in {input_metadata_dir}.")
-                        pixel_to_um_calc = None
-                        unit_hint_raw = ""
+                        print(f"[ERROR] No Leica XML/XLF files found in {input_metadata_dir}. Skipping region.")
+                        continue
+
                     else:
                         # Heuristic: prefer files whose stem contains a region token; else newest file
-                        region_token = None
-                        if filtered_tifs:
+                        region_token = (str(region) or "").strip()
+                        if not region_token and filtered_tifs:
                             region_token = Path(filtered_tifs[0]).stem.split('_')[0]
-                
-                        prio = [f for f in md_files if region_token and region_token in f.stem]
+             
+                        # Case-insensitive preference for files whose stem contains the token
+                        prio = [f for f in md_files if region_token and region_token.lower() in f.stem.lower()]
                         md_file = prio[0] if prio else max(md_files, key=lambda p: p.stat().st_mtime)
-                
+                        
                         print(f"[META] Using Leica XML: {md_file.name} ({md_file})")
+                        
+                        # Parse robustly; clear error message on failure; also guard empty root
                         try:
-                            root = ET.parse(md_file).getroot()
+                            tree = ET.parse(md_file)
+                            root = tree.getroot()
+                            if root is None:
+                                print(f"[ERROR] Parsed empty/None XML root from {md_file}. Skipping region.")
+                                continue
                         except Exception as e:
-                            print(f"[WARN] Could not parse {md_file.name}: {e}. Falling back to no-XML path.")
-                            root = None
+                            print(f"[ERROR] Failed to parse Leica XML '{md_file}': {e}. Skipping region.")
+                            continue
+                       
 
                 # ---------- Helpers ----------
                 def _f(x):
@@ -1091,7 +1115,9 @@ def deconvolve_and_mip(
                     effective_pixel_to_um = pixel_to_um_calc
                     print(f"[META] No manual pixel size provided — using metadata pixel size: {effective_pixel_to_um:.6f} µm/px")
                 else:
-                    print("[WARN] No pixel size information available — please provide 'pixel_to_um' manually.")
+                    print(f"[ERROR] No pixel size information available — please provide 'pixel_to_um' manually. Skipping region.")
+                    continue
+
             
                 # ---------- 3) Objective magnification info (best-effort) ----------
                 mag = None
@@ -1147,8 +1173,8 @@ def deconvolve_and_mip(
             elif mode == 'lif':
                 try:
                     if mosaic is None:
-                        print(f"[INFO] No mosaic information found for LIF region '{image_name}' — skipping XML metadata.")
-                        return
+                        print(f"[ERROR] No mosaic information found for LIF region '{image_name}' — skipping XML metadata.")
+                        continue
             
                     print("[INFO] Generating LIF TileScanInfo XML metadata")
             
@@ -1227,8 +1253,9 @@ def deconvolve_and_mip(
                         effective_pixel_to_um = pixel_to_um_calc
                         print(f"[META] No manual pixel size provided — using metadata pixel size: {effective_pixel_to_um:.6f} µm/px")
                     else:
-                        print("[WARN] No pixel size available (manual or metadata). Stopping processing.")
-                        return  # stop here — nothing valid to proceed with
+                        print("[ERROR] No pixel size information available — please provide 'pixel_to_um' manually. Skipping region")
+                        continue
+            
             
                     # --- 3) Stage positions from LIF mosaic (raw) ---
                     try:
@@ -1282,7 +1309,7 @@ def deconvolve_and_mip(
                             print(f"[WARN] Could not get bounding box for tile {m}: {e}")
             
                     if not tiles_list:
-                        raise RuntimeError("No CZI tile positions available to write TileScanInfo.")
+                        print("No CZI tile positions available to write TileScanInfo.")
             
                     x_raw = np.array(x_list, dtype=float)
                     y_raw = np.array(y_list, dtype=float)
@@ -1291,7 +1318,7 @@ def deconvolve_and_mip(
                     # --- 2) Parse XML metadata directly from czi.meta ---
                     meta_root = getattr(czi, "meta", None)
                     if meta_root is None:
-                        raise RuntimeError("CZI metadata XML not available (meta is None).")
+                        print("CZI metadata XML not available (meta is None).")
             
                     if not isinstance(meta_root, ET.Element):
                         meta_root = ET.fromstring(meta_root)  # handles bytes/str
@@ -1352,7 +1379,8 @@ def deconvolve_and_mip(
                     if pixel_to_um_calc is not None:
                         print(f"[META] Pixel size from CZI metadata: {pixel_to_um_calc:.6f} µm/px")
                     else:
-                        print("[WARN] No pixel size found in CZI metadata.")
+                        print("[WARN] No pixel size information available from metadata")
+            
             
                     # --- 4) Extract objective magnification (numeric only) ---
                     mag = None
@@ -1392,8 +1420,9 @@ def deconvolve_and_mip(
                         effective_pixel_to_um = pixel_to_um_calc
                         print(f"[META] No manual pixel size provided — using metadata pixel size: {effective_pixel_to_um:.6f} µm/px")
                     else:
-                        print("[WARN] No pixel size available (manual or metadata).")
-            
+                        print("[ERROR] No pixel size information available — please provide 'pixel_to_um' manually. Skipping region")
+                        continue
+                        
                     # --- 6) Unit hint for stage positions (for TileScanInfo generation) ---
                     # Mosaic tile bounding boxes lack a declared unit; leave empty so the hypothesis test
                     # infers the correct interpretation (often pixels → µm/px).
@@ -1628,7 +1657,7 @@ def deconvolve_and_mip(
         
                     # Deconvolution with RedLionFish method
                     if deconvolution_method == 'redlionfish':
-                        deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=50)
+                        deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=num_iterations)
                         # Save max projection if MIP requested, otherwise full stack
                         processed_img = np.max(deconvolved_images, axis=0).astype('uint16') if mip else deconvolved_images.astype('uint16')
                         tifffile.imwrite(output_file_path, processed_img)
