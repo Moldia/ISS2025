@@ -1760,10 +1760,11 @@ def mipped_to_OME_tiffs(region_directories, cycles, pixel_to_um=None):
             # Build file index: tile -> channel -> path
             file_index = defaultdict(dict)
             for f in tif_files:
-                m = re.search(r'_s(\d+)_ch(\d+)', f.name, re.IGNORECASE)
+                m = re.search(r'_s0*(\d+)_ch0*(\d+)', f.name, re.IGNORECASE)
                 if m:
-                    tile, channel = m.groups()
+                    tile, channel = map(int, m.groups())
                     file_index[tile][channel] = f
+
 
             tiles = sorted(file_index.keys(), key=int)
             channels = sorted({ch for chs in file_index.values() for ch in chs}, key=int)
