@@ -233,7 +233,9 @@ def decide_and_write_tilescan(
     # writing params
     tiles_iter=None,                      # iterable of (FieldX, FieldY, PosX_raw, PosY_raw)
     app_name="LAS X",                     # Attachment@Application
-    out_xml_path=None                     # Path for output XML
+    out_xml_path=None,                     # Path for output XML
+    deconvolution_method=None,       
+    deconvolution_iterations=None
 ):
     """
     Decide stage position units + pixel size (µm/px),
@@ -317,7 +319,10 @@ def decide_and_write_tilescan(
 
     def _write_xml(*, to_um, chosen_unit, rationale, unit_hint_raw, unit_hint_norm,
                    pixel_to_um, pixel_to_um_source, width_px, tile_width_um, dx, dy,
-                   tiles_iter, app_name, out_xml_path):
+                   tiles_iter, app_name, out_xml_path,
+                   deconvolution_method=None,            
+                   deconvolution_iterations=None):
+        
         out = _ET.Element("Data")
         img = _ET.SubElement(out, "Image", TextDescription="")
         att = _ET.SubElement(img, "Attachment", Name="TileScanInfo",
@@ -328,6 +333,14 @@ def decide_and_write_tilescan(
         att.set("RawPositionUnitUsed", chosen_unit or "unknown")
         att.set("ScaleRawToMicron", f"{to_um:.12g}")
         att.set("DecisionNote", rationale or "")
+    
+        if deconvolution_method is None:
+            att.set("DeconvolutionMethod", "None")
+            att.set("DeconvolutionIterations", "0")
+        else:
+            att.set("DeconvolutionMethod", str(deconvolution_method))
+            att.set("DeconvolutionIterations", str(deconvolution_iterations or 0))
+
 
         if pixel_to_um is not None:
             att.set("PixelSizeUm", f"{float(pixel_to_um):.10f}")
@@ -459,8 +472,11 @@ def decide_and_write_tilescan(
             unit_hint_raw=unit_hint_raw, unit_hint_norm=unit_hint_norm,
             pixel_to_um=pixel_to_um, pixel_to_um_source=pixel_to_um_source,
             width_px=width_px, tile_width_um=tile_width_um, dx=dx, dy=dy,
-            tiles_iter=tiles_iter, app_name=app_name, out_xml_path=out_xml_path
+            tiles_iter=tiles_iter, app_name=app_name, out_xml_path=out_xml_path,
+            deconvolution_method=deconvolution_method,
+            deconvolution_iterations=deconvolution_iterations
         )
+
 
     return dict(
         chosen_unit=chosen_unit, to_um=to_um, rationale=rationale,
@@ -479,14 +495,15 @@ def preprocessing_main(input_dirs,
                             output_dir_prefix,
                             mode,
                             n_total_cycles,
+                            regions_to_process=None,
                             deconvolution_method=None,
+                            num_iterations = 50,
                             PSF_metadata=None, 
                             align_channel=4, 
                             mip=True,
                             tile_dimension=6000, 
                             pixel_to_um = None,
-                            chunk_size=None,
-                            num_iterations = 50):
+                            chunk_size=None):
     
     """
     Main preprocessing pipeline for microscopy image data.
@@ -562,12 +579,14 @@ def preprocessing_main(input_dirs,
                             cycles=cycles,
                             output_dir_prefix=output_dir_prefix, 
                             mode=mode,
+                            regions_to_process=regions_to_process,
                             deconvolution_method=deconvolution_method,
+                            num_iterations=num_iterations,
                             PSF_metadata=PSF_metadata, 
                             mip=mip,
                             pixel_to_um=pixel_to_um,
-                            chunk_size=chunk_size,
-                            num_iterations=num_iterations)
+                            chunk_size=chunk_size
+                            )
 
     # OME TIFFS
     mipped_to_OME_tiffs(
@@ -601,12 +620,13 @@ def deconvolve_and_mip(
     cycles ,
     output_dir_prefix: Path,
     mode: str,
+    regions_to_process: Optional[List[int]] = None,
     deconvolution_method: Optional[str] = None,
+    num_iterations = 50,
     PSF_metadata: Optional[dict] = None, 
     mip: bool = True,
     pixel_to_um = None,
-    chunk_size: Optional[int] = None,
-    num_iterations = 50
+    chunk_size: Optional[int] = None
 ) -> list:
     """
     Deconvolve Leica microscopy data for a given cycle.
@@ -754,6 +774,21 @@ def deconvolve_and_mip(
 
         # rename regions    
         region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
+
+        # select a subset of regions to be processed
+        if regions_to_process is not None:
+            # Convert region_numbers (1-based) into indexes (0-based)
+            selected_indices = [i - 1 for i in regions_to_process 
+                                if 1 <= i <= len(regions)]
+        
+            # Reduce regions and region_numbers
+            regions = [regions[i] for i in selected_indices]
+            region_numbers = [region_numbers[i] for i in selected_indices]
+        
+            #print(f"User-selected regions_to_process = {regions_to_process}")
+            #print(f"Reduced regions = {regions}")
+            #print(f"Reduced region_numbers = {region_numbers}")
+                
     
         print("Regions to be processed:", regions) 
         print("=" * width + "\033[0m")
@@ -1167,8 +1202,10 @@ def deconvolve_and_mip(
                     off_tol=0.25,                                # your overlap tolerance
                     tiles_iter=tiles_iter,
                     app_name="LAS X",
-                    out_xml_path=metadata_directory / f"{region}.xml"
-                )
+                    out_xml_path=metadata_directory / f"{region}.xml",
+                    deconvolution_method=deconvolution_method,       
+                    deconvolution_iterations=num_iterations
+                    )
             
 
             # --- lif metadata (Leica LIF → LAS-style XML; include pixel size, magnification, unit conversion) ---
@@ -1286,7 +1323,9 @@ def deconvolve_and_mip(
                         off_tol=0.25,
                         tiles_iter=tiles_list,
                         app_name="LAS AF",
-                        out_xml_path=metadata_directory / f"{image_name}.xml"
+                        out_xml_path=metadata_directory / f"{image_name}.xml",
+                        deconvolution_method=deconvolution_method,       
+                        deconvolution_iterations=num_iterations
                     )
             
                     print(f"[INFO] Wrote LIF TileScanInfo for {image_name} (positions in µm)")
@@ -1441,8 +1480,10 @@ def deconvolve_and_mip(
                         off_tol=0.25,
                         tiles_iter=tiles_list,
                         app_name="Zeiss CZI",
-                        out_xml_path=metadata_directory / f"{region}.xml"
-                    )
+                        out_xml_path=metadata_directory / f"{region}.xml",
+                        deconvolution_method=deconvolution_method,       
+                        deconvolution_iterations=num_iterations
+                        )
             
                 except Exception as e:
                     print(f"[WARN] Could not parse/write CZI metadata: {e}")
@@ -1708,7 +1749,7 @@ def deconvolve_and_mip(
     
     
                     tile_channel_end = time.time()
-                    print(f"\033[1;37m[Timing] Full deconvolution cycle for Tile {tile}, Channel {channel} took {tile_channel_end - tile_channel_start:.2f} seconds\033[0m")
+                    print(f"\033[1;37m[Timing] Full deconvolution/mipping cycle for Tile {tile}, Channel {channel} took {tile_channel_end - tile_channel_start:.2f} seconds\033[0m")
             
             # After all tiles and channels are done
             if mip and stacked_directory.exists():
