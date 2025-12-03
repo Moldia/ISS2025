@@ -859,13 +859,15 @@ def deconvolve_and_mip(
                     sample_indicator = re.compile(r'_s0+_')           # matches "_s0_", "_s00_", "_s000_", etc.
                 
                 # Extract tile numbers and collect sample tile files
-                tiles = set()        # unique tile numbers
+                tiles = set()        # unique tile numbers (ints)
                 sample_tiles = []    # files belonging to tile 0 (any form of 0-padded index)
                 
                 for f in filtered_tifs:
-                    if tile_pattern.search(f.name):
-                        tiles.add(tile_pattern.search(f.name).group(1))   # collect tile numbers
-                    if sample_indicator.search(f.name):                   # regex match for "tile 0"
+                    m = tile_pattern.search(f.name)
+                    if m:
+                        tiles.add(int(tile_pattern.search(f.name).group(1)))         # <-- int, not string
+                
+                    if sample_indicator.search(f.name):
                         sample_tiles.append(f)
 
                 # Safe fallback: if no tile 0 exists, pick the lowest available tile
@@ -879,7 +881,7 @@ def deconvolve_and_mip(
                     sample_tiles = [f for f in filtered_tifs if fallback_pattern.search(f.name)]
         
                 # Sort tile list and compute total number of tiles
-                tiles = sorted(tiles, key=int)
+                tiles = sorted(tiles)
                 n_tiles = len(tiles)
                 # Infer Z-size from number of sample_tile files divided by number of channels
                 size_z = int(len(sample_tiles) / len(channels))
@@ -892,13 +894,13 @@ def deconvolve_and_mip(
         
                 # --- Pre-index files by tile and channel to speed up lookups ---
                 tile_to_files = {}
-                for tile in tiles:
+                for tile in tiles:  # tile is int now
                     if mode == 'tif_autosaved':
-                        tile_files = [f for f in filtered_tifs if f"--Stage{tile}--" in str(f)]
+                        tile_files = [f for f in filtered_tifs if re.search(rf"--Stage0*{tile}--", f.name)]
                     else:
-                        tile_files = [f for f in filtered_tifs if f"_s{tile}_" in str(f)]
+                        tile_files = [f for f in filtered_tifs if re.search(rf"_s0*{tile}_", f.name)]
                     tile_to_files[tile] = tile_files
-        
+                        
                 tile_channel_files = {}
                 for tile, files_in_tile in tile_to_files.items():
                     for channel in channels:
@@ -910,10 +912,9 @@ def deconvolve_and_mip(
                         else:
                             # tif_exported: supports 1–N digits, any zero padding, any case
                             # Matches: _ch0, _ch00, _ch000, _Ch02, _CH2, etc.
-                            pattern = re.compile(rf"_ch0*{channel}\b", re.IGNORECASE)
+                            pattern = re.compile(rf"_ch0*{channel}(?=\D|$)", re.IGNORECASE)
                 
-                        channel_files = [f for f in files_in_tile if pattern.search(f.name)]
-                        tile_channel_files[(tile, channel)] = channel_files
+                        tile_channel_files[(tile, channel)] = [f for f in files_in_tile if pattern.search(f.name)]
 
                         
             # --- lif file preparations ---
@@ -1533,36 +1534,32 @@ def deconvolve_and_mip(
                 tree.write(xml_path, encoding="utf-8", xml_declaration=True)
                 print(f"Metadata XML written: {xml_path}")
 
-            
+
             # ----- STEP 3: SKIP EXISTING FILES -----
             print("\033[96mProcessing files\033[0m")
-            # Check what files are expected to exist
-            expected_files = [
-                            (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
-                            for tile in tiles
-                            for channel in channels
-                        ]
-                        
-            print(f"Expected number of output files in {mipped_directory if mip else stacked_directory}: {len(expected_files)} ({len(tiles)} tiles × {len(channels)} channels)")
             
-            # Identify which files are missing
-            missing_files = [f for f in expected_files if not f.exists()]
+            # Build set of already-existing outputs (fast)
+            existing = set()
+            out_dir = (mipped_directory if mip else stacked_directory)
+            for f in out_dir.glob(f"Cycle{cycle}_s*_ch*.tif"):
+                m = re.search(r"_s0*(\d+)_ch0*(\d+)", f.name, re.IGNORECASE)
+                if m:
+                    existing.add((int(m.group(1)), int(m.group(2))))
             
-            if not missing_files:
-                print(f"All expected files for Cycle {cycle} already exist in {mipped_directory if mip else stacked_directory} directory. Skipping processing.")
+            # Determine missing channels per tile (only what you need)
+            missing_channels_by_tile = {}
+            for tile in tiles:
+                t = int(tile)
+                miss = [int(ch) for ch in channels if (t, int(ch)) not in existing]
+                if miss:
+                    missing_channels_by_tile[t] = miss
+            
+            if not missing_channels_by_tile:
+                print(f"All expected files for Cycle {cycle} already exist in {out_dir}. Skipping processing.")
                 continue
             
-            # Extract unique tile numbers from missing file names
-            missing_tiles = sorted(set(
-                match.group(1)
-                for f in missing_files
-                if (match := re.search(r'_s(\d+)_ch', f.name))
-            ))
-            
-            # Update the tiles list to only those with missing outputs
-            tiles = missing_tiles
-            
-            print(f"{len(tiles)} tile(s) have missing outputs. Proceeding with processing only these.")
+            tiles = sorted(missing_channels_by_tile.keys())
+            print(f"{len(tiles)} tile(s) have missing outputs. Proceeding with missing tile-channel combos only.")
 
             # ----- STEP 4: GENERATE PSFS FOR ALL CHANNELS -----
             print("Calculating the PSF")
@@ -1613,24 +1610,28 @@ def deconvolve_and_mip(
                     
                     # Store path to generated PSF file in dictionary
                     psf_dict[channel] = psf_filename
+
         
             # ----- STEP 5: DECONVOLVE EACH TILE AND CHANNEL -----
+            # If you rebuilt `tiles = sorted(missing_channels_by_tile.keys())` earlier, update n_tiles:
+            n_tiles = len(tiles)
+
             print("Single tile imaging." if n_tiles == 1 else f"Number of tiles to process: {n_tiles}")
     
             # Prepare directory to save stacked images
-            
             stacked_directory.mkdir(exist_ok=True, parents=True)
     
             # Loop over each tile (spatial subdivision of the image)
             for tile in tqdm(tiles, desc="Processing tiles", leave=False):
-               
-                # Loop over each fluorescence channel in the PSF metadata
-                for channel in channels:
+                tile = int(tile)
+            
+                for channel in missing_channels_by_tile.get(tile, []):  # only missing channels (safe)
+                    channel = int(channel)
+            
                     print(f"\033[90m[\033[96mCycle {cycle}\033[90m] Tile {tile}, Channel {channel}...\033[0m")
                     tile_channel_start = time.time()
-                    
-                    # Choose output path depending on whether MIP (max intensity projection) is requested
-                    output_file_path = (mipped_directory if mip else stacked_directory) / f'Cycle{cycle}_s{tile}_ch{int(channel)}.tif'
+            
+                    output_file_path = (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
         
                     # Skip processing if output file already exists
                     if output_file_path.exists():
@@ -1639,6 +1640,7 @@ def deconvolve_and_mip(
         
                     # Load stacked images depending on mode
                     if mode in ('tif_autosaved', 'tif_exported'):
+
                         channel_files = tile_channel_files.get((tile, channel), [])
                         stacked_images = np.stack([tifffile.imread(f) for f in channel_files])
                     elif mode == 'lif':
