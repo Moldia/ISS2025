@@ -281,9 +281,14 @@ class GibsonLanni(PSF):
 
         PSF = np.zeros((size_y, size_x, size_z))
 
+        
         for z_index in range(PSF.shape[2]):
+
             # Interpolate the radial PSF function
-            PSF_interp = interp1d(r, PSF_rz[z_index, :])
+            #PSF_interp = interp1d(r, PSF_rz[z_index, :])
+            # Interpolate PSF(r) onto the Cartesian r_pixel grid; if any r_pixel falls outside the precomputed r range,
+            # don't crash—just return 0.0 (treat it as PSF=0 beyond the modeled support).
+            PSF_interp = interp1d(r, PSF_rz[z_index, :], bounds_error=False, fill_value=0.0)
 
             # Evaluate the PSF at each value of r_pixel
             PSF[:,:, z_index] = PSF_interp(r_pixel.ravel()).reshape(size_y, size_x)
