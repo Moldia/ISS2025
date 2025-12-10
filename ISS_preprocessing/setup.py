@@ -25,9 +25,9 @@ setup(
     install_requires=[
         "numpy",
         "scipy",
-        "tifffile",
+        "tifffile<2025.2.18",
+        "zarr<3",
         "PyYAML",
-        # add other dependencies here
     ],
     python_requires=">=3.9",
     keywords=[
