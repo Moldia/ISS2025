@@ -81,6 +81,55 @@ def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
     except Exception:
         return False
 
+
+
+def to_uint16_safe(
+    arr: np.ndarray,
+    *,
+    context: str = "",
+) -> np.ndarray:
+    """
+    Safely cast an image array to uint16.
+
+    This function:
+      - Detects NaN / ±Inf values
+      - Replaces them with safe numeric values
+      - Clips intensities to the uint16 range [0, 65535]
+      - Emits a single [INFO] message only if correction was needed
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Image array (2D or 3D), typically float after deconvolution.
+    context : str
+        Short identifier for logging (e.g. "tile=0 ch=1").
+
+    Returns
+    -------
+    np.ndarray
+        uint16 array with the same shape as input.
+    """
+    has_nan = np.isnan(arr).any()
+    has_inf = np.isinf(arr).any()
+
+    if has_nan or has_inf:
+        print(
+            f"[INFO] to_uint16_safe"
+            f"{f' ({context})' if context else ''}: "
+            f"nan={has_nan}, inf={has_inf}"
+        )
+
+    safe = np.nan_to_num(
+        arr,
+        nan=0.0,
+        posinf=65535.0,
+        neginf=0.0,
+    )
+
+    safe = np.clip(safe, 0, 65535)
+
+    return safe.astype(np.uint16)
+
 # ======================================================================================
 # Deconwolf
 # ======================================================================================
@@ -4180,7 +4229,7 @@ def deconvolve_and_mip(
             region_items = ordered
 
         if not region_items:
-            print("{BOLD}[WARN]⚠️ {RESET} No regions selected; skipping this cycle.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} No regions selected; skipping this cycle.")
             continue
 
         
