@@ -4452,7 +4452,16 @@ def deconvolve_and_mip(
                         if deconvolution_method == 'redlionfish':
                             deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=num_iterations)
                             # Save max projection if MIP requested, otherwise full stack
-                            processed_img = np.max(deconvolved_images, axis=0).astype('uint16') if mip else deconvolved_images.astype('uint16')
+                            if mip:
+                                processed_img = to_uint16_safe(
+                                    np.max(deconvolved_images, axis=0),
+                                    context=f"tile={tile} ch={channel}",
+                                )
+                            else:
+                                processed_img = to_uint16_safe(
+                                    deconvolved_images,
+                                    context=f"tile={tile} ch={channel}",
+                                )
                             tifffile.imwrite(output_file_path, processed_img)
                             print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
                             
@@ -4493,17 +4502,7 @@ def deconvolve_and_mip(
             
                         # No deconvolution, just save max projection or stack
                         elif deconvolution_method is None:
-                            if mip:
-                                processed_img = to_uint16_safe(
-                                    np.max(deconvolved_images, axis=0),
-                                    context=f"tile={tile} ch={channel}",
-                                )
-                            else:
-                                processed_img = to_uint16_safe(
-                                    deconvolved_images,
-                                    context=f"tile={tile} ch={channel}",
-                                )
-
+                            processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
                             tifffile.imwrite(output_file_path, processed_img)
                             print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
         
