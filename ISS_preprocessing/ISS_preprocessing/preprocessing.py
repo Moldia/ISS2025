@@ -82,7 +82,6 @@ def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
         return False
 
 
-
 def to_uint16_safe(
     arr: np.ndarray,
     *,
@@ -4494,7 +4493,17 @@ def deconvolve_and_mip(
             
                         # No deconvolution, just save max projection or stack
                         elif deconvolution_method is None:
-                            processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
+                            if mip:
+                                processed_img = to_uint16_safe(
+                                    np.max(deconvolved_images, axis=0),
+                                    context=f"tile={tile} ch={channel}",
+                                )
+                            else:
+                                processed_img = to_uint16_safe(
+                                    deconvolved_images,
+                                    context=f"tile={tile} ch={channel}",
+                                )
+
                             tifffile.imwrite(output_file_path, processed_img)
                             print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
         
