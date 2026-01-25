@@ -67,6 +67,8 @@ from skimage.exposure import rescale_intensity
 # ======================================================================================
 # Small, reusable utilities
 # ======================================================================================
+BOLD = "\033[1m"
+RESET = "\033[0m"
 
 def safe_mkdir(p: Path) -> Path:
     p.mkdir(exist_ok=True, parents=True)
@@ -78,7 +80,6 @@ def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
         return path.exists() and path.stat().st_size > int(min_size)
     except Exception:
         return False
-
 
 # ======================================================================================
 # Deconwolf
@@ -415,7 +416,7 @@ def decide_and_write_tilescan(
     if pixel_to_um_calc is not None:
         print(f"[META] Pixel size from metadata: {float(pixel_to_um_calc):.6f} µm/px")
     else:
-        print("[WARN] No pixel size information available from metadata")
+        print("{BOLD}[WARN]⚠️ {RESET} No pixel size information available from metadata")
     
     if pixel_to_um_manual is not None:
         print(f"[INFO] Manual pixel_to_um: {float(pixel_to_um_manual):.6f} µm/px")
@@ -423,7 +424,7 @@ def decide_and_write_tilescan(
             float(pixel_to_um_manual), float(pixel_to_um_calc), rtol=0.02
         ):
             print(
-                f"[WARN] Manual pixel size ({float(pixel_to_um_manual):.6f} µm/px) differs "
+                f"{BOLD}[WARN]⚠️ {RESET} Manual pixel size ({float(pixel_to_um_manual):.6f} µm/px) differs "
                 f"from metadata value ({float(pixel_to_um_calc):.6f} µm/px)."
             )
     
@@ -440,7 +441,7 @@ def decide_and_write_tilescan(
         else:
             print(f"[INFO] Pixel size decision: using metadata-derived pixel_to_um={pixel_to_um:.6f} µm/px")
     else:
-        print("[WARN] Pixel size decision: no pixel size available (manual=None, metadata=None)")
+        print("{BOLD}[WARN]⚠️ {RESET} Pixel size decision: no pixel size available (manual=None, metadata=None)")
     
     tile_width_um = (width_px * pixel_to_um) if (width_px and pixel_to_um) else None
     unit_hint_norm = _normalize_unit(unit_hint_raw or "")
@@ -494,7 +495,7 @@ def decide_and_write_tilescan(
                 dx, dy, ovx, ovy = r["dx"], r["dy"], r["ovx"], r["ovy"]
                 rationale = f"metadata unit '{chosen_unit}' confirmed"
             else:
-                print(f"[WARN] Metadata unit '{unit_hint_norm}' inconsistent — running hypothesis test.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} Metadata unit '{unit_hint_norm}' inconsistent — running hypothesis test.")
     
         # Otherwise (or if hint failed): choose best hypothesis
         if chosen_unit is None:
@@ -1447,7 +1448,7 @@ def czi_get_mosaic_positions(
 
     if missing > 0:
         msg = (
-            f"[WARN] CZI mosaic position extraction: "
+            f"{BOLD}[WARN]⚠️ {RESET} CZI mosaic position extraction: "
             f"{missing}/{int(n_tiles)} tile(s) missing bounding boxes."
         )
         if errors_preview:
@@ -2019,7 +2020,7 @@ class TiffHandler(BaseHandler):
             ctx["objective_mag_source"] = "Leica XML" if mag is not None else None
     
         except Exception as e:
-            print(f"[WARN] TIFF handler: failed to pre-extract Leica metadata for region '{region_name}': {e}")
+            print(f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: failed to pre-extract Leica metadata for region '{region_name}': {e}")
     
         return ctx
     
@@ -2139,7 +2140,7 @@ class TiffHandler(BaseHandler):
         if sample_tiles:
             if len(sample_tiles) % len(channels) != 0:
                 print(
-                    f"[WARN] TIFF handler: sample_tiles ({len(sample_tiles)}) not divisible by "
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: sample_tiles ({len(sample_tiles)}) not divisible by "
                     f"channels ({len(channels)}); inferred size_z may be wrong."
                 )
             size_z = max(1, len(sample_tiles) // len(channels))
@@ -2380,7 +2381,7 @@ class TiffHandler(BaseHandler):
     
             if dropped:
                 print(
-                    f"[WARN] TIFF handler: XML contains {len(dropped)} tile(s) not present on disk; "
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: XML contains {len(dropped)} tile(s) not present on disk; "
                     f"dropping them. Example dropped TileIndex: {dropped[:10]}{'...' if len(dropped) > 10 else ''}"
                 )
     
@@ -2470,12 +2471,12 @@ class TiffHandler(BaseHandler):
     
             if missing_in_xml:
                 print(
-                    f"[WARN] TIFF handler: {len(missing_in_xml)} on-disk tile(s) have no matching XML TileIndex; "
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: {len(missing_in_xml)} on-disk tile(s) have no matching XML TileIndex; "
                     f"missing={missing_in_xml[:10]}{'...' if len(missing_in_xml) > 10 else ''}"
                 )
             if extra_in_xml:
                 print(
-                    f"[WARN] TIFF handler: {len(extra_in_xml)} XML tile(s) are not present on disk after mapping; "
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: {len(extra_in_xml)} XML tile(s) are not present on disk after mapping; "
                     f"extra={extra_in_xml[:10]}{'...' if len(extra_in_xml) > 10 else ''}"
                 )
     
@@ -2783,11 +2784,11 @@ class LifHandler(BaseHandler):
         image_dimensions: Tuple[int, int] = ctx["image_dimensions"]
     
         if mosaic is None:
-            print(f"[WARN] No mosaic_position found for LIF region '{region}'. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} No mosaic_position found for LIF region '{region}'. Skipping TileScanInfo.")
             return None
     
         if not isinstance(mosaic, (list, tuple)) or len(mosaic) == 0:
-            print(f"[WARN] Empty/invalid mosaic_position for LIF region '{region}'. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} Empty/invalid mosaic_position for LIF region '{region}'. Skipping TileScanInfo.")
             return None
     
         # Tiles we actually process / write to disk (these must match filenames _sNNN_)
@@ -2800,7 +2801,7 @@ class LifHandler(BaseHandler):
         # Sanity / mismatch handling
         if len(mosaic) != len(tiles_ctx):
             print(
-                f"[WARN] Tile count mismatch for '{region}': "
+                f"{BOLD}[WARN]⚠️ {RESET} Tile count mismatch for '{region}': "
                 f"len(mosaic_position)={len(mosaic)} vs len(ctx['tiles'])={len(tiles_ctx)}. "
                 f"Will only use overlapping indices."
             )
@@ -3150,7 +3151,7 @@ class CziHandler(BaseHandler):
             print(f"[ERROR] CZI handler: image_dimensions missing for region '{region}'. Skipping metadata.")
             return None
         if not tiles:
-            print(f"[WARN] CZI handler: tiles missing/empty for region '{region}'. Skipping metadata.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} CZI handler: tiles missing/empty for region '{region}'. Skipping metadata.")
             return None
 
         czi = ctx.get("czi", None)
@@ -3206,11 +3207,11 @@ class CziHandler(BaseHandler):
 
             raw_tiles_iter = list(raw_tiles_iter or [])
         except Exception as e:
-            print(f"[WARN] CZI handler: no usable mosaic positions for region '{region}': {e!r}. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} CZI handler: no usable mosaic positions for region '{region}': {e!r}. Skipping TileScanInfo.")
             return None
 
         if not raw_tiles_iter:
-            print(f"[WARN] CZI handler: mosaic tile list empty for region '{region}'. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} CZI handler: mosaic tile list empty for region '{region}'. Skipping TileScanInfo.")
             return None
 
         # ------------------------------------------------------------------
@@ -3269,7 +3270,7 @@ class CziHandler(BaseHandler):
         tiles_iter_5 = [t for t in tiles_iter_5 if int(t[0]) in tiles_set]
         if not tiles_iter_5:
             print(
-                f"[WARN] CZI handler: mosaic positions do not overlap processed tiles for '{region}'. "
+                f"{BOLD}[WARN]⚠️ {RESET} CZI handler: mosaic positions do not overlap processed tiles for '{region}'. "
                 "Skipping TileScanInfo."
             )
             return None
@@ -3282,7 +3283,7 @@ class CziHandler(BaseHandler):
         if missing_tiles:
             preview = missing_tiles[:20]
             print(
-                f"[WARN] CZI handler: {len(missing_tiles)} processed tile(s) have no mosaic stage coords "
+                f"{BOLD}[WARN]⚠️ {RESET} CZI handler: {len(missing_tiles)} processed tile(s) have no mosaic stage coords "
                 f"and will be omitted from TileScanInfo for '{region}'. "
                 f"Missing TileIndex: {preview}{'...' if len(missing_tiles) > 20 else ''}"
             )
@@ -3291,7 +3292,7 @@ class CziHandler(BaseHandler):
             # This should not happen after filtering, but keep it defensive.
             preview = extra_tiles[:20]
             print(
-                f"[WARN] CZI handler: {len(extra_tiles)} tile(s) have coords but are not in ctx['tiles'] "
+                f"{BOLD}[WARN]⚠️ {RESET} CZI handler: {len(extra_tiles)} tile(s) have coords but are not in ctx['tiles'] "
                 f"for '{region}'. Extra TileIndex: {preview}{'...' if len(extra_tiles) > 20 else ''}"
             )
 
@@ -3484,7 +3485,7 @@ class Nd2Handler(BaseHandler):
 
         if coords is None:
             print(
-                f"[WARN] ND2 handler: no stage coordinates available for region "
+                f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: no stage coordinates available for region "
                 f"'{ctx.get('region')}'. TileScanInfo will be skipped."
             )
 
@@ -3507,7 +3508,7 @@ class Nd2Handler(BaseHandler):
                 preview_tiles = tiles[:5]
 
                 print(
-                    f"[WARN] ND2 handler: stage coordinate count ({n_coords}) does not match "
+                    f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: stage coordinate count ({n_coords}) does not match "
                     f"tile count ({n_tiles}) for region '{ctx.get('region')}'. "
                     f"TileScanInfo may be incomplete or misaligned.\n"
                     f"        tiles preview: {preview_tiles}\n"
@@ -3538,76 +3539,199 @@ class Nd2Handler(BaseHandler):
     def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
         """
         Read a (Z, Y, X) stack for one tile+channel from ND2.
+    
         Supports tile dimension P or M if present; otherwise uses single tile.
+    
+        WHY THIS FUNCTION EXISTS (ND2 gotcha)
+        ------------------------------------
+        `nd2.ND2File.to_dask()` does NOT always return an xarray.DataArray.
+        In some files it returns a ResourceBackedDaskArray (or similar) that:
+          - has no .isel()
+          - has no .dims()
+    
+        If we naively do `np.asarray(darr)` in that situation, we materialize the ENTIRE
+        dataset (P×Z×C×Y×X) and appear to "hang" during reading.
+    
+        This function therefore:
+          1) Tries named-dimension selection via .isel() when available (xarray path).
+          2) Otherwise slices FIRST using positional indexing on the dask-like array,
+             THEN materializes only the requested slab (fallback path).
+          3) Normalizes output to exactly (Z, Y, X) and uint16.
+    
+        INFO PRINT POLICY
+        -----------------
+        - Emit concise [INFO] lines only when we take the fallback (non-xarray) path.
+          That’s where "silent hangs" used to happen and where provenance matters.
+        - Do not spam per-plane debug; just one or two lines per tile/channel read.
         """
         darr = ctx["nd2_darr"]
         sizes: Dict[str, int] = ctx["nd2_sizes"]
         tile_dim = ctx.get("nd2_tile_dim", None)
-
+    
         tile = int(tile)
         channel = int(channel)
-
-        # Build a slicing dict for xarray-like / dask array selection.
-        # nd2.ND2File.to_dask() typically returns an xarray DataArray.
-        # We'll try .isel first; fall back to numpy-style indexing if needed.
+    
+        # Z length (best-effort; ND2 may omit Z in some cases)
         size_z = int(sizes.get("Z", 1) or 1)
-
+    
         # Helper: safe isel on DataArray
         def _isel(obj, **kwargs):
             if hasattr(obj, "isel"):
                 return obj.isel(**kwargs)
             raise AttributeError("Object has no .isel()")
-
+    
         try:
+            # =====================================================================
+            # PATH A: xarray.DataArray selection (named dims)
+            # =====================================================================
+            # This is the "ideal" case: named-dim indexing is robust to axis ordering.
             sel = {"C": channel}
+    
+            # Include full Z stack if present
             if "Z" in sizes and size_z > 1:
                 sel["Z"] = slice(0, size_z)
+    
+            # Include tile index if ND2 exposes a tile dimension (P or M)
             if tile_dim in ("P", "M") and tile_dim in sizes:
                 sel[tile_dim] = tile
-
+    
             sub = _isel(darr, **sel)
-            arr = np.asarray(sub)  # bring to numpy (still lazy upstream)
+    
+            # NOTE: We keep this behavior unchanged: np.asarray(sub) may trigger upstream
+            # computation depending on backend, but for xarray this is typically fine.
+            arr = np.asarray(sub)
+    
         except Exception:
-            # Fall back to positional indexing if isel is unavailable.
-            # NOTE: dimension order can vary; this is a best-effort fallback.
-            arr = np.asarray(darr)
-
-            # If we got a full array, attempt to index by common axis ordering.
-            # Common: (T?, P?, M?, Z, C, Y, X) or similar.
-            # We keep this conservative: select last two axes as Y,X and try to place C/Z/tile.
-            # If this fallback is hit often, we should tighten dimension handling.
-            if arr.ndim < 2:
-                raise RuntimeError("ND2 read_stack(): unexpected array shape from to_dask()")
-
-            # If there's a channel axis, try selecting it by assuming it's near the end.
-            # This is imperfect; prefer the .isel path above.
-            # We'll just handle the common case: (..., Z, C, Y, X)
-            if arr.ndim >= 5:
-                # assume last axes are Y,X; then C; then Z
-                # arr[..., Z, C, Y, X]
-                arr = arr[..., :, channel, :, :]
-                if tile_dim in ("P", "M") and arr.ndim >= 6:
-                    # assume tile dim is before Z
-                    # arr[..., tile, Z, Y, X]
-                    arr = arr[..., tile, :, :, :]
-            elif arr.ndim == 4:
-                # could be (Z, Y, X) already or (C, Y, X, ?) etc
-                pass
-
-        # Ensure output shape is (Z, Y, X)
+            # =====================================================================
+            # PATH B: positional indexing fallback (ResourceBackedDaskArray, etc.)
+            # =====================================================================
+            # This is the critical fix vs your previous implementation:
+            # - Do NOT do np.asarray(darr) (that materializes everything).
+            # - Slice FIRST to (Z,Y,X) for the requested tile+channel, then compute.
+            shape = tuple(getattr(darr, "shape", ()))
+            if len(shape) < 3:
+                raise RuntimeError(f"ND2 read_stack(): unexpected array shape from to_dask(); shape={shape}")
+    
+            # Pull out reported sizes (may be 1 even if the dim isn't present)
+            p_n = int(sizes.get("P", 1) or 1)
+            m_n = int(sizes.get("M", 1) or 1)
+            z_n = int(sizes.get("Z", 1) or 1)
+            c_n = int(sizes.get("C", 1) or 1)
+            y_n = int(sizes.get("Y", 1) or 1)
+            x_n = int(sizes.get("X", 1) or 1)
+    
+            # Emit ONE helpful info line: what we're reading and from what backing type/shape.
+            print(
+                f"[INFO] ND2 read_stack(): using fallback positional slicing "
+                f"(darr_type={type(darr).__name__}, shape={shape}) "
+                f"for tile={tile}, channel={channel}"
+            )
+    
+            # -----------------------------
+            # Strong-match fast path
+            # -----------------------------
+            # Common ND2 mosaic layout observed in your files:
+            #   (P, Z, C, Y, X)
+            # If it matches exactly, slice deterministically (fast + correct).
+            if len(shape) == 5 and shape == (p_n, z_n, c_n, y_n, x_n):
+                # Select just the requested tile+channel stack: -> (Z, Y, X)
+                darr_sel = darr[tile, slice(0, z_n), channel, :, :]
+    
+                # Compute only this slab (never the entire dataset).
+                if hasattr(darr_sel, "compute"):
+                    arr = np.asarray(darr_sel.compute())
+                else:
+                    arr = np.asarray(darr_sel)
+    
+            else:
+                # -----------------------------
+                # Generic conservative fallback
+                # -----------------------------
+                # When axis order differs, do best-effort axis identification by matching sizes:
+                # - Prefer Y/X as the last two axes if they match reported Y/X
+                # - Find C and Z axes by matching c_n and z_n (avoiding Y/X)
+                # - Find tile axis by matching P or M size (depending on tile_dim)
+                sl = [slice(None)] * len(shape)
+    
+                # Prefer Y/X at the end when they match (common ND2)
+                ax_y = ax_x = None
+                if len(shape) >= 2 and shape[-2] == y_n and shape[-1] == x_n:
+                    ax_y, ax_x = len(shape) - 2, len(shape) - 1
+    
+                # Find channel axis by matching c_n (avoid Y/X)
+                ax_c = None
+                if c_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x):
+                            continue
+                        if shape[ax] == c_n:
+                            ax_c = ax
+                            break
+    
+                # Find Z axis by matching z_n (avoid Y/X and C)
+                ax_z = None
+                if z_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x, ax_c):
+                            continue
+                        if shape[ax] == z_n:
+                            ax_z = ax
+                            break
+    
+                # Find tile axis by matching P or M
+                ax_tile = None
+                if tile_dim == "P" and p_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x, ax_c, ax_z):
+                            continue
+                        if shape[ax] == p_n:
+                            ax_tile = ax
+                            break
+                elif tile_dim == "M" and m_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x, ax_c, ax_z):
+                            continue
+                        if shape[ax] == m_n:
+                            ax_tile = ax
+                            break
+    
+                # Apply slice selections we managed to identify
+                if ax_tile is not None:
+                    sl[ax_tile] = tile
+                if ax_c is not None:
+                    sl[ax_c] = channel
+                if ax_z is not None:
+                    sl[ax_z] = slice(0, z_n)
+    
+                darr_sel = darr[tuple(sl)]
+    
+                # Compute only the selected slab.
+                if hasattr(darr_sel, "compute"):
+                    arr = np.asarray(darr_sel.compute())
+                else:
+                    arr = np.asarray(darr_sel)
+    
+        # =====================================================================
+        # Normalize output to (Z, Y, X)
+        # =====================================================================
         arr = np.asarray(arr)
+    
+        # After slicing, we expect:
+        # - (Z, Y, X) normally
+        # - (Y, X) if Z==1 (then add a singleton Z axis)
+        # - potentially extra singleton axes depending on backend (squeeze them)
         if arr.ndim == 2:
             arr = arr[None, ...]
         elif arr.ndim > 3:
-            # squeeze singleton axes but keep Z
             arr = np.squeeze(arr)
             if arr.ndim == 2:
                 arr = arr[None, ...]
             elif arr.ndim != 3:
                 raise RuntimeError(f"ND2 read_stack(): could not normalize to (Z,Y,X); got shape {arr.shape}")
-
+    
         return arr.astype(np.uint16, copy=False)
 
+    
     # -----------------------------
     # Build args for decide_and_write_tilescan()
     # -----------------------------
@@ -3637,15 +3761,15 @@ class Nd2Handler(BaseHandler):
         tiles = list(ctx.get("tiles", []) or [])
 
         if not tiles:
-            print(f"[WARN] ND2 handler: no tiles inferred for region '{region}'. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: no tiles inferred for region '{region}'. Skipping TileScanInfo.")
             return None
 
         if coords is None:
-            print(f"[WARN] ND2 handler: no stage coordinates available for region '{region}'. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: no stage coordinates available for region '{region}'. Skipping TileScanInfo.")
             return None
 
         if not isinstance(coords, (list, tuple)) or len(coords) == 0:
-            print(f"[WARN] ND2 handler: empty stage coordinate list for region '{region}'. Skipping TileScanInfo.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: empty stage coordinate list for region '{region}'. Skipping TileScanInfo.")
             return None
 
         # ND2 coords are stagePositionUm → microns.
@@ -3664,7 +3788,7 @@ class Nd2Handler(BaseHandler):
         n = min(len(tiles), len(coords))
         if len(coords) != len(tiles):
             print(
-                f"[WARN] ND2 handler: coords count ({len(coords)}) != tiles count ({len(tiles)}); "
+                f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: coords count ({len(coords)}) != tiles count ({len(tiles)}); "
                 f"using first {n} entries."
             )
 
@@ -3685,13 +3809,13 @@ class Nd2Handler(BaseHandler):
             y_list.append(y_um)
 
         if not tiles_iter:
-            print(f"[WARN] ND2 handler: could not build any tile position records for '{region}'. Skipping.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: could not build any tile position records for '{region}'. Skipping.")
             return None
 
         x_raw = np.asarray(x_list, dtype=float)
         y_raw = np.asarray(y_list, dtype=float)
         if x_raw.size == 0 or y_raw.size == 0:
-            print(f"[WARN] ND2 handler: empty x/y arrays after parsing for '{region}'. Skipping.")
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: empty x/y arrays after parsing for '{region}'. Skipping.")
             return None
 
         return dict(
@@ -4052,11 +4176,11 @@ def deconvolve_and_mip(
                     idx = rnum - 1
                     ordered.append((idx, all_regions[idx], rnum))
                 else:
-                    print(f"[WARN] regions_to_process contains out-of-range region {rnum}; skipping.")
+                    print(f"{BOLD}[WARN]⚠️ {RESET} regions_to_process contains out-of-range region {rnum}; skipping.")
             region_items = ordered
 
         if not region_items:
-            print("[WARN] No regions selected; skipping this cycle.")
+            print("{BOLD}[WARN]⚠️ {RESET} No regions selected; skipping this cycle.")
             continue
 
         
@@ -4186,7 +4310,7 @@ def deconvolve_and_mip(
                     # NOTE: this can be heavy; later you can replace this with a smaller psf_xy (e.g. 256).
                     psf_x = int(image_dimensions[0])
                     psf_y = int(image_dimensions[1])
-                    print(f"[META] Generating RL PSF at tile size: {psf_x}×{psf_y} px")
+                    print(f"[INFO] Generating RL PSF at tile size: {psf_x}×{psf_y} px")
                 
                     # Optional: warn if PSF magnification doesn't match metadata magnification
                     # (only if you have objective_mag in ctx and PSF_metadata has 'm')
@@ -4195,7 +4319,7 @@ def deconvolve_and_mip(
                         psf_mag = float(PSF_metadata.get("m")) if PSF_metadata.get("m") is not None else None
                         if meta_mag is not None and psf_mag is not None and not np.isclose(meta_mag, psf_mag, rtol=0.02):
                             print(
-                                f"[WARN] PSF magnification ({psf_mag:g}x) differs from metadata objective ({meta_mag:g}x)."
+                                f"{BOLD}[WARN]⚠️ {RESET} PSF magnification ({psf_mag:g}x) differs from metadata objective ({meta_mag:g}x) - check input parameter PSF_metadata!"
                             )
                     except Exception:
                         pass
@@ -4263,6 +4387,7 @@ def deconvolve_and_mip(
                             # (optional) keep your message if you want
                             # print(f"Valid output exists: {output_file_path}. Skipping.")
                             continue
+
 
                         stacked_images = handler.read_stack(ctx, tile=tile, channel=channel)
     
@@ -4509,7 +4634,7 @@ def mipped_to_OME_tiffs(
             tiles_from_files = sorted(file_index.keys())
             channels = sorted({ch for d in file_index.values() for ch in d.keys()})
             if not channels or not tiles_from_files:
-                print("[WARN] Could not infer tiles/channels from filenames. Skipping.")
+                print("{BOLD}[WARN]⚠️ {RESET} Could not infer tiles/channels from filenames. Skipping.")
                 continue
 
             print(
@@ -4529,7 +4654,7 @@ def mipped_to_OME_tiffs(
                 md_file = preferred
             elif md_candidates:
                 md_file = md_candidates[0]
-                print(f"[WARN] Preferred XML missing; using {md_file.name}")
+                print(f"{BOLD}[WARN]⚠️ {RESET} Preferred XML missing; using {md_file.name}")
             else:
                 print(f"No XML metadata in {metadata_directory}. Skipping.")
                 continue
@@ -4537,13 +4662,13 @@ def mipped_to_OME_tiffs(
             try:
                 root = ET.parse(md_file).getroot()
             except Exception as e:
-                print(f"[WARN] Failed to parse {md_file}: {e}. Skipping.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} Failed to parse {md_file}: {e}. Skipping.")
                 continue
 
             att = root.find(".//Attachment[@Name='TileScanInfo']")
             tile_nodes = _find_tilescan_tiles(root)
             if not tile_nodes:
-                print(f"[WARN] No <Tile> positions in {md_file.name}. Skipping.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} No <Tile> positions in {md_file.name}. Skipping.")
                 continue
 
             flip_x, flip_y = _get_flip_flags(att)
@@ -4560,7 +4685,7 @@ def mipped_to_OME_tiffs(
 
             if effective_px is None:
                 print(
-                    "[WARN] No pixel size available (neither XML PixelSizeUm nor pixel_to_um arg). "
+                    "{BOLD}[WARN]⚠️ {RESET} No pixel size available (neither XML PixelSizeUm nor pixel_to_um arg). "
                     "OME will be written without PhysicalSizeX/Y."
                 )
             else:
@@ -4608,7 +4733,7 @@ def mipped_to_OME_tiffs(
             missing_on_disk = [t for t in tiles_from_xml if t not in set(tiles_on_disk)]
             if missing_on_disk:
                 print(
-                    f"[WARN] XML declares {len(missing_on_disk)} tile(s) that do not exist on disk. "
+                    f"{BOLD}[WARN]⚠️ {RESET} XML declares {len(missing_on_disk)} tile(s) that do not exist on disk. "
                     f"Viewers may show these as black/empty regions. "
                     f"Example missing: {missing_on_disk[:10]}{'...' if len(missing_on_disk) > 10 else ''}"
                 )
@@ -4617,7 +4742,7 @@ def mipped_to_OME_tiffs(
             missing_in_xml = [t for t in tiles_on_disk if t not in pos_um_by_tile]
             if missing_in_xml:
                 print(
-                    f"[WARN] XML missing positions for {len(missing_in_xml)} on-disk tile(s); "
+                    f"{BOLD}[WARN]⚠️ {RESET} XML missing positions for {len(missing_in_xml)} on-disk tile(s); "
                     f"these will be skipped. "
                     f"Example missing: {missing_in_xml[:10]}{'...' if len(missing_in_xml) > 10 else ''}"
                 )
@@ -4625,7 +4750,7 @@ def mipped_to_OME_tiffs(
             # Keep on-disk tile id ordering, but only for tiles we can position
             tiles_aligned = [t for t in tiles_on_disk if t in pos_um_by_tile]
             if not tiles_aligned:
-                print("[WARN] No overlapping tiles between files and XML positions. Skipping.")
+                print("{BOLD}[WARN]⚠️ {RESET} No overlapping tiles between files and XML positions. Skipping.")
                 continue
             
             print(
@@ -4666,7 +4791,7 @@ def mipped_to_OME_tiffs(
             try:
                 height_px, width_px = tifffile.imread(first_img_path).shape
             except Exception as e:
-                print(f"[WARN] Could not read {first_img_path} for dims: {e}. Skipping.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} Could not read {first_img_path} for dims: {e}. Skipping.")
                 continue
 
             # ----------------------------------------------------------------------
@@ -4983,7 +5108,7 @@ def align_and_stitch(
 
                 # Overwrite protection: warn but replace
                 if final_file.exists():
-                    print(f"[WARN] Overwriting existing stitched file: {final_file}")
+                    print(f"{BOLD}[WARN]⚠️ {RESET} Overwriting existing stitched file: {final_file}")
 
                 tmp_file.replace(final_file)
 
@@ -5080,12 +5205,12 @@ def retile_stitched_images(
                 try:
                     sample_tile = tifffile.imread(existing_tiles[0])
                 except Exception as e:
-                    print(f"[WARN] Could not read sample existing tile: {existing_tiles[0].name}: {e}")
+                    print(f"{BOLD}[WARN]⚠️ {RESET} Could not read sample existing tile: {existing_tiles[0].name}: {e}")
                     sample_tile = None
 
                 if sample_tile is None or sample_tile.shape != (tile_dimension, tile_dimension):
                     print(
-                        f"[WARN] Existing tiles look wrong (expected {tile_dimension}×{tile_dimension}). "
+                        f"{BOLD}[WARN]⚠️ {RESET} Existing tiles look wrong (expected {tile_dimension}×{tile_dimension}). "
                         f"Reprocessing all tiles in {retiled_directory}."
                     )
                     for p in existing_tiles:
