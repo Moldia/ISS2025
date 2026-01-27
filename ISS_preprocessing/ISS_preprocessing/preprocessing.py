@@ -1,5 +1,5 @@
 """
-Microscopy preprocessing pipeline (cleaned + unified handlers)
+Microscopy preprocessing pipeline 
 
 Goals
 -----
