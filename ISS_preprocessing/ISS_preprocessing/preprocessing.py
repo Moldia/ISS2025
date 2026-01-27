@@ -1,51 +1,137 @@
+"""
+Microscopy preprocessing pipeline 
+
+Goals
+-----
+- Support input formats in one unified pipeline:
+    TIFF (.tif), Leica LIF (.lif), Zeiss CZI (.czi), Nikon ND2 (.nd2)
+- Keep the "main" pipeline readable by pushing format-specific logic into handlers
+- Centralize TileScanInfo metadata writing via decide_and_write_tilescan()
+- Preserve existing behavior:
+    deconvolution (RedLionFish / Deconwolf / None), MIP, OME-TIFF, Ashlar stitching, retiling
+
+Key Contracts
+-------------
+- decide_and_write_tilescan() is the *only* TileScanInfo XML writer.
+- TileScanInfo output positions are ALWAYS written in microns (µm), regardless of input units.
+- Handlers that provide mosaic/stage positions must ultimately supply STRICT 5-tuples:
+    (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+  where TileIndex MUST match the tile ids used by downstream filenames (e.g. `_s{tile}`).
+
+Notes
+-----
+- External dependencies assumed installed:
+  tifffile, numpy, pandas, cv2, tqdm, natsort, aicspylibczi, readlif, nd2, ashlar, skimage
+- Local modules assumed available:
+  RedLionfishDeconv as rl
+  ISS_preprocessing.psf as fd_psf
+  ashlar.scripts.ashlar as ashlar
+"""
 
 
+# ============================
 # --- Standard Library ---
+# ============================
 import os
 import re
-import shutil
-import subprocess
-import time
 import math
+import time
+import shutil
 import warnings
+import subprocess
 from pathlib import Path
 from collections import defaultdict
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Iterable, Tuple
 
+import xml.etree.ElementTree as ET
+
+# ============================
 # --- Third-Party ---
+# ============================
 import numpy as np
 import pandas as pd
 import tifffile
-import cv2
-import dask.array as da
 from tqdm import tqdm
 from natsort import natsorted
-from aicspylibczi import CziFile
-from readlif.reader import LifFile
-import nd2
 
+
+# ============================
 # --- Local Modules ---
+# ============================
 import RedLionfishDeconv as rl
 import ISS_preprocessing.psf as fd_psf
-import ashlar.scripts.ashlar as ashlar
 
-from skimage import io, img_as_ubyte
+from skimage import img_as_ubyte
 from skimage.exposure import rescale_intensity
 
-def convert_16bit_to_8bit_auto(image_16):
-    # Stretch intensities based on actual data range
-    image_rescaled = rescale_intensity(image_16, in_range='image', out_range='dtype')
-    image_8 = img_as_ubyte(image_rescaled)
-    return image_8
+# ======================================================================================
+# Small, reusable utilities
+# ======================================================================================
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+def safe_mkdir(p: Path) -> Path:
+    p.mkdir(exist_ok=True, parents=True)
+    return p
+
+def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
+    """Fast corruption guard for outputs from previous runs."""
+    try:
+        return path.exists() and path.stat().st_size > int(min_size)
+    except Exception:
+        return False
 
 
-def custom_copy(src, dest):
-    """Custom function to copy a file to a destination."""
-    if os.path.isdir(dest):
-        dest = os.path.join(dest, os.path.basename(src))
-    shutil.copyfile(src, dest)
+def to_uint16_safe(
+    arr: np.ndarray,
+    *,
+    context: str = "",
+) -> np.ndarray:
+    """
+    Safely cast an image array to uint16.
+
+    This function:
+      - Detects NaN / ±Inf values
+      - Replaces them with safe numeric values
+      - Clips intensities to the uint16 range [0, 65535]
+      - Emits a single [INFO] message only if correction was needed
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Image array (2D or 3D), typically float after deconvolution.
+    context : str
+        Short identifier for logging (e.g. "tile=0 ch=1").
+
+    Returns
+    -------
+    np.ndarray
+        uint16 array with the same shape as input.
+    """
+    has_nan = np.isnan(arr).any()
+    has_inf = np.isinf(arr).any()
+
+    if has_nan or has_inf:
+        print(
+            f"[INFO] to_uint16_safe"
+            f"{f' ({context})' if context else ''}: "
+            f"nan={has_nan}, inf={has_inf}"
+        )
+
+    safe = np.nan_to_num(
+        arr,
+        nan=0.0,
+        posinf=65535.0,
+        neginf=0.0,
+    )
+
+    safe = np.clip(safe, 0, 65535)
+
+    return safe.astype(np.uint16)
+
+# ======================================================================================
+# Deconwolf
+# ======================================================================================
 
 def generate_psf(psf_output, resxy, resz, wavelength, NA, ni):
     """dw_bw command to generate PSF."""
@@ -94,183 +180,88 @@ def deconvolve_image(input_image, psf_image, output_image, iterations, tilesize=
     except Exception as e:
         print(f"\033[91mUnexpected error: {e}\033[0m")
 
-def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
-    """
-    Check if a file exists and is larger than a minimum size (default 1 KB).
-    This helps detect corrupted or empty files from failed previous runs.
 
-    Parameters
-    ----------
-    path : Path
-        Path to the file being checked.
-    min_size : int, optional
-        Minimum file size in bytes. Default is 1024 (1 KB).
-
-    Returns
-    -------
-    bool
-        True if the file exists and is valid, False otherwise.
-    """
-    return path.exists() and path.stat().st_size > min_size
-
-def normalize_czi_array(arr, dims):
-    """
-    Normalize CZI numpy array into shape (M, Z, C, Y, X).
-    Missing dimensions are inserted as singleton axes.
-
-    Parameters
-    ----------
-    arr : np.ndarray
-        Array from CziFile.asarray().
-    dims : dict
-        Dimension sizes from CziFile.dims.
-
-    Returns
-    -------
-    np.ndarray
-        Array reshaped to (M, Z, C, Y, X).
-    """
-
-    # Extract sizes (default to 1 if missing)
-    s = dims.get("S", 1)   # scenes
-    m = dims.get("M", 1)   # mosaic tiles
-    z = dims.get("Z", 1)   # z-slices
-    c = dims.get("C", 1)   # channels
-    y = dims.get("Y")
-    x = dims.get("X")
-
-    # Collapse S and M into one "M"
-    msize = s * m
-
-    expected_size = msize * z * c * y * x
-    if arr.size != expected_size:
-        raise ValueError(
-            f"Array size mismatch: got {arr.shape}, "
-            f"expected total {expected_size} "
-            f"from sizes M={msize}, Z={z}, C={c}, Y={y}, X={x}"
-        )
-
-    arr = arr.reshape((msize, z, c, y, x))
-    return arr
-
-def normalize_dims_shape(czi):
-    """
-    Normalize dims_shape from aicspylibczi.CziFile.get_dims_shape() to always be a dict {axis: size}.
-    Flexible for different versions of aicspylibczi:
-      - dict already → return as-is
-      - list of dicts → unpack axis: (start, size) → keep only size
-      - list of tuples → take first two items (axis, size)
-    """
-    dims_shape = czi.get_dims_shape()
-
-    if isinstance(dims_shape, dict):
-        return dims_shape
-
-    if isinstance(dims_shape, list):
-        out = {}
-        for elem in dims_shape:
-            if isinstance(elem, dict):
-                # Example: {'X': (0, 2048), 'Y': (0, 2048), ...}
-                for axis, rng in elem.items():
-                    if isinstance(rng, tuple) and len(rng) == 2:
-                        out[axis] = rng[1]  # take size only
-                    else:
-                        raise ValueError(f"Unexpected value for axis {axis}: {rng}")
-
-            elif isinstance(elem, tuple) and len(elem) >= 2:
-                # Example: ("X", 2048)
-                axis, size = elem[0], elem[1]
-                out[axis] = size
-
-            else:
-                raise ValueError(f"Unexpected element in dims_shape: {elem}")
-
-        return out
-
-    raise TypeError(f"Unexpected dims_shape type: {type(dims_shape)}")
-
-
-def normalize_nd2_array(arr, sizes):
-    """
-    Normalize ND2 numpy array into shape (M, Z, C, Y, X).
-    Missing dimensions are inserted as singleton axes (size=1).
-
-    Parameters:
-        arr (np.ndarray): array from nd2.imread() or f.to_dask().compute()
-        sizes (dict): dimension sizes from ND2File.sizes
-
-    Returns:
-        np.ndarray: array reshaped to (M, Z, C, Y, X)
-    """
-    m = sizes.get("M", 1)
-    z = sizes.get("Z", 1)
-    c = sizes.get("C", 1)
-    y = sizes.get("Y")
-    x = sizes.get("X")
-
-    # Make sure array has the right number of elements
-    expected_size = m * z * c * y * x
-    if arr.size != expected_size:
-        raise ValueError(
-            f"Array size mismatch: got {arr.shape}, expected total {expected_size} "
-            f"from sizes M={m}, Z={z}, C={c}, Y={y}, X={x}"
-        )
-
-    # Reshape into consistent 5D layout
-    arr = arr.reshape((m, z, c, y, x))
-    return arr
-
-
+# ======================================================================================
+# TileScanInfo writer (your “smart” position unit logic)
+# ======================================================================================
 def decide_and_write_tilescan(
     *,
-    # inputs common to all modes
-    x_raw, y_raw,                         # np.array of raw stage coords (PosX, PosY)
-    image_dimensions,                     # (X, Y) in pixels
-    pixel_to_um_manual=None,              # float|None: manual pixel size (µm/px)
-    pixel_to_um_calc=None,                # float|None: metadata-derived pixel size (µm/px)
-    unit_hint_raw="",                     # e.g. "m", "µm", "", "pixels"
-    off_tol=0.35,                         # tolerance for accepting metadata unit (slightly looser)
-    # writing params
-    tiles_iter=None,                      # iterable of (FieldX, FieldY, PosX_raw, PosY_raw)
-    app_name="LAS X",                     # Attachment@Application
-    out_xml_path=None,                     # Path for output XML
-    deconvolution_method=None,       
-    deconvolution_iterations=None
-):
+    x_raw: np.ndarray,
+    y_raw: np.ndarray,
+    image_dimensions: Tuple[int, int],
+    pixel_to_um_manual: Optional[float] = None,
+    pixel_to_um_calc: Optional[float] = None,
+    unit_hint_raw: str = "",
+    off_tol: float = 0.35,
+    tiles_iter: Optional[Iterable] = None,
+    app_name: str = "LAS X",
+    out_xml_path: Optional[Path] = None,
+    deconvolution_method: Optional[str] = None,
+    deconvolution_iterations: Optional[int] = None,
+    objective_mag: Optional[float] = None,
+    objective_mag_source: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Decide stage position units + pixel size (µm/px),
-    auto-correct pixel_to_um if overlap large,
-    and write LAS/CZI-style TileScanInfo XML with full provenance.
+    Decide stage position units + select pixel size (µm/px), then write TileScanInfo XML.
 
-    Returns dict with:
-      chosen_unit, to_um, rationale, dx, dy, ovx, ovy,
-      pixel_to_um, pixel_to_um_source, tile_width_um, width_px, unit_hint_normalized
+    What this does
+    --------------
+    1) Selects an effective pixel size (µm/px):
+       - pixel_to_um_manual overrides pixel_to_um_calc
+       - provenance is recorded in the output XML attributes
+    2) Chooses a raw-position unit scale (raw → µm):
+       - Uses unit_hint_raw if consistent
+       - Otherwise runs a hypothesis test when tile_width_um is available
+         (requires pixel size and image width to estimate tile width in µm)
+    3) Writes TileScanInfo XML with positions ALWAYS expressed in microns (µm).
+
+    Output XML provenance attributes
+    -------------------------------
+    - DeclaredUnitHint / DeclaredUnitNormalized
+    - RawPositionUnitUsed / ScaleRawToMicron
+    - PixelSizeUm / PixelSizeSource
+    - TileWidthPx / TileWidthUm
+    - MedianStepXUm / MedianStepYUm (when computable)
+
+    Tile records contract (writer policy)
+    -------------------------------------
+    - If writing XML (out_xml_path and tiles_iter provided), tiles_iter MUST contain TileIndex.
+    - Supported tile formats:
+        * 5-tuple: (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        * or dict with keys: TileIndex, FieldX, FieldY, PosX, PosY
+    - Output tiles are written exactly as provided (no inference, no reordering).
+
+    Returns
+    -------
+    Dict[str, Any]
+        Decision summary (unit choice, scale, pixel size choice, inferred steps/overlap if available).
     """
-    import numpy as _np
-    import xml.etree.ElementTree as _ET
 
-    # ---------------- Helpers ----------------
+    # Make sure these are arrays (defensive + consistent)
+    x_raw = np.asarray(x_raw, dtype=float)
+    y_raw = np.asarray(y_raw, dtype=float)
+
     def _normalize_unit(u: str) -> str:
-        if not u: return "unknown"
+        if not u:
+            return "unknown"
         u = u.strip().lower().replace("µ", "u")
-        if u in {"um", "u", "micron", "microns"} or "micromet" in u: return "microns"
-        if u in {"px", "pixel", "pixels"}: return "pixels"
-        if u in {"m", "meter", "metre", "meters", "metres"}: return "meters"
-        if u in {"mm", "millimeter", "millimetre", "millimeters", "millimetres"}: return "millimeters"
+        if u in {"um", "u", "micron", "microns"} or "micromet" in u:
+            return "microns"
+        if u in {"px", "pixel", "pixels"}:
+            return "pixels"
+        if u in {"m", "meter", "metre", "meters", "metres"}:
+            return "meters"
+        if u in {"mm", "millimeter", "millimetre", "millimeters", "millimetres"}:
+            return "millimeters"
         return "unknown"
 
     def _robust_step_1d(vals_um, tile_width_um=None):
-        """
-        Estimate tile step robustly:
-        - If tile_width_um known: median of diffs in [0.5, 1.2]×width (fallback to top 30%)
-        - Else: median of largest 30% of positive diffs
-        """
         if vals_um is None or len(vals_um) < 2:
             return None
-        u = _np.unique(_np.round(vals_um, 9))
+        u = np.unique(np.round(vals_um, 9))
         if u.size < 2:
             return None
-        d = _np.diff(_np.sort(u))
+        d = np.diff(np.sort(u))
         d = d[d > 0]
         if d.size == 0:
             return None
@@ -279,11 +270,10 @@ def decide_and_write_tilescan(
             band = d[(d >= lo) & (d <= hi)]
             if band.size == 0:
                 k = max(1, int(0.3 * d.size))
-                band = _np.sort(d)[-k:]
-            return float(_np.median(band))
+                band = np.sort(d)[-k:]
+            return float(np.median(band))
         k = max(1, int(0.3 * d.size))
-        big = _np.sort(d)[-k:]
-        return float(_np.median(big))
+        return float(np.median(np.sort(d)[-k:]))
 
     def _ov_pct(step_um, width_um):
         if step_um is None or not width_um:
@@ -291,42 +281,118 @@ def decide_and_write_tilescan(
         return (1 - step_um / width_um) * 100.0
 
     def _ov_qual(p):
-        if p is None: return "n/a"
-        if 5 <= p <= 15: return "typical"
-        if p < 0: return "gap?"
-        if p > 25: return "large"
+        if p is None:
+            return "n/a"
+        if 5 <= p <= 15:
+            return "typical"
+        if p < 0:
+            return "gap?"
+        if p > 25:
+            return "large"
         return "ok"
 
     def _fit_for_scale(scale_um_per_raw, tile_width_um):
+        """
+        Evaluate how well a given scale (raw units → µm) matches the expected tile width.
+        Assumes tile_width_um is not None when used for scoring.
+        """
         x_um = x_raw * scale_um_per_raw
         y_um = y_raw * scale_um_per_raw
         dx = _robust_step_1d(x_um, tile_width_um)
         dy = _robust_step_1d(y_um, tile_width_um)
+
         if tile_width_um:
             axis_scores = []
-            if dx is not None: axis_scores.append(abs(dx - tile_width_um) / max(tile_width_um, 1e-9))
-            if dy is not None: axis_scores.append(abs(dy - tile_width_um) / max(tile_width_um, 1e-9))
+            if dx is not None:
+                axis_scores.append(abs(dx - tile_width_um) / max(tile_width_um, 1e-9))
+            if dy is not None:
+                axis_scores.append(abs(dy - tile_width_um) / max(tile_width_um, 1e-9))
             score = min(axis_scores) if axis_scores else float("inf")
         else:
-            # fallback order-of-magnitude guess if no width known
-            max_abs_raw = float(_np.max(_np.abs(_np.concatenate([x_raw, y_raw])))) if x_raw.size else 0.0
-            if _np.isclose(scale_um_per_raw, 1e6): score = 0.0 if max_abs_raw < 1e-3 else 1.0
-            elif _np.isclose(scale_um_per_raw, 1.0): score = 0.0 if max_abs_raw >= 1e-3 else 1.0
-            else: score = 0.5
-        return dict(score=score, dx=dx, dy=dy,
-                    ovx=_ov_pct(dx, tile_width_um),
-                    ovy=_ov_pct(dy, tile_width_um))
+            score = float("inf")
 
-    def _write_xml(*, to_um, chosen_unit, rationale, unit_hint_raw, unit_hint_norm,
-                   pixel_to_um, pixel_to_um_source, width_px, tile_width_um, dx, dy,
-                   tiles_iter, app_name, out_xml_path,
-                   deconvolution_method=None,            
-                   deconvolution_iterations=None):
-        
-        out = _ET.Element("Data")
-        img = _ET.SubElement(out, "Image", TextDescription="")
-        att = _ET.SubElement(img, "Attachment", Name="TileScanInfo",
-                             Application=app_name, FlipX="0", FlipY="0", SwapXY="0")
+        return dict(
+            score=score,
+            dx=dx,
+            dy=dy,
+            ovx=_ov_pct(dx, tile_width_um),
+            ovy=_ov_pct(dy, tile_width_um),
+        )
+
+    def _write_xml(
+        *,
+        to_um,
+        chosen_unit,
+        rationale,
+        unit_hint_raw,
+        unit_hint_norm,
+        pixel_to_um,
+        pixel_to_um_source,
+        width_px,
+        tile_width_um,
+        dx,
+        dy,
+        tiles_iter,
+        out_xml_path,
+        app_name="LAS X",
+        deconvolution_method=None,
+        deconvolution_iterations=None,
+        objective_mag=None,
+        objective_mag_source=None,
+    ):
+    
+        # ------------------------------------------------------------------
+        # Normalize tiles into records (STRICT: require TileIndex)
+        #
+        # - tiles_iter MUST be an iterable of STRICT 5-tuples:
+        #     (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        # ------------------------------------------------------------------
+        tiles_list = list(tiles_iter or [])
+        if not tiles_list:
+            raise ValueError("tiles_iter is empty — cannot write TileScanInfo without TileIndex records.")
+    
+        recs = []
+        for enum_i, t in enumerate(tiles_list):
+            rec = dict(enum_i=int(enum_i), tile_index=None, fx=None, fy=None, px=None, py=None)
+    
+            # STRICT 5-tuple ONLY
+            tt = tuple(t)
+            if len(tt) != 5:
+                raise ValueError(
+                    "Tile entry must be a STRICT 5-tuple (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw); "
+                    f"got len={len(tt)}: {tt}"
+                )
+    
+            rec["tile_index"] = int(tt[0])
+            rec["fx"] = int(tt[1])
+            rec["fy"] = int(tt[2])
+            rec["px"] = float(tt[3])
+            rec["py"] = float(tt[4])
+    
+            # final sanity
+            if rec["tile_index"] is None:
+                raise ValueError(f"Tile entry missing TileIndex after parsing: {t}")
+            if rec["px"] is None or rec["py"] is None:
+                raise ValueError(f"Tile entry missing position: {t}")
+    
+            recs.append(rec)
+    
+        # ------------------------------------------------------------------
+        # Build XML
+        # ------------------------------------------------------------------
+        out = ET.Element("Data")
+        img = ET.SubElement(out, "Image", TextDescription="")
+        att = ET.SubElement(
+            img,
+            "Attachment",
+            Name="TileScanInfo",
+            Application=str(app_name),
+            FlipX="1" if str(app_name).strip().lower() == "nis-elements" else "0",
+            FlipY="0",
+            SwapXY="0",
+        )
+    
+        # Global metadata
         att.set("Unit", "micron")
         att.set("DeclaredUnitHint", unit_hint_raw or "unknown")
         att.set("DeclaredUnitNormalized", unit_hint_norm or "unknown")
@@ -334,18 +400,21 @@ def decide_and_write_tilescan(
         att.set("ScaleRawToMicron", f"{to_um:.12g}")
         att.set("DecisionNote", rationale or "")
     
-        if deconvolution_method is None:
-            att.set("DeconvolutionMethod", "None")
-            att.set("DeconvolutionIterations", "0")
-        else:
+        if deconvolution_method:
             att.set("DeconvolutionMethod", str(deconvolution_method))
             att.set("DeconvolutionIterations", str(deconvolution_iterations or 0))
-
-
+        else:
+            att.set("DeconvolutionMethod", "None")
+            att.set("DeconvolutionIterations", "0")
+    
         if pixel_to_um is not None:
             att.set("PixelSizeUm", f"{float(pixel_to_um):.10f}")
-            if pixel_to_um_source:
-                att.set("PixelSizeSource", pixel_to_um_source)
+            att.set("PixelSizeSource", pixel_to_um_source or "unknown")
+    
+        if objective_mag is not None:
+            att.set("ObjectiveMagnification", f"{float(objective_mag):.10g}")
+            att.set("ObjectiveMagnificationSource", objective_mag_source or "metadata-derived")
+    
         if width_px is not None:
             att.set("TileWidthPx", str(int(width_px)))
         if tile_width_um is not None:
@@ -354,25 +423,25 @@ def decide_and_write_tilescan(
             att.set("MedianStepXUm", f"{float(dx):.10f}")
         if dy is not None:
             att.set("MedianStepYUm", f"{float(dy):.10f}")
-
-        for t in tiles_iter or []:
-            if isinstance(t, dict):
-                fx, fy = int(t["FieldX"]), int(t["FieldY"])
-                px_raw, py_raw = float(t["PosX"]), float(t["PosY"])
-            else:
-                fx, fy, px_raw, py_raw = int(t[0]), int(t[1]), float(t[2]), float(t[3])
-            _ET.SubElement(att, "Tile",
-                           FieldX=str(fx), FieldY=str(fy),
-                           PosX=f"{px_raw * to_um:.10f}",
-                           PosY=f"{py_raw * to_um:.10f}")
-
-        _ET.ElementTree(out).write(out_xml_path, encoding="utf-8", xml_declaration=True)
+    
+        # Tiles (exactly as given)
+        for r in recs:
+            ET.SubElement(
+                att,
+                "Tile",
+                TileIndex=str(int(r["tile_index"])),
+                FieldX=str(int(r["fx"])),
+                FieldY=str(int(r["fy"])),
+                PosX=f"{r['px'] * to_um:.10f}",
+                PosY=f"{r['py'] * to_um:.10f}",
+            )
+    
+        ET.ElementTree(out).write(out_xml_path, encoding="utf-8", xml_declaration=True)
         print(f"[INFO] Wrote TileScanInfo: {out_xml_path} (positions in µm)")
 
-    # ---------------- Decision logic ----------------
+    # --- pixel size selection ---
     width_px = image_dimensions[0] if isinstance(image_dimensions, (tuple, list)) else None
-
-    # pixel size selection
+    
     pixel_to_um = None
     pixel_to_um_source = "unavailable"
     if pixel_to_um_manual is not None:
@@ -381,110 +450,3494 @@ def decide_and_write_tilescan(
     elif pixel_to_um_calc is not None:
         pixel_to_um = float(pixel_to_um_calc)
         pixel_to_um_source = "metadata-derived"
+    
+    # ------------------------------------------------------------------
+    # RESTORED PRINTS: pixel size provenance + magnification
+    # ------------------------------------------------------------------
+    if objective_mag is not None:
+        src = objective_mag_source or "metadata-derived"
+        print(f"[META] Objective magnification: {float(objective_mag):g}x (source={src})")
+    else:
+        print("[META] Objective magnification: unavailable")
+    
 
+    if pixel_to_um_calc is not None:
+        print(f"[META] Pixel size from metadata: {float(pixel_to_um_calc):.6f} µm/px")
+    else:
+        print("{BOLD}[WARN]⚠️ {RESET} No pixel size information available from metadata")
+    
+    if pixel_to_um_manual is not None:
+        print(f"[INFO] Manual pixel_to_um: {float(pixel_to_um_manual):.6f} µm/px")
+        if pixel_to_um_calc is not None and not np.isclose(
+            float(pixel_to_um_manual), float(pixel_to_um_calc), rtol=0.02
+        ):
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} Manual pixel size ({float(pixel_to_um_manual):.6f} µm/px) differs "
+                f"from metadata value ({float(pixel_to_um_calc):.6f} µm/px)."
+            )
+    
+    
+    # ------------------------------------------------------------------
+    # RESTORED PRINT #1: explicit pixel size decision 
+    # ------------------------------------------------------------------
+    if pixel_to_um is not None:
+        if pixel_to_um_manual is not None:
+            msg = f"[INFO] Pixel size decision: using manual pixel_to_um={pixel_to_um:.6f} µm/px"
+            if pixel_to_um_calc is not None:
+                msg += f" (metadata={float(pixel_to_um_calc):.6f} µm/px)"
+            print(msg)
+        else:
+            print(f"[INFO] Pixel size decision: using metadata-derived pixel_to_um={pixel_to_um:.6f} µm/px")
+    else:
+        print("{BOLD}[WARN]⚠️ {RESET} Pixel size decision: no pixel size available (manual=None, metadata=None)")
+    
     tile_width_um = (width_px * pixel_to_um) if (width_px and pixel_to_um) else None
     unit_hint_norm = _normalize_unit(unit_hint_raw or "")
-
-    # include mm hypothesis
+    
+    # Hypotheses: scale raw units → µm
     candidates = {
         "meters": 1e6,
         "millimeters": 1e3,
         "microns": 1.0,
-        "pixels": pixel_to_um if pixel_to_um is not None else None
+        "pixels": pixel_to_um if pixel_to_um is not None else None,
     }
-
+    
     chosen_unit = None
     rationale = ""
     dx = dy = ovx = ovy = None
     to_um = None
-
-    # Try metadata unit first (if provided and supported)
-    if unit_hint_norm in candidates and candidates[unit_hint_norm] is not None:
-        r = _fit_for_scale(candidates[unit_hint_norm], tile_width_um)
-        if r["score"] <= off_tol:
+    
+    # ---------------------------
+    # Unit decision
+    # ---------------------------
+    if tile_width_um is None:
+    # No tile width => hypothesis test is not meaningful.
+    # Prefer metadata hint if it maps to a valid scale, else default to microns.
+        if unit_hint_norm in candidates and candidates[unit_hint_norm] is not None:
             chosen_unit = unit_hint_norm
             to_um = candidates[chosen_unit]
-            dx, dy, ovx, ovy = r["dx"], r["dy"], r["ovx"], r["ovy"]
-            parts = []
-            parts.append(f"ΔX≈{dx:.2f} µm (overlap≈{ovx:.1f}% {_ov_qual(ovx)})" if dx is not None else "ΔX=n/a")
-            parts.append(f"ΔY≈{dy:.2f} µm (overlap≈{ovy:.1f}% {_ov_qual(ovy)})" if dy is not None else "ΔY=n/a")
-            rationale = f"metadata unit '{chosen_unit}' confirmed: {', '.join(parts)} vs width≈{tile_width_um:.2f} µm" if tile_width_um else f"metadata unit '{chosen_unit}' confirmed"
+    
+            # Make it explicit that this is a hint-based choice (not “confirmed”)
+            # and record the original hint value for debugging.
+            rationale = (
+                f"{chosen_unit} chosen from declared unit hint "
+                f"(DeclaredUnitNormalized='{unit_hint_norm}'; no tile_width_um)"
+            )
         else:
-            print(f"[WARN] Metadata unit '{unit_hint_norm}' inconsistent (overlap X≈{r['ovx']}, Y≈{r['ovy']}) — running hypothesis test.")
+            chosen_unit = "microns"
+            to_um = candidates.get("microns", 1.0) or 1.0
+    
+            # Make it explicit we are defaulting because hint was unusable.
+            rationale = (
+                "microns chosen by default (declared unit hint unusable or missing; "
+                "no tile_width_um; hypothesis test disabled)"
+            )
 
-    # Hypothesis selection if not confirmed
-    if chosen_unit is None:
-        scores, details = {}, {}
-        for name, scale in candidates.items():
-            if scale is None:
-                continue
-            r = _fit_for_scale(scale, tile_width_um)
-            scores[name] = r["score"]
-            details[name] = r
-        if not scores:
-            chosen_unit, to_um, rationale = "microns", 1.0, "no evaluable hypotheses; defaulting to microns"
-        else:
-            chosen_unit = min(scores, key=scores.get)
-            to_um = candidates[chosen_unit]
-            dx, dy, ovx, ovy = (details[chosen_unit][k] for k in ("dx", "dy", "ovx", "ovy"))
-            parts = []
-            parts.append(f"ΔX≈{dx:.2f} µm (overlap≈{ovx:.1f}% {_ov_qual(ovx)})" if dx is not None else "ΔX=n/a")
-            parts.append(f"ΔY≈{dy:.2f} µm (overlap≈{ovy:.1f}% {_ov_qual(ovy)})" if dy is not None else "ΔY=n/a")
-            if tile_width_um is not None:
-                rationale = f"{chosen_unit} chosen by hypothesis: {', '.join(parts)} vs width≈{tile_width_um:.2f} µm"
+    else:
+        # Try hint first (if it corresponds to a candidate with a scale)
+        if unit_hint_norm in candidates and candidates[unit_hint_norm] is not None:
+            r = _fit_for_scale(candidates[unit_hint_norm], tile_width_um)
+            if r["score"] <= off_tol:
+                chosen_unit = unit_hint_norm
+                to_um = candidates[chosen_unit]
+                dx, dy, ovx, ovy = r["dx"], r["dy"], r["ovx"], r["ovy"]
+                rationale = f"metadata unit '{chosen_unit}' confirmed"
             else:
-                rationale = f"{chosen_unit} chosen by hypothesis: {', '.join(parts)}"
-
-    # Large-overlap auto-correction check (try the other pixel size source if available)
-    def _is_large(v): return v is not None and v > 25.0
-    if _is_large(ovx) or _is_large(ovy):
-        if pixel_to_um_manual is not None and pixel_to_um_calc is not None:
-            other_px = float(pixel_to_um_calc) if pixel_to_um_source == "manual argument" else float(pixel_to_um_manual)
-            if not _np.isclose(other_px, float(pixel_to_um), rtol=0.05):
-                new_tile_width_um = (width_px * other_px) if width_px else None
-                r2 = _fit_for_scale(to_um, new_tile_width_um)
-                ovx2, ovy2 = r2["ovx"], r2["ovy"]
-                if all(v is not None and v <= 25.0 for v in (ovx2, ovy2)):
-                    print(
-                        f"[WARN] Large overlap ({ovx:.1f}%, {ovy:.1f}%) with {pixel_to_um:.6f} µm/px — "
-                        f"switching to {other_px:.6f} µm/px improves overlap "
-                        f"({ovx2:.1f}%, {ovy2:.1f}%).\n\033[1m⚠️ Please verify your manual 'pixel_to_um' value.\033[0m"
-                    )
-                    pixel_to_um = other_px
-                    pixel_to_um_source = "metadata-derived" if pixel_to_um_source == "manual argument" else "manual argument"
-                    tile_width_um = new_tile_width_um
-                    # keep outputs consistent:
-                    dx, dy = r2["dx"], r2["dy"]
-                    ovx, ovy = ovx2, ovy2
-                    rationale = f"{chosen_unit} confirmed; pixel size auto-corrected"
-
-    # Safe print (avoid formatting None)
+                print(f"{BOLD}[WARN]⚠️ {RESET} Metadata unit '{unit_hint_norm}' inconsistent — running hypothesis test.")
+    
+        # Otherwise (or if hint failed): choose best hypothesis
+        if chosen_unit is None:
+            scores, details = {}, {}
+            for name, scale in candidates.items():
+                if scale is None:
+                    continue
+                r = _fit_for_scale(scale, tile_width_um)
+                scores[name] = r["score"]
+                details[name] = r
+            if scores:
+                chosen_unit = min(scores, key=scores.get)
+                to_um = candidates.get(chosen_unit, 1.0) or 1.0
+                d = details.get(chosen_unit, {})
+                dx, dy, ovx, ovy = d.get("dx"), d.get("dy"), d.get("ovx"), d.get("ovy")
+                rationale = f"{chosen_unit} chosen by hypothesis"
+            else:
+                chosen_unit = "microns"
+                to_um = 1.0
+                rationale = "no valid unit candidates; defaulting to microns"
+    
     px_str = f"{pixel_to_um:.6f}" if pixel_to_um is not None else "NA"
     tw_str = f"{tile_width_um:.2f}" if tile_width_um is not None else "NA"
-    print(
-        f"[INFO] Position unit decision: {rationale} "
-        f"[unit used='{chosen_unit}'; width_px={width_px}; pixel_to_um={px_str} µm/px; tile_width_um={tw_str} µm]"
+    
+    # ------------------------------------------------------------------
+    # RESTORED PRINT #2: compact unit decision line 
+    # ------------------------------------------------------------------
+
+    if (dx is not None) and (dy is not None) and (tile_width_um is not None) and (tile_width_um > 0):
+        ovx_s = f"{ovx:.1f}% {_ov_qual(ovx)}" if ovx is not None else "n/a"
+        ovy_s = f"{ovy:.1f}% {_ov_qual(ovy)}" if ovy is not None else "n/a"
+        print(
+            f"[INFO] Position unit decision (detail): {rationale}: "
+            f"ΔX≈{dx:.2f} µm (overlap≈{ovx_s}), "
+            f"ΔY≈{dy:.2f} µm (overlap≈{ovy_s}) "
+            f"vs width≈{tile_width_um:.2f} µm "
+            f"[unit used='{chosen_unit}'; width_px={width_px}; pixel_to_um={px_str} µm/px; tile_width_um={tw_str} µm]"
+        )
+    else:
+        print(
+            f"[INFO] Position unit decision: {rationale} "
+            f"[unit used='{chosen_unit}'; width_px={width_px}; pixel_to_um={px_str} µm/px; tile_width_um={tw_str} µm]"
+        )
+
+    # NOTE (TileScanInfo writer policy)
+    # --------------------------------
+    # _write_xml() writes exactly what tiles_iter provides (no inference, no sorting).
+    # Handlers must provide valid ints for TileIndex/FieldX/FieldY.
+
+    if out_xml_path and tiles_iter is not None:
+        _write_xml(
+            to_um=to_um,
+            chosen_unit=chosen_unit,
+            rationale=rationale,
+            unit_hint_raw=unit_hint_raw,
+            unit_hint_norm=unit_hint_norm,
+            pixel_to_um=pixel_to_um,
+            pixel_to_um_source=pixel_to_um_source,
+            width_px=width_px,
+            tile_width_um=tile_width_um,
+            dx=dx,
+            dy=dy,
+            tiles_iter=tiles_iter,
+            out_xml_path=out_xml_path,
+            app_name=app_name,
+            deconvolution_method=deconvolution_method,
+            deconvolution_iterations=deconvolution_iterations,
+            objective_mag=objective_mag,
+            objective_mag_source=objective_mag_source,
+        )
+
+    return dict(
+        chosen_unit=chosen_unit,
+        to_um=to_um,
+        rationale=rationale,
+        dx=dx,
+        dy=dy,
+        ovx=ovx,
+        ovy=ovy,
+        pixel_to_um=pixel_to_um,
+        pixel_to_um_source=pixel_to_um_source,
+        tile_width_um=tile_width_um,
+        width_px=width_px,
+        unit_hint_normalized=unit_hint_norm,
     )
 
-    if out_xml_path and tiles_iter:
-        _write_xml(
-            to_um=to_um, chosen_unit=chosen_unit, rationale=rationale,
-            unit_hint_raw=unit_hint_raw, unit_hint_norm=unit_hint_norm,
-            pixel_to_um=pixel_to_um, pixel_to_um_source=pixel_to_um_source,
-            width_px=width_px, tile_width_um=tile_width_um, dx=dx, dy=dy,
-            tiles_iter=tiles_iter, app_name=app_name, out_xml_path=out_xml_path,
+# ==================================================================================
+# Shared HELPERS 
+# ==================================================================================
+
+def normalize_pixel_size_to_um(
+    raw_length_per_pixel: float,
+    *,
+    source: str,
+    meters_range: Tuple[float, float] = (1e-9, 1e-4),
+) -> Tuple[Optional[float], str]:
+    """
+    Normalize a raw physical length-per-pixel value to microns (µm/px)
+    using magnitude-based heuristics.
+
+    This function centralizes the unit-inference logic used across
+    TIFF / LIF / CZI handlers to avoid format-dependent drift.
+
+    Heuristic
+    ---------
+    - If raw_length_per_pixel falls within a plausible meters-per-pixel
+      range (default: 1e-9 .. 1e-4), interpret it as meters and convert
+      to microns (× 1e6).
+    - Otherwise, assume the value is already expressed in microns.
+
+    IMPORTANT DESIGN NOTES
+    ----------------------
+    - This function performs *no metadata parsing* — only magnitude-based
+      normalization.
+    - The meters_range is intentionally conservative and shared across
+      all formats for consistency.
+    - If raw_length_per_pixel is non-positive or NaN, returns (None, reason).
+
+    Parameters
+    ----------
+    raw_length_per_pixel : float
+        Raw length-per-pixel value extracted from metadata.
+    source : str
+        Human-readable source label (used only for provenance strings).
+    meters_range : (float, float)
+        Inclusive range treated as meters-per-pixel.
+
+    Returns
+    -------
+    pixel_size_um : float or None
+        Pixel size in microns per pixel, or None if invalid.
+    provenance : str
+        Description of how the value was interpreted.
+    """
+
+    try:
+        v = float(raw_length_per_pixel)
+    except Exception:
+        return None, f"{source}: invalid raw value"
+
+    if not np.isfinite(v) or v <= 0:
+        return None, f"{source}: non-positive or non-finite value"
+
+    lo, hi = meters_range
+
+    if lo <= v <= hi:
+        # Interpreted as meters-per-pixel → convert to µm
+        return v * 1e6, f"{source}: meters-per-pixel (×1e6 → µm)"
+    else:
+        # Interpreted as already in µm-per-pixel
+        return v, f"{source}: assumed µm-per-pixel (outside meter range)"
+
+
+# ==================================================================================
+# TIFF HELPERS (Leica XML / TIFF modes)
+# ==================================================================================
+
+def tiff_find_metadata_dir_case_insensitive(input_dir: Path, folder_name: str = "metadata") -> Optional[Path]:
+    """
+    Find Leica's metadata folder inside input_dir, case-insensitively.
+
+    Leica commonly uses folder names like:
+      - "Metadata"
+      - "MetaData"
+      - "metadata"
+
+    We scan only one level under input_dir.
+    """
+    input_dir = Path(input_dir)
+    wanted = (folder_name or "").strip().lower()
+
+    for p in input_dir.iterdir():
+        if p.is_dir() and p.name.strip().lower() == wanted:
+            return p
+    return None
+
+def tiff_pick_leica_xml(input_metadata_dir: Path, *, region_token: str = "") -> Optional[Path]:
+    """
+    Pick the best Leica XML/XLF file from a Metadata folder.
+
+    Rules:
+      - Accept: .xml, .xlif
+      - Ignore: any file with "properties" in the name (LAS X dumps)
+      - Prefer: a file whose name contains region_token (case-insensitive)
+      - Fallback: newest file by modification time
+    """
+    input_metadata_dir = Path(input_metadata_dir)
+
+    md_files = [
+        f for f in input_metadata_dir.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in (".xml", ".xlf", ".xlif")
+        and "properties" not in f.name.lower()
+    ]
+    if not md_files:
+        return None
+
+    region_token = (region_token or "").strip()
+    if region_token:
+        prio = [f for f in md_files if region_token.lower() in f.stem.lower()]
+        if prio:
+            # If multiple match, keep deterministic ordering
+            return sorted(prio)[0]
+
+    return max(md_files, key=lambda p: p.stat().st_mtime)
+
+def tiff_parse_xml_safe(md_file: Path) -> Optional[ET.Element]:
+    """Parse Leica XML safely. Return root element or None on failure."""
+    try:
+        root = ET.parse(str(md_file)).getroot()
+        return root if root is not None else None
+    except Exception:
+        return None
+
+def tiff_safe_float(x) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def tiff_px_um_from_dim(dim_node: Optional[ET.Element], axis: str) -> Tuple[Optional[float], str]:
+    """
+    Compute Leica pixel size from a DimensionDescription node using Length / NumberOfElements.
+
+    Leica exports are inconsistent about physical units. In practice:
+      - If Length/Elements is extremely small (typical meters/px scale), treat it as meters/px
+        and convert to µm/px by multiplying by 1e6.
+      - Otherwise assume the value is already in µm/px.
+
+    Returns
+    -------
+    (pixel_size_um_per_px, source_string)
+        pixel_size_um_per_px may be None if required fields are missing.
+
+    DESIGN NOTES
+    ------------
+    - Pure extraction helper: NO printing, NO logging, NO file I/O.
+    - All unit-magnitude inference is delegated to normalize_pixel_size_to_um()
+      to keep TIFF/LIF/CZI behavior consistent.
+    """
+
+    if dim_node is None:
+        return None, f"{axis}:missing"
+
+    # Leica XML uses either NumberOfElements or Elements depending on export flavor.
+    N = tiff_safe_float(dim_node.attrib.get("NumberOfElements") or dim_node.attrib.get("Elements"))
+    L = tiff_safe_float(dim_node.attrib.get("Length"))
+
+    # Guard: require both values and require positivity
+    if N is None or L is None:
+        return None, f"{axis}:no_length_or_count"
+    if N <= 0 or L <= 0:
+        return None, f"{axis}:nonpositive_length_or_count"
+
+    raw = L / N  # raw pixel size in unknown units (meters/px or µm/px)
+
+    # Guard: reject non-finite values early
+    if not np.isfinite(raw) or raw <= 0:
+        return None, f"{axis}:invalid_raw"
+
+    # ------------------------------------------------------------------
+    # Delegate unit normalization to the shared helper
+    # ------------------------------------------------------------------
+    px_um, src = normalize_pixel_size_to_um(
+        raw,
+        source=f"{axis}:Length/N",
+    )
+
+    return px_um, src
+
+
+def tiff_extract_pixel_size_and_magnification(
+    root: ET.Element,
+    *,
+    pixel_to_um_manual: Optional[float] = None,
+    rtol_warn: float = 0.02,
+) -> Dict[str, Any]:
+    """
+    Extract pixel size (µm/px), objective magnification, and unit hints from Leica TIFF XML.
+
+    IMPORTANT
+    ---------
+    - Extraction only: this function MUST NOT print, log, or write files.
+    - It MUST NOT apply the manual pixel size override: pixel_to_um_manual is handled later
+      in decide_and_write_tilescan() to keep all decisions and warnings centralized.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Includes:
+          - pixel_to_um_calc (float or None)
+          - magnification (float or None)
+          - unit_hint_raw (str)
+          - px_um_x/px_um_y + per-axis source strings + mismatch indicator
+    """
+
+    def tiff_extract_objective_magnification(root: ET.Element) -> Optional[float]:
+        """
+        Best-effort objective magnification extraction from Leica XML.
+    
+        We try a few plausible locations/attributes. Returns magnification (e.g. 20.0) or None.
+        """
+        for xp in (
+            ".//Instrument//Objective",
+            ".//Attachment[@Name='HardwareSetting']//ATLCameraSettingDefinition",
+        ):
+            n = root.find(xp)
+            if n is None:
+                continue
+            mag = tiff_safe_float(
+                n.attrib.get("Magnification")
+                or n.attrib.get("NominalMagnification")
+                or n.attrib.get("TotalVideoMag")
+            )
+            if mag:
+                return mag
+        return None
+    
+    # ------------------------------------------------------------
+    # Pixel size extraction from DimensionDescription nodes
+    # ------------------------------------------------------------
+    dim_x = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='1']")
+    dim_y = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='2']")
+
+    px_um_x, src_x = tiff_px_um_from_dim(dim_x, "X")
+    px_um_y, src_y = tiff_px_um_from_dim(dim_y, "Y")
+
+    pixel_to_um_calc = None
+    warn_xy_mismatch = None
+
+    if px_um_x is not None and px_um_y is not None:
+        rel = abs(px_um_x - px_um_y) / max(px_um_x, px_um_y)
+        pixel_to_um_calc = (px_um_x + px_um_y) / 2.0
+        if rel > rtol_warn:
+            warn_xy_mismatch = rel
+    else:
+        pixel_to_um_calc = px_um_x if px_um_x is not None else px_um_y
+
+    # ------------------------------------------------------------
+    # Objective magnification (best-effort)
+    # ------------------------------------------------------------
+    mag = tiff_extract_objective_magnification(root)
+
+    # ------------------------------------------------------------
+    # Raw unit hint from metadata (may be unreliable)
+    # ------------------------------------------------------------
+    unit_hint_raw = (
+        dim_x.attrib.get("Unit", "") if dim_x is not None else ""
+    ).strip().lower()
+
+    # ------------------------------------------------------------
+    # Return EVERYTHING needed for later decision + logging
+    # ------------------------------------------------------------
+    return dict(
+        pixel_to_um_calc=pixel_to_um_calc,
+        magnification=mag,
+        unit_hint_raw=unit_hint_raw,
+
+        # Provenance for later logging
+        px_um_x=px_um_x,
+        px_um_y=px_um_y,
+        src_x=src_x,
+        src_y=src_y,
+        warn_xy_mismatch=warn_xy_mismatch,
+    )
+
+
+def tiff_collect_tiles_from_tilescaninfo(root: ET.Element) -> List[Tuple]:
+    """
+    Read Leica TileScanInfo tile positions from XML.
+
+    Returns
+    -------
+    List[Tuple]
+        If TileIndex is present on tiles:
+          (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        Else:
+          (FieldX, FieldY, PosX_raw, PosY_raw)
+
+    Ordering
+    --------
+    Deterministic grid order: sorted by (FieldY, FieldX).
+
+    Validation
+    ----------
+    - If ANY <Tile> has TileIndex then ALL must have TileIndex (else ValueError).
+    - FieldX, FieldY, PosX, PosY are required on every <Tile>.
+    - Types are normalized:
+        FieldX/FieldY/TileIndex -> int
+        PosX/PosY -> float
+    """
+
+
+    def _require_attr(node: ET.Element, name: str) -> str:
+        v = node.attrib.get(name, None)
+        if v is None:
+            raise ValueError(
+                f"<Tile> missing required attribute {name!r}: "
+                f"{ET.tostring(node, encoding='unicode')}"
+            )
+        return v
+
+    tile_nodes = root.findall(".//Attachment[@Name='TileScanInfo']//Tile")
+    if not tile_nodes:
+        return []
+
+    # Check TileIndex consistency (either present on all tiles or none)
+    has_any_ti = any("TileIndex" in n.attrib for n in tile_nodes)
+    has_all_ti = all("TileIndex" in n.attrib for n in tile_nodes)
+    if has_any_ti and not has_all_ti:
+        raise ValueError(
+            "Inconsistent TileScanInfo: some <Tile> have TileIndex and others do not."
+        )
+
+    # Deterministic grid order (FieldY, FieldX)
+    # NOTE: we intentionally use the required attrs here, so missing FieldX/FieldY
+    # fails loudly with context.
+    tile_nodes_sorted = sorted(
+        tile_nodes,
+        key=lambda n: (int(_require_attr(n, "FieldY")), int(_require_attr(n, "FieldX"))),
+    )
+
+    tiles_iter: List[Tuple] = []
+
+    for n in tile_nodes_sorted:
+        # Required core attributes
+        fx = int(_require_attr(n, "FieldX"))
+        fy = int(_require_attr(n, "FieldY"))
+        px = float(_require_attr(n, "PosX"))
+        py = float(_require_attr(n, "PosY"))
+
+        if has_all_ti:
+            ti = int(_require_attr(n, "TileIndex"))
+            tiles_iter.append((ti, fx, fy, px, py))
+        else:
+            tiles_iter.append((fx, fy, px, py))
+
+    return tiles_iter
+
+# ======================================================================================
+# LIF helpers (pixel size + objective magnification) 
+# ======================================================================================
+
+def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Extract LIF objective magnification + pixel size (µm/px), using the keys your LifHandler sets.
+
+    Expects (from LifHandler.open_region):
+      - ctx["lif_file"] (readlif LifFile)   [optional but preferred]
+      - ctx["lif_xml_root"]                [optional]
+      - ctx["lif_image_dict"]              [optional]
+      - ctx["lif_filepath"]                [optional, only for messaging]
+
+    Returns:
+      (objective_mag, pixel_to_um_calc)
+    """
+    lf = ctx.get("lif_file", None)
+
+    # ---------- xml_header as text (best-effort) ----------
+    xml_text = ""
+    try:
+        xml_header = getattr(lf, "xml_header", None) if lf is not None else None
+        if isinstance(xml_header, (bytes, bytearray)):
+            xml_text = xml_header.decode("utf-8", errors="replace")
+        else:
+            xml_text = str(xml_header or "")
+    except Exception:
+        xml_text = ""
+
+    # Prefer ctx-provided root, fallback to lf.xml_root
+    root = ctx.get("lif_xml_root", None)
+    if root is None and lf is not None:
+        root = getattr(lf, "xml_root", None)
+
+    def _try_float(x) -> Optional[float]:
+        try:
+            if x is None:
+                return None
+            if isinstance(x, str):
+                x = x.strip().replace(",", ".")
+            return float(x)
+        except Exception:
+            return None
+
+    def _plausible_mag(v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            if not np.isfinite(v):
+                return None
+        except Exception:
+            return None
+        # typical objectives ~1..200; allow a bit wider
+        return float(v) if (0.25 <= float(v) <= 400.0) else None
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    # =============================================================================
+    # (1) Magnification from xml_root (namespace-agnostic)
+    # =============================================================================
+    mag: Optional[float] = None
+    if isinstance(root, ET.Element):
+        objective_like = []
+        for n in root.iter():
+            lname = _local(n.tag).lower()
+            if "objective" in lname:
+                objective_like.append(n)
+
+        scan_nodes = objective_like if objective_like else list(root.iter())
+
+        attr_keys = (
+            "Magnification",
+            "NominalMagnification",
+            "ObjectiveMagnification",
+            "TotalMagnification",
+            "TotalVideoMagnification",
+        )
+
+        for n in scan_nodes:
+            # 1) attributes on node
+            for k in attr_keys:
+                if k in n.attrib:
+                    mag = _plausible_mag(_try_float(n.attrib.get(k)))
+                    if mag is not None:
+                        break
+            if mag is not None:
+                break
+
+            # 2) child text nodes
+            for child in list(n):
+                lk = _local(child.tag)
+                if lk in attr_keys and (child.text or "").strip():
+                    mag = _plausible_mag(_try_float(child.text))
+                    if mag is not None:
+                        break
+            if mag is not None:
+                break
+
+    # =============================================================================
+    # (2) Magnification regex fallback over xml_header text
+    # =============================================================================
+    if mag is None and xml_text:
+        patterns = [
+            r'NominalMagnification\s*=\s*["\']([\d.,]+)["\']',
+            r'ObjectiveMagnification\s*=\s*["\']([\d.,]+)["\']',
+            r'TotalMagnification\s*=\s*["\']([\d.,]+)["\']',
+            r'Magnification\s*=\s*["\']([\d.,]+)["\']',
+            r'<NominalMagnification>\s*([\d.,]+)\s*</NominalMagnification>',
+            r'<Magnification>\s*([\d.,]+)\s*</Magnification>',
+        ]
+        for pat in patterns:
+            m = re.search(pat, xml_text, re.IGNORECASE)
+            if m:
+                mag = _plausible_mag(_try_float(m.group(1)))
+                if mag is not None:
+                    break
+
+    # =============================================================================
+    # Pixel size (µm/px)
+    # =============================================================================
+    pixel_to_um_calc: Optional[float] = None
+
+    # (a) Look for voxel size in xml_header (often meters)
+    if xml_text:
+        voxels = re.findall(r'VoxelSize[XY]\s*=\s*["\']([\deE.+-]+)["\']', xml_text, re.IGNORECASE)
+        if voxels:
+            try:
+                # IMPORTANT:
+                # - LIF xml_header voxel sizes are often meters/px, but not guaranteed.
+                # - We delegate unit normalization to normalize_pixel_size_to_um()
+                #   to keep behavior consistent with TIFF/CZI.
+                vals_um: List[float] = []
+                for i, v in enumerate(voxels[:2]):  # X, Y only
+                    if not v:
+                        continue
+                    raw = _try_float(v)
+                    if raw is None or not np.isfinite(raw) or raw <= 0:
+                        continue
+                    um, _src = normalize_pixel_size_to_um(
+                        float(raw),
+                        source=f"LIF xml_header:VoxelSize{'XY'[i]}",
+                    )
+                    if um is not None:
+                        vals_um.append(float(um))
+
+                if vals_um:
+                    pixel_to_um_calc = float(sum(vals_um) / len(vals_um))
+                    return mag, pixel_to_um_calc
+            except Exception:
+                pass
+
+    # (b) Common readlif image_dict keys (varies by version/data)
+    d = ctx.get("lif_image_dict", None)
+    if isinstance(d, dict):
+        # Try a handful of common patterns; accept either meters or microns
+        candidate_keys = ("voxel_size", "voxelSize", "pixel_size", "pixelsize", "scale", "scales")
+        for key in candidate_keys:
+            v = d.get(key, None)
+            if v is None:
+                continue
+            try:
+                if isinstance(v, dict):
+                    x = v.get("x") or v.get("X") or v.get("0")
+                else:
+                    x = v[0]  # list/tuple/np array
+
+                raw = _try_float(x)
+                if raw is None or not np.isfinite(raw) or raw <= 0:
+                    continue
+
+                # IMPORTANT:
+                # - readlif sometimes stores meters/px, sometimes µm/px depending on version/data.
+                # - Delegate to shared helper to avoid drifting heuristics.
+                pixel_to_um_calc, _src = normalize_pixel_size_to_um(
+                    float(raw),
+                    source=f"LIF image_dict:{key}",
+                )
+                if pixel_to_um_calc is not None and pixel_to_um_calc > 0:
+                    return mag, float(pixel_to_um_calc)
+            except Exception:
+                continue
+
+    # (c) Fallback: xml_root DimensionDescription (Length / Elements) -> meters or microns
+    def _safe_float(x) -> Optional[float]:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _dim_to_um(el: Optional[ET.Element], axis: str) -> Optional[float]:
+        if el is None:
+            return None
+        N = _safe_float(el.attrib.get("NumberOfElements") or el.attrib.get("Elements"))
+        L = _safe_float(el.attrib.get("Length"))
+        if N is None or L is None or N <= 0 or L <= 0:
+            return None
+
+        raw = L / N  # could be meters/px or already microns/px depending on file
+
+        # IMPORTANT:
+        # - Delegate normalization to shared helper (same logic as TIFF).
+        um, _src = normalize_pixel_size_to_um(
+            float(raw),
+            source=f"LIF xml_root:{axis}:Length/N",
+        )
+        return um
+
+    if isinstance(root, ET.Element):
+        try:
+            # Leica LIF often uses DimID 1=X and 2=Y, but we keep it defensive
+            dim_x = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='1']")
+            dim_y = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='2']")
+            vals = [v for v in (_dim_to_um(dim_x, "X"), _dim_to_um(dim_y, "Y")) if v is not None]
+            if vals:
+                pixel_to_um_calc = float(sum(vals) / len(vals))
+        except Exception:
+            pixel_to_um_calc = None
+
+    return mag, (float(pixel_to_um_calc) if pixel_to_um_calc is not None else None)
+
+# ======================================================================================
+# CZI helpers (pixel size + objective magnification + mosaic tile positions + dims normalization)
+# ======================================================================================
+
+def czi_get_mag_and_pixel_to_um(czi: "CziFile") -> Tuple[Optional[float], Optional[float]]:
+    """
+    Extract objective magnification + pixel size (µm/px) from CZI metadata.
+
+    Policy
+    ------
+    - We DO NOT guess *stage* units here (that belongs to decide_and_write_tilescan).
+    - We DO try hard to recover pixel size from scaling metadata:
+        * If unit is explicit: convert deterministically.
+        * If unit is missing/unknown: accept only if the numeric magnitude is
+          strongly indicative (meters-like vs microns-like vs nm-like).
+          Otherwise return None (fail closed).
+
+    Returns
+    -------
+    (mag, pixel_to_um_calc)
+      - mag: objective magnification (e.g., 20, 40)
+      - pixel_to_um_calc: µm/px (float) or None
+    """
+    meta_root = getattr(czi, "meta", None)
+    if meta_root is None:
+        return None, None
+
+    if not isinstance(meta_root, ET.Element):
+        try:
+            meta_root = ET.fromstring(meta_root)  # bytes/str
+        except Exception:
+            return None, None
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    def _iter(root: ET.Element, name: str):
+        for n in root.iter():
+            if _local(n.tag) == name:
+                yield n
+
+    # ----------------------------
+    # Pixel size (Scaling/Items/Distance)
+    # ----------------------------
+    def _parse_float(txt: Optional[str]) -> Optional[float]:
+        if not txt:
+            return None
+        try:
+            return float(txt.strip().replace(",", "."))
+        except Exception:
+            return None
+
+    def _unit_to_um(v: float, unit_txt: Optional[str]) -> Optional[float]:
+        """
+        Deterministic conversion if unit is known.
+        Returns None if unit missing/unknown.
+        """
+        u = (unit_txt or "").strip().lower().replace("μ", "µ")
+        if u in ("m", "meter", "metre", "meters", "metres"):
+            return v * 1e6
+        if u in ("mm", "millimeter", "millimetre", "millimeters", "millimetres"):
+            return v * 1e3
+        if u in ("µm", "um", "micrometer", "micrometre", "micron", "microns"):
+            return v
+        if u in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
+            return v * 1e-3
+        return None
+
+    def _magnitude_to_um(v: float) -> Optional[float]:
+        """
+        Unit-missing fallback:
+        Accept only if value magnitude is very clearly in one of these regimes:
+    
+          - meters/px:   ~1e-9 .. 1e-3  (typical is ~1e-7 .. 1e-5)
+          - microns/px:  ~1e-3 .. 50     (typical is ~0.05 .. 5)
+          - nanometers/px: extremely small in microns; rarely used here
+    
+        We return µm/px or None if ambiguous.
+    
+        IMPORTANT DESIGN NOTE
+        ---------------------
+        All magnitude-based unit inference is delegated to the shared helper
+        normalize_pixel_size_to_um() so TIFF / LIF / CZI behave identically.
+        This wrapper exists only to preserve the CZI-specific calling contract.
+        """
+        if not np.isfinite(v) or v <= 0:
+            return None
+    
+        # Delegate magnitude-based unit inference to shared helper
+        px_um, _src = normalize_pixel_size_to_um(
+            float(v),
+            source="CZI scaling",
+        )
+    
+        return px_um
+
+
+    def _get_pixel_to_um(root: ET.Element) -> Optional[float]:
+        vals_um: List[float] = []
+
+        for dist in _iter(root, "Distance"):
+            axis = dist.get("Id") or dist.get("Dimension") or dist.get("Axis")
+            if axis not in ("X", "Y"):
+                continue
+
+            val_txt = None
+            unit_txt = None
+            for ch in dist:
+                lname = _local(ch.tag)
+                if lname in ("Value", "MeasuredValue") and ch.text:
+                    val_txt = ch.text.strip()
+                elif lname in ("DefaultUnit", "Unit") and ch.text:
+                    unit_txt = ch.text.strip()
+
+            v = _parse_float(val_txt)
+            if v is None:
+                continue
+
+            um = _unit_to_um(v, unit_txt)
+            if um is None:
+                # Unit missing/unknown: use magnitude-based acceptance (fail closed)
+                um = _magnitude_to_um(v)
+
+            if um is not None and np.isfinite(um) and um > 0:
+                vals_um.append(float(um))
+
+        if not vals_um:
+            return None
+
+        # If X and Y differ wildly, refuse (metadata likely inconsistent)
+        if len(vals_um) >= 2:
+            a, b = vals_um[0], vals_um[1]
+            if max(a, b) / max(min(a, b), 1e-12) > 1.5:
+                return None
+
+        return float(sum(vals_um) / len(vals_um))
+
+    pixel_to_um = _get_pixel_to_um(meta_root)
+
+    # ----------------------------
+    # Magnification (best-effort, as before)
+    # ----------------------------
+    mag = None
+    for path in (
+        ".//Information/Instrument/Objectives/Objective/NominalMagnification",
+        ".//Information/Instrument/Objectives/Objective/ManufacturerData/Magnification",
+        ".//Scaling/Objectives/Objective/NominalMagnification",
+    ):
+        txt = meta_root.findtext(path)
+        if not txt:
+            continue
+        m = re.search(r"([\d.,]+)", txt)
+        if not m:
+            continue
+        try:
+            v = float(m.group(1).replace(",", "."))
+        except Exception:
+            continue
+        if np.isfinite(v) and (0.25 <= v <= 400):
+            mag = float(v)
+            break
+
+    return mag, pixel_to_um
+    
+def czi_get_mosaic_positions(
+    czi: "CziFile",
+    *,
+    n_tiles: int,
+    scene_index: Optional[int] = None,
+    block_index: Optional[int] = None,
+) -> Tuple[
+    List[Tuple[int, int, int, float, float]],
+    np.ndarray,
+    np.ndarray,
+    str,
+]:
+    """
+    Extract raw mosaic tile positions from a Zeiss CZI file using aicspylibczi.
+
+    This function queries the mosaic tile bounding boxes directly from the CZI
+    container and converts them into STRICT 5-tuples suitable for downstream
+    TileScanInfo writing:
+
+        (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+
+    IMPORTANT DESIGN NOTES
+    ----------------------
+    - This function performs *no unit guessing* and *no scaling*.
+      Raw coordinates are returned exactly as reported by the CZI.
+    - The returned unit_hint_raw is intentionally conservative ("unknown").
+      Unit normalization happens later in decide_and_write_tilescan().
+    - TileIndex is taken directly from the mosaic index (M dimension).
+    - FieldX / FieldY are *placeholders* here (Zeiss does not expose a grid);
+      spatial layout is determined solely from (PosX_raw, PosY_raw).
+
+    SCENE / BLOCK HANDLING
+    ----------------------
+    - If `scene_index` is provided, bounding boxes are queried with S=scene_index.
+      This is REQUIRED for multi-scene CZIs; otherwise all scenes incorrectly
+      reuse scene 0 tile positions.
+    - If `block_index` is provided (usually B=0), it is also passed explicitly.
+    - If the installed aicspylibczi version does not accept S/B for this call,
+      the function transparently retries without them.
+
+    Parameters
+    ----------
+    czi : CziFile
+        Open CZI file handle.
+    n_tiles : int
+        Number of mosaic tiles (M dimension).
+    scene_index : int or None
+        Scene index (S dimension) corresponding to the region being processed.
+    block_index : int or None
+        Block index (B dimension), if present in the dataset.
+
+    Returns
+    -------
+    tiles_iter : List[Tuple[int, int, int, float, float]]
+        STRICT 5-tuples suitable for decide_and_write_tilescan().
+    x_raw : np.ndarray
+        Raw X positions (as reported by CZI).
+    y_raw : np.ndarray
+        Raw Y positions (as reported by CZI).
+    unit_hint_raw : str
+        Always "unknown" for CZI (unit inference happens later).
+    """
+
+    tiles_iter: List[Tuple[int, int, int, float, float]] = []
+    x_raw_list: List[float] = []
+    y_raw_list: List[float] = []
+
+    missing = 0
+    errors_preview: List[str] = []
+
+    # Iterate over mosaic tiles by M index
+    for m in range(int(n_tiles)):
+        try:
+            # ------------------------------------------------------------------
+            # Build arguments for get_mosaic_tile_bounding_box()
+            #
+            # Z=0, C=0 are generally safe for positional metadata.
+            # S/B are included *only if explicitly requested* to avoid
+            # breaking older aicspylibczi signatures.
+            # ------------------------------------------------------------------
+            kwargs = {
+                "M": int(m),
+                "Z": 0,
+                "C": 0,
+            }
+
+            if scene_index is not None:
+                kwargs["S"] = int(scene_index)
+
+            if block_index is not None:
+                kwargs["B"] = int(block_index)
+
+            # ------------------------------------------------------------------
+            # Query bounding box; retry without S/B if the signature rejects them
+            # ------------------------------------------------------------------
+            try:
+                bb = czi.get_mosaic_tile_bounding_box(**kwargs)
+            except TypeError:
+                # Older aicspylibczi versions may not accept S/B for this call
+                kwargs.pop("S", None)
+                kwargs.pop("B", None)
+                bb = czi.get_mosaic_tile_bounding_box(**kwargs)
+
+            # ------------------------------------------------------------------
+            # Extract raw stage coordinates (NO scaling here)
+            # ------------------------------------------------------------------
+            x = float(bb.x)
+            y = float(bb.y)
+
+            # ------------------------------------------------------------------
+            # STRICT 5-tuple:
+            # - TileIndex = m (matches on-disk `_s{tile}` convention for CZI)
+            # - FieldX / FieldY are placeholders (Zeiss does not expose a grid)
+            # - PosX_raw / PosY_raw are raw stage coordinates
+            # ------------------------------------------------------------------
+            tiles_iter.append((int(m), int(m), 0, x, y))
+            x_raw_list.append(x)
+            y_raw_list.append(y)
+
+        except Exception as e:
+            missing += 1
+            if len(errors_preview) < 5:
+                errors_preview.append(f"M={m}: {e!r}")
+            continue
+
+    if missing > 0:
+        msg = (
+            f"{BOLD}[WARN]⚠️ {RESET} CZI mosaic position extraction: "
+            f"{missing}/{int(n_tiles)} tile(s) missing bounding boxes."
+        )
+        if errors_preview:
+            msg += " Examples: " + "; ".join(errors_preview)
+        print(msg)
+
+    unit_hint_raw = "unknown"
+
+    return (
+        tiles_iter,
+        np.asarray(x_raw_list, dtype=float),
+        np.asarray(y_raw_list, dtype=float),
+        unit_hint_raw,
+    )
+
+
+def normalize_dims_shape(czi: "CziFile") -> Dict[str, int]:
+    """
+    Normalize CziFile.get_dims_shape() across aicspylibczi versions into {axis: size}.
+
+    Handler expectations
+    --------------------
+    CziHandler expects a dict like:
+      {"X": 2048, "Y": 2048, "Z": 7, "C": 5, "M": 4, "S": 2, ...}
+
+    Notes
+    -----
+    aicspylibczi has returned shapes in different forms:
+      - dict: {"X": 2048, "Y": (0, 2048), ...}
+      - list of dicts: [{"X": (0, 2048)}, {"Y": (0, 2048)}, ...]
+      - list of tuples: [("X", (0, 2048)), ("Y", 2048), ...]
+
+    We treat (start, end) as size=end (matches versions commonly seen in practice).
+    """
+    dims_shape = czi.get_dims_shape()
+
+    def _as_size(v) -> int:
+        # v may be int or (start, end)
+        if isinstance(v, tuple) and len(v) == 2:
+            return int(v[1])
+        return int(v)
+
+    if isinstance(dims_shape, dict):
+        out: Dict[str, int] = {}
+        for axis, rng in dims_shape.items():
+            out[str(axis)] = _as_size(rng)
+        return out
+
+    if isinstance(dims_shape, list):
+        out: Dict[str, int] = {}
+        for elem in dims_shape:
+            if isinstance(elem, dict):
+                for axis, rng in elem.items():
+                    out[str(axis)] = _as_size(rng)
+            elif isinstance(elem, tuple) and len(elem) >= 2:
+                axis, size_or_rng = elem[0], elem[1]
+                out[str(axis)] = _as_size(size_or_rng)
+            else:
+                raise ValueError(f"Unexpected dims_shape element: {elem!r}")
+        return out
+
+    raise TypeError(f"Unexpected dims_shape type: {type(dims_shape)!r}")
+
+# ======================================================================================
+# ND2 helpers (NO PRINTS; match Nd2Handler contract)
+# ======================================================================================
+
+def _nd2_try_float(x: Any) -> Optional[float]:
+    """Best-effort float conversion for ND2 metadata fields."""
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def nd2_get_pixel_to_um_calc(f: "nd2.ND2File") -> Optional[float]:
+    """
+    Best-effort ND2 pixel size (µm/px) extraction WITHOUT printing.
+    Returns None if not found.
+
+    Priority:
+      1) f.metadata.channels[0].volume.axesCalibration
+      2) voxel_size / pixel_size style attributes
+      3) xarray coords spacing (rare)
+    """
+    # (1) axesCalibration (most reliable for your pipeline)
+    try:
+        dx_um, dy_um, _dz_um = f.metadata.channels[0].volume.axesCalibration
+        dx_um = _nd2_try_float(dx_um)
+        dy_um = _nd2_try_float(dy_um)
+        if (
+            dx_um is not None and dy_um is not None
+            and np.isfinite(dx_um) and np.isfinite(dy_um)
+            and dx_um > 0 and dy_um > 0
+        ):
+            return float((dx_um + dy_um) / 2.0)
+    except Exception:
+        pass
+
+    # (2) direct voxel/pixel size fields (version-dependent)
+    for attr in ("voxel_size", "voxelsize", "pixel_size", "pixelsize"):
+        try:
+            v = getattr(f, attr, None)
+            if v is None:
+                continue
+
+            if isinstance(v, (tuple, list)) and len(v) >= 2:
+                dx_um = _nd2_try_float(v[0])
+                dy_um = _nd2_try_float(v[1])
+            else:
+                dx_um = _nd2_try_float(getattr(v, "x", None))
+                dy_um = _nd2_try_float(getattr(v, "y", None))
+
+            if (
+                dx_um is not None and dy_um is not None
+                and np.isfinite(dx_um) and np.isfinite(dy_um)
+                and dx_um > 0 and dy_um > 0
+            ):
+                return float((dx_um + dy_um) / 2.0)
+        except Exception:
+            pass
+
+    # (3) xarray coords spacing fallback (rare)
+    try:
+        darr = f.to_dask(copy=False)
+        if hasattr(darr, "coords") and "X" in darr.coords and len(darr.coords["X"]) > 1:
+            xs = np.asarray(darr.coords["X"].values, dtype=float)
+            xs = np.sort(xs)
+            step = float(np.median(np.diff(xs)))
+            if np.isfinite(step) and step > 0:
+                # coords might be meters; convert if it looks like meters
+                if step < 1e-3:
+                    step *= 1e6
+                return float(step)
+    except Exception:
+        pass
+
+    return None
+
+
+def nd2_get_objective_magnification(f: "nd2.ND2File") -> Optional[float]:
+    """
+    Best-effort objective magnification extraction WITHOUT printing.
+    Returns None if not found.
+    """
+
+    def _plausible_mag(v: Any) -> Optional[float]:
+        val = _nd2_try_float(v)
+        if val is None or not np.isfinite(val):
+            return None
+        return float(val) if 0.25 <= val <= 400 else None
+
+    mag: Optional[float] = None
+
+    # (A) structured metadata object graph (preferred)
+    try:
+        md = getattr(f, "metadata", None)
+        objs: List[Any] = []
+        if md is not None:
+            objs.append(md)
+            try:
+                objs.append(md.channels[0])
+            except Exception:
+                pass
+
+        containers: List[Any] = []
+        for obj in objs:
+            if obj is None:
+                continue
+            for attr in ("objective", "objectives", "microscope", "instrument", "optics", "volume"):
+                containers.append(getattr(obj, attr, None))
+
+        flat: List[Any] = []
+        for c in containers:
+            if c is None:
+                continue
+            if isinstance(c, (list, tuple)):
+                flat.extend([x for x in c if x is not None])
+            else:
+                flat.append(c)
+
+        for obj in flat:
+            for key in (
+                "magnification", "Magnification",
+                "nominalMagnification", "NominalMagnification",
+                "objectiveMagnification", "ObjectiveMagnification",
+            ):
+                m_val = _plausible_mag(getattr(obj, key, None))
+                if m_val is not None:
+                    mag = m_val
+                    break
+            if mag is not None:
+                break
+    except Exception:
+        mag = None
+
+    # (B) raw metadata text fallback (last resort)
+    if mag is None:
+        try:
+            raw = ""
+            for attr in ("raw_metadata", "metadata_raw", "xml", "meta", "_meta", "_metadata", "_raw_metadata"):
+                v = getattr(f, attr, None)
+                if v is None:
+                    continue
+                raw = v.decode("utf-8", errors="ignore") if isinstance(v, (bytes, bytearray)) else str(v)
+                if raw:
+                    break
+
+            if raw:
+                m = re.search(r"(NominalMagnification|Magnification)\D{0,10}([\d.,]+)", raw, re.IGNORECASE)
+                if m:
+                    mag = _plausible_mag(m.group(2).replace(",", "."))
+        except Exception:
+            mag = None
+
+    return mag
+
+
+def nd2_get_stage_positions_um(f: "nd2.ND2File") -> Optional[List[Tuple[float, float]]]:
+    """
+    Extract stage coordinates from ND2 experiment metadata as (x_um, y_um), WITHOUT printing.
+
+    Matches Nd2Handler.infer_tiles_channels() logic:
+      - f.experiment XYPosLoop
+      - p.stagePositionUm.x / .y
+    """
+    try:
+        xy_loop = next((e for e in f.experiment if getattr(e, "type", None) == "XYPosLoop"), None)
+        if xy_loop is None:
+            return None
+        pts = xy_loop.parameters.points
+        coords = [(float(p.stagePositionUm.x), float(p.stagePositionUm.y)) for p in pts]
+        return coords if coords else None
+    except Exception:
+        return None
+
+
+def nd2_get_mag_and_pixel_to_um(f: "nd2.ND2File") -> Tuple[Optional[float], Optional[float]]:
+    """
+    Convenience wrapper (NO PRINTS):
+      returns (objective_magnification, pixel_to_um_calc)
+    """
+    return nd2_get_objective_magnification(f), nd2_get_pixel_to_um_calc(f)
+
+
+# ======================================================================================
+# Format handlers: each handler knows how to
+#   1) discover regions
+#   2) prepare per-region reading context
+#   3) read a single tile/channel stack into (Z,Y,X)
+#   4) provide metadata inputs to write_region_metadata()
+# ======================================================================================
+
+# -----------------------------
+# Base handler 
+# -----------------------------
+from abc import ABC, abstractmethod
+
+class BaseHandler(ABC):
+    """
+    Abstract base class for format handlers.
+
+    Handlers define how to:
+      1) discover_regions(input_dir) -> List[str]
+      2) open_region(input_dir, region_index, region_name) -> ctx dict
+      3) infer_tiles_channels(ctx) -> tiles/channels/Z/image_dimensions (+ anything else)
+      4) read_stack(ctx, tile, channel) -> (Z, Y, X) uint16
+      5) close_region(ctx) -> release resources
+
+    Optional metadata support
+    -------------------------
+    Handlers may implement build_metadata_args(ctx, ...) to return a kwargs dict for
+    decide_and_write_tilescan(). The handler MUST NOT write XML directly.
+    """
+
+
+    #: Human-readable mode / format name, e.g. "lif", "czi", "nd2"
+    mode: str
+
+    @abstractmethod
+    def discover_regions(self, input_dir: Path) -> List[str]:
+        """
+        Inspect the input directory and return a list of region identifiers
+        (e.g. ["R1", "R2"] or arbitrary strings), in processing order.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def open_region(self, *, input_dir: Path, region_index: int, region_name: str) -> Dict[str, Any]:
+        """
+        Open resources for a given region and return a context dict.
+
+        The context is handler-specific, but must contain everything needed for:
+          - infer_tiles_channels(ctx)
+          - read_stack(ctx, tile, channel)
+          - close_region(ctx)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def infer_tiles_channels(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inspect the region-level context and return at least:
+            {
+              "tiles": List[int],              # tile identifiers
+              "channels": List[int],           # channel identifiers
+              "size_z": int,                   # number of z-planes
+              "image_dimensions": Tuple[int, int],  # (X, Y) in pixels
+              ...
+            }
+
+        Handlers may include additional keys as needed.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
+        """
+        Read and return the (Z, Y, X) uint16 stack for a single (tile, channel).
+        The caller assumes:
+          - shape is (size_z, Y, X) as reported by infer_tiles_channels
+          - dtype is np.uint16
+        """
+        raise NotImplementedError
+
+    def close_region(self, ctx: Dict[str, Any]) -> None:
+        """
+        Close any file handles / resources associated with this region.
+        Default implementation does nothing; override if your handler opens files.
+        """
+        return None
+
+
+    def build_metadata_args(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        pixel_to_um_manual: Optional[float],
+        deconvolution_method: Optional[str],
+        num_iterations: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return kwargs for decide_and_write_tilescan(), or None to skip this region.
+        Must NOT call decide_and_write_tilescan itself.
+        Default: no metadata support.
+        """
+        return None
+
+
+# -----------------------------
+# TIFF handler 
+# -----------------------------
+class TiffHandler(BaseHandler):
+    """
+    Supports BOTH tif_autosaved + tif_exported, but keeps mode as provided
+    via handler instance (see get_handler()).
+    """
+    def __init__(self, *, mode: str):
+        """
+        Initialize a TIFF handler for Leica TIFF datasets.
+    
+        Leica produces two distinct TIFF filename conventions depending on how
+        data were generated:
+          - "tif_autosaved": direct LAS X autosave during acquisition
+          - "tif_exported": manual export from LAS X
+    
+        The only difference between these modes is how tile and channel numbers
+        are encoded in the filenames. We select regex patterns once here and
+        reuse them everywhere to ensure consistent parsing.
+        """
+        assert mode in ("tif_autosaved", "tif_exported")
+        self.mode = mode
+    
+        # ------------------------------------------------------------------
+        # Filename parsing patterns
+        #
+        # These regexes are used to EXTRACT NUMBERS from filenames.
+        # They must be used consistently everywhere to avoid subtle bugs.
+        #
+        # Example autosaved:
+        #   R1--Stage0003--Z0005--C02.tif
+        #
+        # Example exported:
+        #   R1_s0003_ch02.tif
+        # ------------------------------------------------------------------
+    
+        if mode == "tif_autosaved":
+            # Match channel number from "--C02", "--C2", etc.
+            self.channel_pattern = re.compile(r"--C0*(\d+)(?=\D|$)", re.IGNORECASE)
+    
+            # Match tile number from "--Stage0003--"
+            self.tile_pattern = re.compile(r"--Stage(\d+)--")
+    
+            # Identify files belonging to "tile 0".
+            # These are used only as a REFERENCE to estimate Z count.
+            self.sample_indicator = re.compile(r"--Stage0+--")
+    
+        else:  # tif_exported
+            # Match channel number from "_ch02", "_cH2", etc.
+            self.channel_pattern = re.compile(r"_ch0*(\d+)(?=\D|$)", re.IGNORECASE)
+    
+            # Match tile number from "_s0003_"
+            self.tile_pattern = re.compile(r"_s(\d+)_")
+    
+            # Identify files belonging to "tile 0" for Z estimation.
+            self.sample_indicator = re.compile(r"_s0+_")
+
+    # ---- internal helper ----
+    def _iter_tiffs(self, input_dir: Path) -> Iterable[Path]:
+        """
+        Yield all TIFF image files belonging to the dataset.
+    
+        This reproduces the original filtering logic used in the old pipeline:
+          - Only '.tif' files
+          - Exclude 'dw' in name
+          - Exclude LAS X text sidecar files ('.txt')
+    
+        IMPORTANT:
+        This function does NOT filter by region, tile, or channel.
+        It only answers: "Which files are valid TIFF image planes?"
+        """
+        for f in input_dir.iterdir():
+            if not f.is_file():
+                continue
+            if f.suffix.lower() != ".tif":
+                continue
+            if "dw" in f.name:
+                continue
+            yield f
+
+
+    def discover_regions(self, input_dir: Path) -> List[str]:
+        """
+        Discover region identifiers from TIFF filenames.
+    
+        Leica encodes the region name as the FIRST token in the filename.
+        Everything before the first separator belongs to the region.
+    
+        Examples:
+          Autosaved:  "R1--Stage0003--C02.tif"  -> region "R1"
+          Exported:   "R1_s0003_ch02.tif"       -> region "R1"
+    
+        We extract this token and return all unique region names,
+        sorted for deterministic processing order.
+        """
+        tif_files = [f.name for f in self._iter_tiffs(input_dir)]
+        region_names = set()
+    
+        for fn in tif_files:
+            base = fn.rsplit(".", 1)[0]
+            chunks = base.split("--" if self.mode == "tif_autosaved" else "_")
+            region_names.add(chunks[0])
+    
+        return sorted(region_names)
+
+    
+    def open_region(self, *, input_dir: Path, region_index: int, region_name: str) -> Dict[str, Any]:
+        """
+        Open TIFF region context and (optionally) pre-extract Leica metadata.
+    
+        Behavior
+        --------
+        - Always returns a ctx dict.
+        - If Leica metadata folder/XML is missing or cannot be parsed, returns ctx with
+          metadata fields left as None/empty (pipeline can still run).
+    
+        If Leica XML is available, extracts:
+          - TileScanInfo tile positions (4-tuples or 5-tuples depending on TileIndex presence)
+          - metadata-derived pixel size (µm/px) and unit hint
+          - objective magnification (best-effort)
+    
+        Notes on TileIndex
+        ------------------
+        - No reconciliation to on-disk tile ids happens here (ctx['tiles'] not known yet).
+        - Mapping/subsetting is performed later in build_metadata_args() after infer_tiles_channels().
+        """
+
+        ctx: Dict[str, Any] = dict(
+            input_dir=Path(input_dir),
+            region_index=int(region_index),
+            region=str(region_name),
+            mode=self.mode,
+        )
+    
+        # Core "uniform" metadata fields (same semantics as other handlers)
+        ctx["objective_mag"] = None
+        ctx["objective_mag_source"] = None
+        ctx["pixel_to_um_calc"] = None
+        ctx["unit_hint_raw"] = ""
+    
+        # Optional Leica metadata (TIFF-specific but harmlessly present)
+        ctx["tiff_metadata_dir"] = None
+        ctx["tiff_metadata_file"] = None
+        ctx["tiff_xml_root"] = None
+    
+        # Mosaic fields (kept consistent with other handlers)
+        # tiles_iter may be 5-tuples (TileIndex, FieldX, FieldY, PosX, PosY)
+        # or 4-tuples (FieldX, FieldY, PosX, PosY) if TileIndex is absent in XML.
+        ctx["mosaic_tiles_iter"] = None
+        ctx["mosaic_x_raw"] = None
+        ctx["mosaic_y_raw"] = None
+    
+        try:
+            # 1) Locate Leica metadata folder (case-insensitive "metadata" under input_dir)
+            input_metadata_dir = tiff_find_metadata_dir_case_insensitive(ctx["input_dir"], "metadata")
+            if input_metadata_dir is None:
+                return ctx  # no Leica metadata
+    
+            # 2) Choose Leica XML/XLF file that matches this region (ignores Properties dumps)
+            region_token = (region_name or "").strip()
+            md_file = tiff_pick_leica_xml(input_metadata_dir, region_token=region_token)
+            if md_file is None:
+                return ctx
+    
+            root = tiff_parse_xml_safe(md_file)
+            if root is None:
+                return ctx
+    
+            ctx["tiff_metadata_dir"] = input_metadata_dir
+            ctx["tiff_metadata_file"] = md_file
+            ctx["tiff_xml_root"] = root
+    
+            # 3) Extract tile stage positions from Leica TileScanInfo
+            #
+            # Contract of tiff_collect_tiles_from_tilescaninfo():
+            #   - If XML has TileIndex: returns 5-tuples:
+            #       (TileIndex, FieldX, FieldY, PosX, PosY)
+            #   - Else: returns 4-tuples:
+            #       (FieldX, FieldY, PosX, PosY)
+            #
+            # NOTE:
+            # - tiff_collect_tiles_from_tilescaninfo() already:
+            #     * sorts deterministically (FieldY, FieldX)
+            #     * normalizes types (ints/floats)
+            # - We do NOT assign TileIndex here; that's done later in build_metadata_args().
+            tiles_iter = list(tiff_collect_tiles_from_tilescaninfo(root) or [])
+            if not tiles_iter:
+                raise ValueError("TileScanInfo contained no tiles (tiles_iter empty).")
+    
+            n = len(tiles_iter[0])
+            if n == 5:
+                # (TileIndex, FieldX, FieldY, PosX, PosY)
+                x_raw = np.asarray([t[3] for t in tiles_iter], dtype=float)
+                y_raw = np.asarray([t[4] for t in tiles_iter], dtype=float)
+            elif n == 4:
+                # (FieldX, FieldY, PosX, PosY)
+                x_raw = np.asarray([t[2] for t in tiles_iter], dtype=float)
+                y_raw = np.asarray([t[3] for t in tiles_iter], dtype=float)
+            else:
+                raise ValueError(f"Unexpected tiles_iter tuple length: {n} (expected 4 or 5).")
+    
+            ctx["mosaic_tiles_iter"] = tiles_iter
+            ctx["mosaic_x_raw"] = x_raw
+            ctx["mosaic_y_raw"] = y_raw
+    
+            # 4) Pixel size + magnification (metadata-derived)
+            meta = tiff_extract_pixel_size_and_magnification(
+                root,
+                pixel_to_um_manual=None,  # manual override comes from pipeline arg, not here
+                rtol_warn=0.02,
+            )
+    
+            ctx["pixel_to_um_calc"] = meta.get("pixel_to_um_calc", None)
+            ctx["unit_hint_raw"] = (meta.get("unit_hint_raw", "") or "")
+            mag = meta.get("magnification", None)
+            ctx["objective_mag"] = mag
+            ctx["objective_mag_source"] = "Leica XML" if mag is not None else None
+    
+        except Exception as e:
+            print(f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: failed to pre-extract Leica metadata for region '{region_name}': {e}")
+    
+        return ctx
+    
+    def _matches_channel(self, filename: str, ch: int) -> bool:
+        """
+        Return True if the filename belongs to the given channel number.
+    
+        This MUST use self.channel_pattern instead of string matching
+        because Leica uses inconsistent zero-padding and capitalization:
+          - C2, C02, ch2, ch02, cH2, ...
+    
+        By always parsing the number and comparing integers, we ensure
+        that channel detection and file assignment remain consistent.
+        """
+        m = self.channel_pattern.search(filename)
+        return (m is not None) and (int(m.group(1)) == int(ch))
+
+
+    def infer_tiles_channels(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Infer dataset structure for a single region.
+    
+        This method answers four concrete questions for the pipeline:
+          1) Which tile indices exist in this region?
+          2) Which channel indices exist?
+          3) How many Z planes belong to each (tile, channel) stack?
+          4) What are the image dimensions in pixels (X, Y)?
+    
+        IMPORTANT:
+        - This uses ONLY filename patterns and TIFF headers.
+        - No Leica XML, no metadata inference, no assumptions.
+        - Behavior is intentionally equivalent to the old preprocessing code.
+        """
+    
+        input_dir: Path = ctx["input_dir"]
+        region: str = ctx["region"]
+    
+        # ------------------------------------------------------------
+        # 1) Collect all TIFF files belonging to this region
+        #
+        # We rely on the region token being part of the filename,
+        # exactly as in the legacy pipeline.
+        # ------------------------------------------------------------
+        tif_files = list(self._iter_tiffs(input_dir))
+        prefix = f"{region}--" if self.mode == "tif_autosaved" else f"{region}_"
+        filtered_tifs = [f for f in tif_files if f.name.startswith(prefix)]
+
+        if not filtered_tifs:
+            raise RuntimeError(f"No TIFFs found for region token '{region}'")
+    
+        # ------------------------------------------------------------
+        # 2) Detect available channels from filenames
+        #
+        # Example matches:
+        #   tif_autosaved  → "--C01", "--C002"
+        #   tif_exported   → "_ch1", "_CH002"
+        #
+        # Zero-padding is ignored by int().
+        # ------------------------------------------------------------
+        channel_set = set()
+        for f in filtered_tifs:
+            m = self.channel_pattern.search(f.name)
+            if m:
+                channel_set.add(int(m.group(1)))
+    
+        channels = sorted(channel_set)
+        if not channels:
+            raise RuntimeError(f"No channels detected for region '{region}'")
+    
+        # ------------------------------------------------------------
+        # 3) Detect tile indices and identify "sample" tiles
+        #
+        # Tiles are inferred from filename patterns:
+        #   tif_autosaved  → "--Stage###--"
+        #   tif_exported   → "_s###_"
+        #
+        # Sample tiles are those belonging to the lowest tile index,
+        # used to estimate Z depth and image shape.
+        # ------------------------------------------------------------
+        tiles = set()
+        sample_tiles: List[Path] = []
+    
+        for f in filtered_tifs:
+            m = self.tile_pattern.search(f.name)
+            if m:
+                tiles.add(int(m.group(1)))
+    
+            # Sample tiles are typically Stage000 / s000
+            if self.sample_indicator.search(f.name):
+                sample_tiles.append(f)
+    
+        # If no explicit sample tiles were found, fall back to
+        # the lowest tile index present.
+        if not sample_tiles and tiles:
+            lowest = min(tiles)
+            if self.mode == "tif_exported":
+                fallback = re.compile(rf"_s0*{lowest}_")
+            else:
+                fallback = re.compile(rf"--Stage0*{lowest}--")
+    
+            sample_tiles = [f for f in filtered_tifs if fallback.search(f.name)]
+    
+        tiles = sorted(tiles)
+        if not tiles:
+            raise RuntimeError(f"No tiles detected for region '{region}'")
+    
+        # ------------------------------------------------------------
+        # 4) Infer Z depth
+        #
+        # Old logic (kept intentionally):
+        #   number of planes for sample tile / number of channels
+        #
+        # This assumes:
+        #   - one TIFF per (Z, C) plane
+        #   - consistent ordering across tiles
+        # ------------------------------------------------------------
+        if sample_tiles:
+            if len(sample_tiles) % len(channels) != 0:
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: sample_tiles ({len(sample_tiles)}) not divisible by "
+                    f"channels ({len(channels)}); inferred size_z may be wrong."
+                )
+            size_z = max(1, len(sample_tiles) // len(channels))
+        else:
+            size_z = 1
+
+    
+        # ------------------------------------------------------------
+        # 5) Infer image dimensions from a single TIFF header
+        #
+        # We only read the TIFF header (no pixel data),
+        # and expect a single 2D plane (Y, X).
+        # ------------------------------------------------------------
+        sample_path = sample_tiles[0] if sample_tiles else filtered_tifs[0]
+    
+        with tifffile.TiffFile(str(sample_path)) as tf:
+            shp = tf.pages[0].shape  # (Y, X)
+    
+        if len(shp) != 2:
+            raise RuntimeError(
+                f"Expected 2D plane for '{sample_path.name}', got shape={shp}"
+            )
+    
+        image_dimensions = (int(shp[1]), int(shp[0]))  # (X, Y)
+    
+        # ------------------------------------------------------------
+        # 6) Build a lookup table:
+        #
+        #   (tile_index, channel_index) → list of TIFF planes (Z order)
+        #
+        # This allows read_stack() to be simple and fast.
+        # ------------------------------------------------------------
+        tile_to_files: Dict[int, List[Path]] = {t: [] for t in tiles}
+    
+        for f in filtered_tifs:
+            m = self.tile_pattern.search(f.name)
+            if not m:
+                continue
+            t = int(m.group(1))
+            if t in tile_to_files:
+                tile_to_files[t].append(f)
+    
+        tile_channel_files: Dict[Tuple[int, int], List[Path]] = {}
+        for t, files_in_tile in tile_to_files.items():
+            for ch in channels:
+                tile_channel_files[(t, ch)] = [
+                    f for f in files_in_tile
+                    if self._matches_channel(f.name, ch)
+                ]
+    
+        # ------------------------------------------------------------
+        # 7) Store everything needed by read_stack() in ctx
+        #
+        # The returned dict is intentionally minimal and
+        # contains only what the pipeline needs.
+        # ------------------------------------------------------------
+        ctx.update(dict(
+            filtered_tifs=filtered_tifs,
+            tiles=tiles,
+            channels=channels,
+            size_z=size_z,
+            image_dimensions=image_dimensions,
+            tile_channel_files=tile_channel_files,
+        ))
+    
+        return {
+            "tiles": tiles,
+            "channels": channels,
+            "size_z": size_z,
+            "image_dimensions": image_dimensions,
+        }
+
+
+    def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
+        """
+        Read a (Z, Y, X) stack for one tile and one channel.
+    
+        This is intentionally the *simple, old-style* TIFF reader:
+          - Each Z plane is stored as a separate TIFF file
+          - Files are read sequentially with tifffile.imread
+          - No multiprocessing, no retries, no shape repair
+          - Behavior matches the legacy pipeline exactly
+    
+        Assumptions:
+          - ctx["tile_channel_files"] was built by infer_tiles_channels()
+          - Each file contains a single 2D plane (Y, X)
+          - All planes for a given (tile, channel) have identical shape
+        """
+        tile = int(tile)
+        channel = int(channel)
+    
+        # Look up all TIFF files belonging to this (tile, channel) pair.
+        # This should already represent one full Z stack.
+        tile_channel_files = ctx["tile_channel_files"]
+        files = tile_channel_files.get((tile, channel), [])
+    
+        if not files:
+            raise FileNotFoundError(
+                f"No TIFF planes found for tile={tile}, channel={channel}"
+            )
+    
+        # Sort filenames to ensure deterministic Z ordering.
+        # This preserves historical behavior and avoids OS-dependent ordering.
+        files = sorted(files, key=lambda p: str(p))
+    
+        # Read each plane and stack into a 3D array: (Z, Y, X)
+        stack = np.stack(
+            [tifffile.imread(str(f)) for f in files],
+            axis=0
+        )
+    
+        # Defensive check: each stack must be exactly 3D
+        if stack.ndim != 3:
+            raise ValueError(
+                f"Expected (Z,Y,X) stack, got shape={stack.shape} "
+                f"for tile={tile}, channel={channel}"
+            )
+    
+        # Ensure uint16 without copying if already correct
+        return stack.astype(np.uint16, copy=False)
+
+    def build_metadata_args(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        pixel_to_um_manual: Optional[float],
+        deconvolution_method: Optional[str],
+        num_iterations: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Prepare keyword arguments for decide_and_write_tilescan().
+    
+        Responsibilities
+        ----------------
+        - Validate Leica metadata presence
+        - Normalize tile records to STRICT 5-tuples:
+            (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        - Align TileIndex with on-disk tile ids (ctx["tiles"]) so downstream mapping is stable
+        - Return a kwargs dict for decide_and_write_tilescan() (caller supplies out_xml_path)
+    
+        Subset policy
+        -------------
+        - If XML provides TileIndex (5-tuples): keep only those tiles whose TileIndex exists on disk.
+        - If XML lacks TileIndex (4-tuples):
+            * Sort XML tiles by (FieldY, FieldX) to create a deterministic list.
+            * ASSUME on-disk filename tile ids are 0-based indices into that list:
+                on_disk_tile_id t -> xml_tiles[t]
+            * This supports subsets but can misregister mosaics if filename ids do not correspond
+              to Leica’s grid ordering.
+    
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            Kwargs for decide_and_write_tilescan(), or None to skip metadata writing.
+        """
+
+    
+        # ------------------------------------------------------------
+        # Basic sanity check: image geometry must already be known
+        # ------------------------------------------------------------
+        image_dimensions: Optional[Tuple[int, int]] = ctx.get("image_dimensions", None)
+        if image_dimensions is None:
+            print(
+                "[ERROR] TIFF handler: image_dimensions missing in ctx "
+                "(infer_tiles_channels() must be called first)."
+            )
+            return None
+    
+        # ------------------------------------------------------------
+        # Leica metadata requirements
+        # ------------------------------------------------------------
+        md_file = ctx.get("tiff_metadata_file", None)
+        tiles_iter = ctx.get("mosaic_tiles_iter", None)
+    
+        if md_file is None:
+            print(
+                f"[ERROR] TIFF handler: no Leica XML/XLF metadata for region "
+                f"'{ctx.get('region')}'. Skipping metadata."
+            )
+            return None
+    
+        if tiles_iter is None:
+            print(
+                "[ERROR] TIFF handler: missing tile positions "
+                "(TileScanInfo not found or incomplete). Skipping metadata."
+            )
+            return None
+    
+        # ------------------------------------------------------------
+        # Normalize tiles_iter to 5-tuples:
+        #   (TileIndex, FieldX, FieldY, PosX, PosY)
+        # ------------------------------------------------------------
+        tiles_iter = list(tiles_iter or [])
+        if not tiles_iter:
+            print("[ERROR] TIFF handler: tiles_iter empty. Skipping metadata.")
+            return None
+    
+        t0 = tiles_iter[0]
+        if (not isinstance(t0, tuple)) or (len(t0) not in (4, 5)):
+            print(
+                f"[ERROR] TIFF handler: unexpected tiles_iter entry: {type(t0)} / {t0}. "
+                "Expected tuples of length 4 or 5. Skipping metadata."
+            )
+            return None
+    
+        # On-disk tiles MUST be known here (infer_tiles_channels ran)
+        file_tiles = ctx.get("tiles", None)
+        if not file_tiles:
+            print(
+                "[ERROR] TIFF handler: ctx['tiles'] missing or empty; "
+                "infer_tiles_channels() must run first. Skipping metadata."
+            )
+            return None
+        file_tiles_sorted = sorted(int(t) for t in file_tiles)
+    
+        # Defensive init (avoids UnboundLocalError if code changes later)
+        x_raw = None
+        y_raw = None
+    
+        # ----------------------------
+        # Case A: 5-tuples already have TileIndex
+        # ----------------------------
+        if len(t0) == 5:
+            # Normalize types
+            tiles_5 = [(int(a), int(b), int(c), float(d), float(e)) for (a, b, c, d, e) in tiles_iter]
+    
+            # Allow subset: keep only tiles whose TileIndex exists on disk
+            file_set = set(file_tiles_sorted)
+            kept = [t for t in tiles_5 if t[0] in file_set]
+            dropped = [t[0] for t in tiles_5 if t[0] not in file_set]
+    
+            if not kept:
+                print(
+                    "[ERROR] TIFF handler: TileScanInfo TileIndex values do not overlap with on-disk tiles. "
+                    "Skipping metadata to avoid wrong tile mapping."
+                )
+                return None
+    
+            if dropped:
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: XML contains {len(dropped)} tile(s) not present on disk; "
+                    f"dropping them. Example dropped TileIndex: {dropped[:10]}{'...' if len(dropped) > 10 else ''}"
+                )
+    
+            tiles_iter = kept
+    
+            # Keep the same tile ordering as on-disk filenames for determinism downstream.
+            rank = {t: i for i, t in enumerate(file_tiles_sorted)}
+            tiles_iter = sorted(tiles_iter, key=lambda t: rank.get(int(t[0]), 10**12))
+    
+            # Rebuild x_raw/y_raw in EXACTLY this kept order
+            x_raw = np.asarray([t[3] for t in tiles_iter], dtype=float)
+            y_raw = np.asarray([t[4] for t in tiles_iter], dtype=float)
+    
+        # ----------------------------
+        # Case B: 4-tuples (FieldX, FieldY, PosX, PosY)
+        # ----------------------------
+        else:
+            # Normalize + sort XML tiles into deterministic grid order
+            #   xml_tiles[i] is the i-th tile in Leica grid order
+            xml_tiles = [(int(fx), int(fy), float(px), float(py)) for (fx, fy, px, py) in tiles_iter]
+            xml_tiles = sorted(xml_tiles, key=lambda t: (t[1], t[0]))  # (FieldY, FieldX)
+            n_xml = len(xml_tiles)
+    
+            if not file_tiles_sorted:
+                print("[ERROR] TIFF handler: no on-disk tiles found for mapping. Skipping metadata.")
+                return None
+    
+            if n_xml <= 0:
+                print("[ERROR] TIFF handler: XML contains zero tiles (n_xml=0). Skipping metadata.")
+                return None
+    
+            # Validate mapping range (tile id must be a valid index into xml_tiles)
+            bad = [t for t in file_tiles_sorted if not (0 <= t < n_xml)]
+            if bad:
+                print(
+                    "[ERROR] TIFF handler: filename tile ids exceed XML tile count "
+                    f"(bad={bad[:10]}{'...' if len(bad) > 10 else ''}, "
+                    f"max_file_tile={max(file_tiles_sorted)}, n_xml={n_xml}). "
+                    "Cannot safely map tiles. Skipping metadata."
+                )
+                return None
+    
+            # INFO: explain mapping decision
+            preview = file_tiles_sorted[:10]
+            print(
+                "[INFO] TIFF handler: mapping XML tiles by filename tile ids (assumed 0-based indexing): "
+                f"file_tiles={preview}{'...' if len(file_tiles_sorted) > 10 else ''}, n_xml={n_xml}"
+            )
+            print(f"[INFO] TIFF handler: max on-disk tile id = {max(file_tiles_sorted)}")
+            print(f"[INFO] TIFF handler: mapping {len(file_tiles_sorted)} on-disk tile(s) onto {n_xml} XML tile(s).")
+    
+            # Build final tiles_iter using filename tile id as TileIndex
+            mapped_tiles_iter: List[Tuple[int, int, int, float, float]] = []
+            for tid in file_tiles_sorted:
+                fx, fy, px, py = xml_tiles[tid]
+                mapped_tiles_iter.append((tid, fx, fy, px, py))
+            tiles_iter = mapped_tiles_iter
+    
+            # INFO: show a few concrete mappings
+            k = min(10, len(tiles_iter))
+            pairs = [
+                f"{t[0]}->(fx={t[1]},fy={t[2]},x={t[3]:.6f},y={t[4]:.6f})"
+                for t in tiles_iter[:k]
+            ]
+            print(
+                "[INFO] TIFF handler: tile mapping (filename->xml): "
+                + "; ".join(pairs)
+                + (f"; ... (+{len(tiles_iter)-k} more)" if len(tiles_iter) > k else "")
+            )
+    
+            # Rebuild x_raw / y_raw aligned with final tile order
+            x_raw = np.asarray([t[3] for t in tiles_iter], dtype=float)
+            y_raw = np.asarray([t[4] for t in tiles_iter], dtype=float)
+    
+        # Defensive: ensure we set x_raw/y_raw
+        if x_raw is None or y_raw is None:
+            print("[ERROR] TIFF handler: internal error: x_raw/y_raw not set. Skipping metadata.")
+            return None
+    
+        # More informative mismatch reporting (actionable)
+        if len(tiles_iter) != len(file_tiles_sorted):
+            file_set = set(file_tiles_sorted)
+            mapped_set = set(int(t[0]) for t in tiles_iter)  # TileIndex after normalization
+    
+            missing_in_xml = sorted(file_set - mapped_set)
+            extra_in_xml = sorted(mapped_set - file_set)
+    
+            if missing_in_xml:
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: {len(missing_in_xml)} on-disk tile(s) have no matching XML TileIndex; "
+                    f"missing={missing_in_xml[:10]}{'...' if len(missing_in_xml) > 10 else ''}"
+                )
+            if extra_in_xml:
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} TIFF handler: {len(extra_in_xml)} XML tile(s) are not present on disk after mapping; "
+                    f"extra={extra_in_xml[:10]}{'...' if len(extra_in_xml) > 10 else ''}"
+                )
+    
+        # Store normalized result back into ctx so downstream sees canonical form
+        ctx["mosaic_tiles_iter"] = tiles_iter
+        ctx["mosaic_x_raw"] = x_raw
+        ctx["mosaic_y_raw"] = y_raw
+    
+        # Final sanity check: numeric arrays must be non-empty
+        if x_raw.size == 0 or y_raw.size == 0:
+            print(
+                "[ERROR] TIFF handler: tile position arrays are empty after normalization. "
+                "Skipping metadata."
+            )
+            return None
+    
+        # Optional metadata (used if present)
+        pixel_to_um_calc = ctx.get("pixel_to_um_calc", None)
+        unit_hint_raw = ctx.get("unit_hint_raw", "")
+    
+        mag = ctx.get("objective_mag", None)
+        mag_src = ctx.get(
+            "objective_mag_source",
+            "Leica XML" if mag is not None else None,
+        )
+    
+        print(
+            f"[INFO] Generating TIFF TileScanInfo XML metadata "
+            f"from Leica XML '{md_file.name}'"
+        )
+    
+        return dict(
+            x_raw=x_raw,
+            y_raw=y_raw,
+            image_dimensions=image_dimensions,
+            pixel_to_um_manual=pixel_to_um_manual,
+            pixel_to_um_calc=pixel_to_um_calc,
+            unit_hint_raw=unit_hint_raw,
+            off_tol=0.25,
+            tiles_iter=tiles_iter,
+            app_name="LAS X",
             deconvolution_method=deconvolution_method,
-            deconvolution_iterations=deconvolution_iterations
+            deconvolution_iterations=num_iterations,
+            objective_mag=mag,
+            objective_mag_source=mag_src,
+        )
+    
+
+# -----------------------------
+# LIF handler (region-aware)
+# -----------------------------
+class LifHandler(BaseHandler):
+    
+    mode = "lif"
+
+    # ------------------------------------------------------------------
+    # Lazy import
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _LifFile():
+        """
+        Lazy import to avoid crashing the Jupyter kernel during module import.
+        Only imports readlif when LIF mode is actually used.
+        """
+        try:
+            from readlif.reader import LifFile
+        except Exception as e:
+            raise ImportError(
+                "LIF mode requires 'readlif'. Install it to use mode='lif'."
+            ) from e
+        return LifFile
+
+
+    # -----------------------------
+    # Region discovery
+    # -----------------------------
+    def discover_regions(self, input_dir: Path) -> List[str]:
+        LifFile = self._LifFile()
+
+        lif_files = sorted([f for f in input_dir.iterdir() if f.suffix.lower() == ".lif"])
+        if not lif_files:
+            return []
+
+        names: List[str] = []
+
+        # case 1: multiple LIF files -> treat as one region per file (first image)
+        if len(lif_files) > 1:
+            for fp in lif_files:
+                lf = LifFile(fp)
+                try:
+                    if not getattr(lf, "image_list", None):
+                        nm = fp.stem
+                    else:
+                        first = lf.image_list[0]
+                        nm = str(first.get("name") or fp.stem)
+        
+                    nm = nm.replace("/", "_")
+                    # ensures uniqueness across files
+                    nm = f"{fp.stem}__{nm}"
+        
+                    names.append(nm)
+        
+                finally:
+                    try:
+                        lf.close()
+                    except Exception:
+                        pass
+
+
+        # case 2: single LIF file -> multiple images = multiple regions
+        else:
+            fp = lif_files[0]
+            lf = LifFile(fp)
+            try:
+                img_list = getattr(lf, "image_list", None) or []
+                for d in img_list:
+                    nm = str(d.get("name") or fp.stem)
+                    names.append(nm.replace("/", "_"))
+            finally:
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+
+        # stable unique (preserve order)
+        seen = set()
+        out: List[str] = []
+        for n in names:
+            if n not in seen:
+                out.append(n)
+                seen.add(n)
+        return out
+
+    # -----------------------------
+    # Open a specific region
+    # -----------------------------
+    def open_region(self, *, input_dir: Path, region_index: int, region_name: str) -> Dict[str, Any]:
+        LifFile = self._LifFile()
+
+        lif_files = sorted([f for f in input_dir.iterdir() if f.suffix.lower() == ".lif"])
+        if not lif_files:
+            raise ValueError("No .lif files found")
+
+        if region_index < 0:
+            raise IndexError("region_index must be >= 0")
+
+        # --- pick file + image index ---
+        if len(lif_files) > 1:
+            # one file per region
+            if region_index >= len(lif_files):
+                raise IndexError(f"region_index {region_index} out of range for {len(lif_files)} .lif files")
+            filepath = lif_files[region_index]
+            lf = LifFile(filepath)
+            if not getattr(lf, "image_list", None):
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f"LIF file '{filepath.name}' has no images (image_list empty).")
+
+            image_dict = lf.image_list[0]
+            image = lf.get_image(0)
+        else:
+            # one file with many images
+            filepath = lif_files[0]
+            lf = LifFile(filepath)
+            img_list = getattr(lf, "image_list", None) or []
+            if region_index >= len(img_list):
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+                raise IndexError(f"region_index {region_index} out of range for LIF image_list size {len(img_list)}")
+
+            image_dict = img_list[region_index]
+            image = lf.get_image(region_index)
+
+        # normalize name
+        image_name = str(image_dict.get("name") or region_name or filepath.stem).replace("/", "_")
+
+        ctx: Dict[str, Any] = dict(
+            input_dir=input_dir,
+            mode=self.mode,
+            region_index=int(region_index),
+            region=image_name,          # prefer a single standard key: ctx["region"]
+            lif_filepath=filepath,
+
+            lif_file=lf,                # kept open; closed in close_region()
+            lif_image=image,
+            lif_image_dict=image_dict,
+
+            # you can keep aliases if older code expects them:
+            image=image,
+            image_dict=image_dict,
+            region_name=image_name,
+        )
+
+        # optional: expose raw XML header/root if readlif provides it
+        ctx["lif_xml_root"] = getattr(lf, "xml_root", None)
+
+        # best-effort: objective mag + pixel size from metadata
+        mag = None
+        pixel_to_um_calc = None
+        try:
+            # If you already wrote this helper, keep using it.
+            # Should return: (objective_mag, pixel_to_um)
+            mag, pixel_to_um_calc = lif_get_mag_and_pixel_to_um(ctx)
+        except Exception:
+            pass
+
+        ctx["objective_mag"] = mag
+        ctx["objective_mag_source"] = "LIF xml_header/xml_root" if mag is not None else None
+        ctx["pixel_to_um_calc"] = pixel_to_um_calc
+
+        return ctx
+
+    # -----------------------------
+    # Infer tiles/channels/dims
+    # -----------------------------
+    def infer_tiles_channels(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        d = ctx["lif_image_dict"]
+        dims = d.get("dims", None)
+        if dims is None:
+            raise RuntimeError(f"LIF image_dict has no 'dims' for region '{ctx.get('region')}'")
+
+        # dims.x / dims.y
+        try:
+            x_px = int(getattr(dims, "x"))
+            y_px = int(getattr(dims, "y"))
+        except Exception as e:
+            raise RuntimeError(f"Invalid LIF dims.x/dims.y for region '{ctx.get('region')}': {e!r}") from e
+
+        if x_px <= 0 or y_px <= 0:
+            raise RuntimeError(f"LIF image has non-positive dimensions (x={x_px}, y={y_px})")
+
+        image_dimensions = (x_px, y_px)  # (width, height)
+
+        # dims.z / dims.m
+        size_z = int(getattr(dims, "z", 1) or 1)
+        n_tiles = int(getattr(dims, "m", 1) or 1)
+        if n_tiles <= 0:
+            n_tiles = 1
+
+        # channels field
+        n_channels = int(d.get("channels", 1) or 1)
+        if n_channels <= 0:
+            n_channels = 1
+
+        mosaic = d.get("mosaic_position", None)
+
+        # IMPORTANT: if mosaic exists, prefer it for tile count (often more reliable)
+        if mosaic is not None:
+            try:
+                n_tiles = max(1, len(mosaic))
+            except Exception:
+                pass
+
+        ctx.update(
+            tiles=list(range(n_tiles)),
+            channels=list(range(n_channels)),
+            size_z=size_z,
+            image_dimensions=image_dimensions,
+            mosaic=mosaic,
+        )
+        
+        return {
+            "tiles": ctx["tiles"],
+            "channels": ctx["channels"],
+            "size_z": ctx["size_z"],
+            "image_dimensions": ctx["image_dimensions"],
+        }
+
+
+    # -----------------------------
+    # Read a (Z,Y,X) stack
+    # -----------------------------
+    def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
+        image = ctx["lif_image"]
+        tile = int(tile)
+        channel = int(channel)
+
+        z_planes = [np.asarray(zf) for zf in image.get_iter_z(m=tile, c=channel)]
+        if not z_planes:
+            raise RuntimeError(
+                f"LIF read_stack(): no Z planes for tile={tile}, channel={channel} (region='{ctx.get('region')}')"
+            )
+
+        stack = np.stack(z_planes, axis=0).astype(np.uint16, copy=False)
+        return stack
+    
+    # -----------------------------
+    # Build args for decide_and_write_tilescan()
+    # (robust: TileIndex matches ctx["tiles"] / on-disk tile ids)
+    # -----------------------------
+    def build_metadata_args(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        pixel_to_um_manual: Optional[float],
+        deconvolution_method: Optional[str],
+        num_iterations: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        mosaic = ctx.get("mosaic", None)
+        region = ctx.get("region", "unknown")
+        image_dimensions: Tuple[int, int] = ctx["image_dimensions"]
+    
+        if mosaic is None:
+            print(f"{BOLD}[WARN]⚠️ {RESET} No mosaic_position found for LIF region '{region}'. Skipping TileScanInfo.")
+            return None
+    
+        if not isinstance(mosaic, (list, tuple)) or len(mosaic) == 0:
+            print(f"{BOLD}[WARN]⚠️ {RESET} Empty/invalid mosaic_position for LIF region '{region}'. Skipping TileScanInfo.")
+            return None
+    
+        # Tiles we actually process / write to disk (these must match filenames _sNNN_)
+        tiles_ctx = ctx.get("tiles", None)
+        if tiles_ctx is None:
+            tiles_ctx = list(range(len(mosaic)))
+        else:
+            tiles_ctx = [int(t) for t in tiles_ctx]
+    
+        # Sanity / mismatch handling
+        if len(mosaic) != len(tiles_ctx):
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} Tile count mismatch for '{region}': "
+                f"len(mosaic_position)={len(mosaic)} vs len(ctx['tiles'])={len(tiles_ctx)}. "
+                f"Will only use overlapping indices."
+            )
+    
+        tiles_iter = []
+        try:
+            # IMPORTANT:
+            # - TileIndex is the tile id used by the pipeline (ctx["tiles"]) and thus filenames.
+            # - We index mosaic by that same tile id when possible.
+            for tile_id in tiles_ctx:
+                if tile_id < 0 or tile_id >= len(mosaic):
+                    # skip tiles that exist on disk but have no mosaic position entry
+                    continue
+                p = mosaic[tile_id]  # expected: (FieldX, FieldY, PosX, PosY) with Pos in meters
+                tiles_iter.append((int(tile_id), int(p[0]), int(p[1]), float(p[2]), float(p[3])))
+    
+            if not tiles_iter:
+                print(f"[ERROR] No overlapping tiles between ctx['tiles'] and mosaic_position for '{region}'. Skipping.")
+                return None
+    
+            x_raw = np.asarray([t[3] for t in tiles_iter], dtype=float)
+            y_raw = np.asarray([t[4] for t in tiles_iter], dtype=float)
+    
+        except Exception as e:
+            print(f"[ERROR] Could not parse mosaic_position for '{region}': {e!r}. Skipping TileScanInfo.")
+            return None
+    
+        if x_raw.size == 0 or y_raw.size == 0:
+            print(f"[ERROR] Parsed mosaic positions are empty for '{region}'. Skipping TileScanInfo.")
+            return None
+    
+        return dict(
+            x_raw=x_raw,
+            y_raw=y_raw,
+            image_dimensions=image_dimensions,
+            pixel_to_um_manual=pixel_to_um_manual,
+            pixel_to_um_calc=ctx.get("pixel_to_um_calc", None),
+            unit_hint_raw="m",  # LIF mosaic positions are meters
+            off_tol=0.25,
+            tiles_iter=tiles_iter,
+            app_name="LAS AF",
+            # NOTE: out_xml_path intentionally NOT included (pipeline passes it)
+            deconvolution_method=deconvolution_method,
+            deconvolution_iterations=num_iterations,
+            objective_mag=ctx.get("objective_mag", None),
+            objective_mag_source=ctx.get("objective_mag_source", None),
         )
 
 
-    return dict(
-        chosen_unit=chosen_unit, to_um=to_um, rationale=rationale,
-        dx=dx, dy=dy, ovx=ovx, ovy=ovy,
-        pixel_to_um=pixel_to_um, pixel_to_um_source=pixel_to_um_source,
-        tile_width_um=tile_width_um, width_px=width_px,
-        unit_hint_normalized=unit_hint_norm
-    )
+    # -----------------------------
+    # Close resources
+    # -----------------------------
+    def close_region(self, ctx: Dict[str, Any]) -> None:
+        lf = ctx.get("lif_file", None)
+        try:
+            if lf is not None:
+                lf.close()
+        except Exception:
+            pass
+        finally:
+            ctx["lif_file"] = None
+            ctx["lif_image"] = None
+            ctx["lif_image_dict"] = None
+            ctx["lif_xml_root"] = None
+            # keep compatibility aliases clean too
+            ctx["image"] = None
+            ctx["image_dict"] = None
+
+
+# ----------------------------
+# CZI handler 
+# ----------------------------
+class CziHandler(BaseHandler):
+    """
+    Design goals (match LIF/TIFF)
+    -----------------------------
+    - discover_regions(): returns a stable list of region names (pipeline uses indices)
+    - open_region(): opens the dataset for a given region_index; keeps file open until close_region()
+    - infer_tiles_channels(): ONLY infers tiles/channels/Z/image_dimensions (NO mosaic parsing here)
+    - build_metadata_args(): parses/normalizes mosaic positions and returns kwargs for decide_and_write_tilescan()
+        * MUST NOT depend on ctx["out_xml_path"]
+        * MUST return STRICT 5-tuples: (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        * TileIndex MUST match on-disk tile ids (the `_s{tile}` numbers in filenames)
+          because mipped_to_OME_tiffs maps positions by TileIndex identity.
+
+    Notes on units
+    --------------
+    - CZI stage/mosaic coordinate units are not guaranteed. Therefore:
+        * We do NOT hardcode unit_hint_raw="m".
+        * We prefer the helper czi_get_mosaic_positions() to return a unit hint if it can.
+        * Otherwise we pass unit_hint_raw="unknown" and let decide_and_write_tilescan()
+          use its hypothesis test (if pixel size is available).
+    """
+    mode = "czi"
+
+    # ------------------------------------------------------------------
+    # Lazy import
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _CziFile():
+        """
+        Lazy import to avoid crashing the Jupyter kernel during module import.
+        Only imports aicspylibczi when CZI mode is actually used.
+        """
+        try:
+            from aicspylibczi import CziFile
+        except Exception as e:
+            raise ImportError(
+                "CZI mode requires 'aicspylibczi'. Install it to use mode='czi'."
+            ) from e
+        return CziFile
+
+    # ------------------------------------------------------------------
+    # Region discovery
+    # ------------------------------------------------------------------
+    def discover_regions(self, input_dir: Path) -> List[str]:
+        CziFile = self._CziFile()
+
+        # Match LIF/TIFF: use sorted() for stable ordering
+        czi_files = sorted([f for f in input_dir.iterdir() if f.suffix.lower() == ".czi"])
+        if not czi_files:
+            return []
+
+        # For now: assume one CZI per directory; "S" (scene) gives region count.
+        czi = CziFile(str(czi_files[0]))
+        try:
+            dims = normalize_dims_shape(czi)
+            n_scenes = int(dims.get("S", 1) or 1)
+            if n_scenes <= 0:
+                n_scenes = 1
+            return [f"Region_{i+1}" for i in range(n_scenes)]
+        finally:
+            try:
+                czi.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Open region
+    # ------------------------------------------------------------------
+    def open_region(self, *, input_dir: Path, region_index: int, region_name: str) -> Dict[str, Any]:
+        CziFile = self._CziFile()
+
+        czi_files = sorted([f for f in input_dir.iterdir() if f.suffix.lower() == ".czi"])
+        if not czi_files:
+            raise ValueError("No .czi files found")
+
+        if region_index < 0:
+            raise IndexError("region_index must be >= 0")
+
+        filepath = czi_files[0]
+        czi = CziFile(str(filepath))
+        try:
+            dims = normalize_dims_shape(czi)
+        except Exception:
+            try:
+                czi.close()
+            except Exception:
+                pass
+            raise
+
+        # Best-effort objective magnification + pixel size (µm/px)
+        try:
+            mag, pixel_to_um_calc = czi_get_mag_and_pixel_to_um(czi)
+        except Exception:
+            mag, pixel_to_um_calc = None, None
+
+        # Match LIF: keep a consistent ctx schema and keep file handle open
+        ctx: Dict[str, Any] = dict(
+            input_dir=input_dir,
+            region_index=int(region_index),
+            region=str(region_name),
+            mode=self.mode,
+
+            czi=czi,                  # kept open; closed in close_region()
+            czi_dims=dims,
+            czi_filepath=filepath,
+
+            objective_mag=mag,
+            objective_mag_source="CZI metadata" if mag is not None else None,
+            pixel_to_um_calc=pixel_to_um_calc,
+        )
+        return ctx
+
+    # ------------------------------------------------------------------
+    # Infer tiles/channels/dims (NO mosaic parsing here)
+    # ------------------------------------------------------------------
+    def infer_tiles_channels(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        - Determine tiles / channels / size_z / image_dimensions
+        - Do NOT parse or normalize mosaic positions here
+          (that belongs in build_metadata_args)
+        """
+        dims: Dict[str, int] = ctx["czi_dims"]
+
+        size_z = int(dims.get("Z", 1) or 1)
+
+        num_channels = int(dims.get("C", 1) or 1)
+        if num_channels <= 0:
+            num_channels = 1
+        channels = list(range(num_channels))
+
+        # CZI uses M for mosaic tile index in many datasets
+        n_tiles = int(dims.get("M", 1) or 1)
+        if n_tiles <= 0:
+            n_tiles = 1
+
+        x_px = int(dims.get("X", 1) or 1)
+        y_px = int(dims.get("Y", 1) or 1)
+        if x_px <= 0 or y_px <= 0:
+            raise RuntimeError(
+                f"CZI reports non-positive image dimensions X={x_px}, Y={y_px} "
+                f"for region '{ctx.get('region')}'."
+            )
+        image_dimensions = (x_px, y_px)
+
+        # Find valid tile ids (some files report M>0 but some M indices are empty)
+        czi = ctx["czi"]
+        tiles: List[int] = []
+
+        if n_tiles <= 1:
+            tiles = [0]
+        else:
+            for m in range(n_tiles):
+                try:
+                    img, _ = czi.read_image(M=m, C=0, Z=0)
+                    if img is not None:
+                        tiles.append(int(m))
+                except Exception:
+                    pass
+            if not tiles:
+                tiles = list(range(n_tiles))
+
+        # Update ctx in-place 
+        ctx.update(dict(
+            tiles=tiles,
+            channels=channels,
+            size_z=size_z,
+            image_dimensions=image_dimensions,
+        
+            mosaic_tiles_iter=None,
+            mosaic_x_raw=None,
+            mosaic_y_raw=None,
+            mosaic_unit_hint_raw=None,
+        ))
+        
+        return {
+            "tiles": ctx["tiles"],
+            "channels": ctx["channels"],
+            "size_z": ctx["size_z"],
+            "image_dimensions": ctx["image_dimensions"],
+        }
+
+
+    # ------------------------------------------------------------------
+    # Read stack
+    # ------------------------------------------------------------------
+    def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
+        """
+        Read a (Z, Y, X) stack for one tile+channel from a CZI.
+        """
+        czi = ctx["czi"]
+        dims = ctx["czi_dims"]
+
+        zmax = int(dims.get("Z", 1) or 1)
+        region_index = int(ctx.get("region_index", 0))
+
+        tile = int(tile)
+        channel = int(channel)
+
+        z_planes: List[np.ndarray] = []
+        for z in range(zmax):
+            # Build read_image kwargs (filter to supported dims defensively)
+            kwargs = {"Z": int(z)}
+
+            if "S" in dims:
+                kwargs["S"] = region_index
+            if "M" in dims:
+                kwargs["M"] = tile
+            if "C" in dims:
+                kwargs["C"] = channel
+            if "B" in dims:
+                kwargs["B"] = 0
+
+            if hasattr(czi, "dims") and isinstance(czi.dims, str):
+                valid_dims = set(czi.dims)
+                kwargs = {k: v for k, v in kwargs.items() if k in valid_dims}
+
+            try:
+                img, _ = czi.read_image(**kwargs)
+            except Exception as e:
+                # Some datasets may not support S; retry without it if the error hints that
+                msg = str(e)
+                if "S value" in msg or "S=" in msg:
+                    kwargs.pop("S", None)
+                    img, _ = czi.read_image(**kwargs)
+                else:
+                    raise
+
+            arr = np.asarray(img).squeeze()
+            if arr.ndim != 2 and arr.size:
+                # be defensive: reduce to (Y, X)
+                arr = arr.reshape(arr.shape[-2:])
+
+            z_planes.append(arr)
+
+        if not z_planes:
+            raise RuntimeError(
+                f"CZI read_stack(): no Z planes read for tile={tile}, channel={channel} "
+                f"(region_index={ctx.get('region_index')}, region='{ctx.get('region')}')."
+            )
+
+        return np.stack(z_planes, axis=0).astype(np.uint16, copy=False)
+
+    # ------------------------------------------------------------------
+    # Build args for decide_and_write_tilescan() (mosaic parsing lives here)
+    # ------------------------------------------------------------------
+    def build_metadata_args(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        pixel_to_um_manual: Optional[float],
+        deconvolution_method: Optional[str],
+        num_iterations: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Match LIF/TIFF handler behavior:
+
+        - MUST NOT depend on ctx["out_xml_path"] (pipeline passes out_xml_path at call site)
+        - Returns kwargs for decide_and_write_tilescan()
+        - Provides STRICT 5-tuples: (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        - TileIndex MUST match ctx["tiles"] (tile ids used on disk: `_s{tile}` in filenames)
+
+        Unit handling
+        -------------
+        - We avoid hardcoding units.
+        - If czi_get_mosaic_positions() can provide a unit hint, we pass it through.
+        - Otherwise unit_hint_raw="unknown" and decide_and_write_tilescan() will:
+            * use the unit hint if plausible, or
+            * run a hypothesis test if pixel size is available.
+        """
+        region = ctx.get("region", "unknown")
+        image_dimensions: Optional[Tuple[int, int]] = ctx.get("image_dimensions", None)
+        tiles: List[int] = [int(t) for t in (ctx.get("tiles", []) or [])]
+
+        if image_dimensions is None:
+            print(f"[ERROR] CZI handler: image_dimensions missing for region '{region}'. Skipping metadata.")
+            return None
+        if not tiles:
+            print(f"{BOLD}[WARN]⚠️ {RESET} CZI handler: tiles missing/empty for region '{region}'. Skipping metadata.")
+            return None
+
+        czi = ctx.get("czi", None)
+        dims: Dict[str, int] = ctx.get("czi_dims", {}) or {}
+
+        if czi is None:
+            print(f"[ERROR] CZI handler: czi handle missing for region '{region}'. Skipping metadata.")
+            return None
+
+        # n_tiles is the nominal M dimension; helper may need it
+        n_tiles = int(dims.get("M", 1) or 1)
+        if n_tiles <= 0:
+            n_tiles = max(1, len(tiles))
+
+        # ------------------------------------------------------------------
+        # Get mosaic positions from helper
+        #
+        # Expected helper outputs (preferred):
+        #   raw_tiles_iter, x_raw, y_raw, unit_hint_raw = czi_get_mosaic_positions(...)
+        #
+        # Backward compatible (older helper):
+        #   raw_tiles_iter, x_raw, y_raw = czi_get_mosaic_positions(...)
+        # ------------------------------------------------------------------
+        raw_tiles_iter = None
+        x_raw = None
+        y_raw = None
+        unit_hint_raw = "unknown"
+
+        try:
+            scene_index = None
+            if "S" in (dims or {}):
+                scene_index = int(ctx.get("region_index", 0))
+            
+            # block index is usually 0 if present; keep optional
+            block_index = 0 if "B" in (dims or {}) else None
+            
+            out = czi_get_mosaic_positions(
+                czi,
+                n_tiles=n_tiles,
+                scene_index=scene_index,
+                block_index=block_index,
+            )
+
+
+            # Allow both return signatures
+            if isinstance(out, tuple) and len(out) == 4:
+                raw_tiles_iter, x_raw, y_raw, unit_hint_raw = out
+            elif isinstance(out, tuple) and len(out) == 3:
+                raw_tiles_iter, x_raw, y_raw = out
+                unit_hint_raw = "unknown"
+            else:
+                raise ValueError(f"Unexpected czi_get_mosaic_positions() return signature: {type(out)} / {out!r}")
+
+            raw_tiles_iter = list(raw_tiles_iter or [])
+        except Exception as e:
+            print(f"{BOLD}[WARN]⚠️ {RESET} CZI handler: no usable mosaic positions for region '{region}': {e!r}. Skipping TileScanInfo.")
+            return None
+
+        if not raw_tiles_iter:
+            print(f"{BOLD}[WARN]⚠️ {RESET} CZI handler: mosaic tile list empty for region '{region}'. Skipping TileScanInfo.")
+            return None
+
+        # ------------------------------------------------------------------
+        # Normalize to STRICT 5-tuples
+        # Contract required by decide_and_write_tilescan():
+        #   (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        # ------------------------------------------------------------------
+        try:
+            t0 = tuple(raw_tiles_iter[0])
+            if len(t0) != 5:
+                raise ValueError(
+                    f"Expected CZI mosaic tuples of len=5 (TileIndex, FieldX, FieldY, PosX, PosY); "
+                    f"got len={len(t0)}: {t0}"
+                )
+
+            tiles_iter_5 = [
+                (int(t[0]), int(t[1]), int(t[2]), float(t[3]), float(t[4]))
+                for t in raw_tiles_iter
+            ]
+
+            # Ensure x_raw/y_raw are arrays if provided by helper; otherwise derive from tuples
+            if x_raw is None or y_raw is None:
+                x_raw = np.asarray([t[3] for t in tiles_iter_5], dtype=float)
+                y_raw = np.asarray([t[4] for t in tiles_iter_5], dtype=float)
+            else:
+                x_raw = np.asarray(x_raw, dtype=float)
+                y_raw = np.asarray(y_raw, dtype=float)
+
+        except Exception as e:
+            print(f"[ERROR] CZI handler: failed to normalize mosaic positions for '{region}': {e!r}. Skipping.")
+            return None
+
+        if x_raw.size == 0 or y_raw.size == 0:
+            print(f"[ERROR] CZI handler: parsed mosaic arrays empty for '{region}'. Skipping TileScanInfo.")
+            return None
+
+        # ------------------------------------------------------------------
+        # Subset-safe filtering + deterministic ordering
+        #
+        # Match TIFF/LIF policy:
+        # - Only keep tiles whose TileIndex appears in ctx["tiles"] (tiles we actually process/write)
+        # - Keep ordering consistent with ctx["tiles"] so downstream per-tile outputs are aligned
+        #
+        # IMPORTANT CZI EDGE CASE
+        # -----------------------
+        # infer_tiles_channels() tests tiles via read_image(...), but stage coords come from
+        # get_mosaic_tile_bounding_box(...). These can disagree:
+        #   - tile readable but no bounding box  -> processed tile has NO coords
+        #   - bounding box exists but tile unreadable -> coords exist for tile we won't process
+        #
+        # We warn if overlap is partial to avoid silently writing incomplete metadata.
+        # ------------------------------------------------------------------
+        tiles_set = set(int(t) for t in tiles)
+
+        # Keep only entries for tiles we actually process
+        tiles_iter_5 = [t for t in tiles_iter_5 if int(t[0]) in tiles_set]
+        if not tiles_iter_5:
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} CZI handler: mosaic positions do not overlap processed tiles for '{region}'. "
+                "Skipping TileScanInfo."
+            )
+            return None
+
+        # ---- report partial overlap (processed tiles missing coords) ----
+        present = set(int(t[0]) for t in tiles_iter_5)
+        missing_tiles = sorted(tiles_set - present)
+        extra_tiles = sorted(present - tiles_set)  # usually empty after filtering, but keep for sanity
+
+        if missing_tiles:
+            preview = missing_tiles[:20]
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} CZI handler: {len(missing_tiles)} processed tile(s) have no mosaic stage coords "
+                f"and will be omitted from TileScanInfo for '{region}'. "
+                f"Missing TileIndex: {preview}{'...' if len(missing_tiles) > 20 else ''}"
+            )
+
+        if extra_tiles:
+            # This should not happen after filtering, but keep it defensive.
+            preview = extra_tiles[:20]
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} CZI handler: {len(extra_tiles)} tile(s) have coords but are not in ctx['tiles'] "
+                f"for '{region}'. Extra TileIndex: {preview}{'...' if len(extra_tiles) > 20 else ''}"
+            )
+
+        # Keep ordering consistent with ctx["tiles"] (not numeric sort of TileIndex)
+        rank = {int(t): i for i, t in enumerate(tiles)}
+        tiles_iter_5 = sorted(tiles_iter_5, key=lambda t: rank.get(int(t[0]), 10**12))
+
+        # Re-derive x_raw/y_raw in the filtered/reordered sequence to guarantee alignment
+        x_raw = np.asarray([t[3] for t in tiles_iter_5], dtype=float)
+        y_raw = np.asarray([t[4] for t in tiles_iter_5], dtype=float)
+
+        # Record in ctx (optional; mirrors LIF/TIFF storing "mosaic" state)
+        ctx["mosaic_tiles_iter"] = tiles_iter_5
+        ctx["mosaic_x_raw"] = x_raw
+        ctx["mosaic_y_raw"] = y_raw
+        ctx["mosaic_unit_hint_raw"] = unit_hint_raw
+
+        return dict(
+            x_raw=x_raw,
+            y_raw=y_raw,
+            image_dimensions=image_dimensions,
+            pixel_to_um_manual=pixel_to_um_manual,
+            pixel_to_um_calc=ctx.get("pixel_to_um_calc", None),
+
+            unit_hint_raw=str(unit_hint_raw or "unknown"),
+            off_tol=0.25,
+
+            tiles_iter=tiles_iter_5,
+            app_name="Zeiss CZI",
+
+            # NOTE: out_xml_path intentionally NOT included (pipeline passes it)
+            deconvolution_method=deconvolution_method,
+            deconvolution_iterations=num_iterations,
+            objective_mag=ctx.get("objective_mag", None),
+            objective_mag_source=ctx.get("objective_mag_source", None),
+        )
+
+    # ------------------------------------------------------------------
+    # Close region
+    # ------------------------------------------------------------------
+    def close_region(self, ctx: Dict[str, Any]) -> None:
+        czi = ctx.get("czi", None)
+        try:
+            if czi is not None:
+                czi.close()
+        except Exception:
+            pass
+        finally:
+            ctx["czi"] = None
+            ctx["czi_dims"] = None
+            ctx["czi_filepath"] = None
+
+
+# ----------------------------
+# ND2 handler
+# ----------------------------
+class Nd2Handler(BaseHandler):
+    mode = "nd2"
+
+    @staticmethod
+    def _nd2():
+        """
+        Lazy import to avoid killing the Jupyter kernel at module import time.
+        Only imports nd2 when ND2 mode is actually used.
+        """
+        try:
+            import nd2
+        except Exception as e:
+            raise ImportError(
+                "ND2 mode requires the 'nd2' package. Install it to use mode='nd2'."
+            ) from e
+        return nd2
+
+    # -----------------------------
+    # Region discovery
+    # -----------------------------
+    def discover_regions(self, input_dir: Path) -> List[str]:
+        nd2_files = sorted([p for p in input_dir.iterdir() if p.suffix.lower() == ".nd2"])
+        if not nd2_files:
+            return []
+        # Policy: ND2 regions are FILES (one region per .nd2), never the internal P dimension.
+        return [f"Region_{i+1}" for i in range(len(nd2_files))]
+
+    # -----------------------------
+    # Open region (one ND2 file)
+    # -----------------------------
+    def open_region(self, *, input_dir: Path, region_index: int, region_name: str) -> Dict[str, Any]:
+        nd2 = self._nd2()
+
+        nd2_files = sorted([p for p in input_dir.iterdir() if p.suffix.lower() == ".nd2"])
+        if not nd2_files:
+            raise ValueError("No .nd2 files found")
+
+        if region_index < 0 or region_index >= len(nd2_files):
+            raise IndexError(f"region_index {region_index} out of range for {len(nd2_files)} nd2 file(s)")
+
+        filepath = nd2_files[int(region_index)]
+
+        f = nd2.ND2File(str(filepath))
+        try:
+            darr = f.to_dask(copy=False)  # lazy
+            sizes = dict(f.sizes)
+        except Exception:
+            try:
+                f.close()
+            except Exception:
+                pass
+            raise
+
+        ctx: Dict[str, Any] = dict(
+            input_dir=input_dir,
+            region_index=int(region_index),
+            region=str(region_name),
+            mode=self.mode,
+
+            nd2_file=f,          # kept open; closed in close_region()
+            nd2_darr=darr,
+            nd2_sizes=sizes,
+            nd2_filepath=filepath,
+        )
+
+        # Best-effort objective magnification + pixel size (µm/px) from ND2 metadata (NO PRINTS here).
+        try:
+            mag, pixel_to_um_calc = nd2_get_mag_and_pixel_to_um(f)   
+        except Exception:
+            mag, pixel_to_um_calc = None, None
+        
+
+        ctx["objective_mag"] = mag
+        ctx["objective_mag_source"] = "Nikon ND2 metadata" if mag is not None else None
+        ctx["pixel_to_um_calc"] = pixel_to_um_calc
+        ctx["nd2_pixel_to_um_calc"] = pixel_to_um_calc  # backwards-compat alias
+
+        return ctx
+
+    # -----------------------------
+    # Infer tiles/channels/dims + stage positions
+    # -----------------------------
+    def infer_tiles_channels(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        sizes: Dict[str, int] = ctx["nd2_sizes"]
+
+        size_z = int(sizes.get("Z", 1) or 1)
+
+        num_channels = int(sizes.get("C", 1) or 1)
+        if num_channels <= 0:
+            num_channels = 1
+        channels = list(range(num_channels))
+
+        x_px = int(sizes.get("X", 1) or 1)
+        y_px = int(sizes.get("Y", 1) or 1)
+        if x_px <= 0 or y_px <= 0:
+            raise RuntimeError(
+                f"ND2 reports non-positive image dimensions X={x_px}, Y={y_px} for region '{ctx.get('region')}'."
+            )
+        image_dimensions = (x_px, y_px)
+
+        # Tiles: prefer P (position loop) else M else single
+        p_n = int(sizes.get("P", 1) or 1)
+        m_n = int(sizes.get("M", 1) or 1)
+
+        if p_n > 1:
+            tiles = list(range(p_n))
+            tile_dim = "P"
+        elif m_n > 1:
+            tiles = list(range(m_n))
+            tile_dim = "M"
+        else:
+            tiles = [0]
+            tile_dim = None
+
+        # ---- stage coords extraction (for TileScanInfo writer) ----
+        # ND2 stage positions from nd2 are typically already in microns (stagePositionUm).
+        #
+        # IMPORTANT DESIGN RULE
+        # ---------------------
+        # We keep ALL the extraction logic in one place (nd2_get_stage_positions_um),
+        # which is a NO-PRINT helper by design. This prevents drift between:
+        #   - infer_tiles_channels() structure inference, and
+        #   - build_metadata_args() / TileScanInfo writing.
+        #
+        # infer_tiles_channels() is allowed to emit ONE warning if extraction fails,
+        # but should not re-implement the metadata parsing itself.
+        f = ctx["nd2_file"]
+        coords: Optional[List[Tuple[float, float]]] = None
+
+        try:
+            coords = nd2_get_stage_positions_um(f)  # NO-PRINT helper
+        except Exception:
+            coords = None
+
+        if coords is None:
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: no stage coordinates available for region "
+                f"'{ctx.get('region')}'. TileScanInfo will be skipped."
+            )
+
+        # ------------------------------------------------------------------
+        # Validate stage coordinate count vs tile count (P-dimension only)
+        #
+        # ND2 assumptions:
+        # - XYPosLoop points correspond 1:1 with P tiles
+        # - coords[i] corresponds to tile i (TileIndex / filename `_s{i}`)
+        #
+        # If this assumption breaks, we WARN (once) and allow the pipeline
+        # to continue; metadata writing will decide how to handle it.
+        # ------------------------------------------------------------------
+        if tile_dim == "P" and coords is not None:
+            n_coords = len(coords)
+            n_tiles = len(tiles)
+
+            if n_coords != n_tiles:
+                preview_coords = coords[:5]
+                preview_tiles = tiles[:5]
+
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: stage coordinate count ({n_coords}) does not match "
+                    f"tile count ({n_tiles}) for region '{ctx.get('region')}'. "
+                    f"TileScanInfo may be incomplete or misaligned.\n"
+                    f"        tiles preview: {preview_tiles}\n"
+                    f"        coords preview: {preview_coords}"
+                )
+
+        ctx.update(dict(
+            tiles=tiles,
+            channels=channels,
+            size_z=size_z,
+            image_dimensions=image_dimensions,
+
+            nd2_coords=coords,      # list of (x_um, y_um) or None
+            nd2_tile_dim=tile_dim,  # "P" | "M" | None
+        ))
+        
+        return {
+            "tiles": ctx["tiles"],
+            "channels": ctx["channels"],
+            "size_z": ctx["size_z"],
+            "image_dimensions": ctx["image_dimensions"],
+        }
+
+
+    # -----------------------------
+    # Read one tile+channel stack (Z,Y,X)
+    # -----------------------------
+    def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
+        """
+        Read a (Z, Y, X) stack for one tile+channel from ND2.
+    
+        Supports tile dimension P or M if present; otherwise uses single tile.
+    
+        WHY THIS FUNCTION EXISTS (ND2 gotcha)
+        ------------------------------------
+        `nd2.ND2File.to_dask()` does NOT always return an xarray.DataArray.
+        In some files it returns a ResourceBackedDaskArray (or similar) that:
+          - has no .isel()
+          - has no .dims()
+    
+        If we naively do `np.asarray(darr)` in that situation, we materialize the ENTIRE
+        dataset (P×Z×C×Y×X) and appear to "hang" during reading.
+    
+        This function therefore:
+          1) Tries named-dimension selection via .isel() when available (xarray path).
+          2) Otherwise slices FIRST using positional indexing on the dask-like array,
+             THEN materializes only the requested slab (fallback path).
+          3) Normalizes output to exactly (Z, Y, X) and uint16.
+    
+        INFO PRINT POLICY
+        -----------------
+        - Emit concise [INFO] lines only when we take the fallback (non-xarray) path.
+          That’s where "silent hangs" used to happen and where provenance matters.
+        - Do not spam per-plane debug; just one or two lines per tile/channel read.
+        """
+        darr = ctx["nd2_darr"]
+        sizes: Dict[str, int] = ctx["nd2_sizes"]
+        tile_dim = ctx.get("nd2_tile_dim", None)
+    
+        tile = int(tile)
+        channel = int(channel)
+    
+        # Z length (best-effort; ND2 may omit Z in some cases)
+        size_z = int(sizes.get("Z", 1) or 1)
+    
+        # Helper: safe isel on DataArray
+        def _isel(obj, **kwargs):
+            if hasattr(obj, "isel"):
+                return obj.isel(**kwargs)
+            raise AttributeError("Object has no .isel()")
+    
+        try:
+            # =====================================================================
+            # PATH A: xarray.DataArray selection (named dims)
+            # =====================================================================
+            # This is the "ideal" case: named-dim indexing is robust to axis ordering.
+            sel = {"C": channel}
+    
+            # Include full Z stack if present
+            if "Z" in sizes and size_z > 1:
+                sel["Z"] = slice(0, size_z)
+    
+            # Include tile index if ND2 exposes a tile dimension (P or M)
+            if tile_dim in ("P", "M") and tile_dim in sizes:
+                sel[tile_dim] = tile
+    
+            sub = _isel(darr, **sel)
+    
+            # NOTE: We keep this behavior unchanged: np.asarray(sub) may trigger upstream
+            # computation depending on backend, but for xarray this is typically fine.
+            arr = np.asarray(sub)
+    
+        except Exception:
+            # =====================================================================
+            # PATH B: positional indexing fallback (ResourceBackedDaskArray, etc.)
+            # =====================================================================
+            # This is the critical fix vs your previous implementation:
+            # - Do NOT do np.asarray(darr) (that materializes everything).
+            # - Slice FIRST to (Z,Y,X) for the requested tile+channel, then compute.
+            shape = tuple(getattr(darr, "shape", ()))
+            if len(shape) < 3:
+                raise RuntimeError(f"ND2 read_stack(): unexpected array shape from to_dask(); shape={shape}")
+    
+            # Pull out reported sizes (may be 1 even if the dim isn't present)
+            p_n = int(sizes.get("P", 1) or 1)
+            m_n = int(sizes.get("M", 1) or 1)
+            z_n = int(sizes.get("Z", 1) or 1)
+            c_n = int(sizes.get("C", 1) or 1)
+            y_n = int(sizes.get("Y", 1) or 1)
+            x_n = int(sizes.get("X", 1) or 1)
+    
+            # Emit ONE helpful info line: what we're reading and from what backing type/shape.
+            print(
+                f"[INFO] ND2 read_stack(): using fallback positional slicing "
+                f"(darr_type={type(darr).__name__}, shape={shape}) "
+                f"for tile={tile}, channel={channel}"
+            )
+    
+            # -----------------------------
+            # Strong-match fast path
+            # -----------------------------
+            # Common ND2 mosaic layout observed in your files:
+            #   (P, Z, C, Y, X)
+            # If it matches exactly, slice deterministically (fast + correct).
+            if len(shape) == 5 and shape == (p_n, z_n, c_n, y_n, x_n):
+                # Select just the requested tile+channel stack: -> (Z, Y, X)
+                darr_sel = darr[tile, slice(0, z_n), channel, :, :]
+    
+                # Compute only this slab (never the entire dataset).
+                if hasattr(darr_sel, "compute"):
+                    arr = np.asarray(darr_sel.compute())
+                else:
+                    arr = np.asarray(darr_sel)
+    
+            else:
+                # -----------------------------
+                # Generic conservative fallback
+                # -----------------------------
+                # When axis order differs, do best-effort axis identification by matching sizes:
+                # - Prefer Y/X as the last two axes if they match reported Y/X
+                # - Find C and Z axes by matching c_n and z_n (avoiding Y/X)
+                # - Find tile axis by matching P or M size (depending on tile_dim)
+                sl = [slice(None)] * len(shape)
+    
+                # Prefer Y/X at the end when they match (common ND2)
+                ax_y = ax_x = None
+                if len(shape) >= 2 and shape[-2] == y_n and shape[-1] == x_n:
+                    ax_y, ax_x = len(shape) - 2, len(shape) - 1
+    
+                # Find channel axis by matching c_n (avoid Y/X)
+                ax_c = None
+                if c_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x):
+                            continue
+                        if shape[ax] == c_n:
+                            ax_c = ax
+                            break
+    
+                # Find Z axis by matching z_n (avoid Y/X and C)
+                ax_z = None
+                if z_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x, ax_c):
+                            continue
+                        if shape[ax] == z_n:
+                            ax_z = ax
+                            break
+    
+                # Find tile axis by matching P or M
+                ax_tile = None
+                if tile_dim == "P" and p_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x, ax_c, ax_z):
+                            continue
+                        if shape[ax] == p_n:
+                            ax_tile = ax
+                            break
+                elif tile_dim == "M" and m_n > 1:
+                    for ax in range(len(shape)):
+                        if ax in (ax_y, ax_x, ax_c, ax_z):
+                            continue
+                        if shape[ax] == m_n:
+                            ax_tile = ax
+                            break
+    
+                # Apply slice selections we managed to identify
+                if ax_tile is not None:
+                    sl[ax_tile] = tile
+                if ax_c is not None:
+                    sl[ax_c] = channel
+                if ax_z is not None:
+                    sl[ax_z] = slice(0, z_n)
+    
+                darr_sel = darr[tuple(sl)]
+    
+                # Compute only the selected slab.
+                if hasattr(darr_sel, "compute"):
+                    arr = np.asarray(darr_sel.compute())
+                else:
+                    arr = np.asarray(darr_sel)
+    
+        # =====================================================================
+        # Normalize output to (Z, Y, X)
+        # =====================================================================
+        arr = np.asarray(arr)
+    
+        # After slicing, we expect:
+        # - (Z, Y, X) normally
+        # - (Y, X) if Z==1 (then add a singleton Z axis)
+        # - potentially extra singleton axes depending on backend (squeeze them)
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        elif arr.ndim > 3:
+            arr = np.squeeze(arr)
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            elif arr.ndim != 3:
+                raise RuntimeError(f"ND2 read_stack(): could not normalize to (Z,Y,X); got shape {arr.shape}")
+    
+        return arr.astype(np.uint16, copy=False)
+
+    
+    # -----------------------------
+    # Build args for decide_and_write_tilescan()
+    # -----------------------------
+    def build_metadata_args(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        pixel_to_um_manual: Optional[float],
+        deconvolution_method: Optional[str],
+        num_iterations: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return kwargs for decide_and_write_tilescan().
+
+        Matches LIF/TIFF handler policy:
+        - MUST NOT require ctx["out_xml_path"] (pipeline passes out_xml_path explicitly)
+        - tiles_iter MUST be STRICT 5-tuples: (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+        - TileIndex MUST match on-disk tile ids used in filenames (`_s{tile}`)
+        """
+        region = ctx.get("region", "unknown")
+        image_dimensions: Optional[Tuple[int, int]] = ctx.get("image_dimensions", None)
+        if image_dimensions is None:
+            print(f"[ERROR] ND2 handler: image_dimensions missing for region '{region}'. Skipping metadata.")
+            return None
+
+        coords = ctx.get("nd2_coords", None)
+        tiles = list(ctx.get("tiles", []) or [])
+
+        if not tiles:
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: no tiles inferred for region '{region}'. Skipping TileScanInfo.")
+            return None
+
+        if coords is None:
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: no stage coordinates available for region '{region}'. Skipping TileScanInfo.")
+            return None
+
+        if not isinstance(coords, (list, tuple)) or len(coords) == 0:
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: empty stage coordinate list for region '{region}'. Skipping TileScanInfo.")
+            return None
+
+        # ND2 coords are stagePositionUm → microns.
+        unit_hint_raw = "microns"
+
+        # Build STRICT tile records aligned to tile ids.
+        #
+        # NOTE ABOUT FieldX / FieldY FOR ND2
+        # ---------------------------------
+        # We do not rely on FieldX/FieldY anywhere downstream (OME uses TileIndex + PosX/PosY).
+        # For now we set:
+        #   FieldX = TileIndex
+        #   FieldY = 0
+        # If ND2 grid indices are needed later, compute them explicitly from coords
+        # (or remove FieldX/FieldY from the schema/pipeline to avoid false assumptions).
+        n = min(len(tiles), len(coords))
+        if len(coords) != len(tiles):
+            print(
+                f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: coords count ({len(coords)}) != tiles count ({len(tiles)}); "
+                f"using first {n} entries."
+            )
+
+        tiles_iter: List[Tuple[int, int, int, float, float]] = []
+        x_list: List[float] = []
+        y_list: List[float] = []
+
+        for i in range(n):
+            tid = int(tiles[i])  # must match on-disk tile id
+            try:
+                x_um = float(coords[i][0])
+                y_um = float(coords[i][1])
+            except Exception:
+                continue
+
+            tiles_iter.append((tid, tid, 0, x_um, y_um))
+            x_list.append(x_um)
+            y_list.append(y_um)
+
+        if not tiles_iter:
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: could not build any tile position records for '{region}'. Skipping.")
+            return None
+
+        x_raw = np.asarray(x_list, dtype=float)
+        y_raw = np.asarray(y_list, dtype=float)
+        if x_raw.size == 0 or y_raw.size == 0:
+            print(f"{BOLD}[WARN]⚠️ {RESET} ND2 handler: empty x/y arrays after parsing for '{region}'. Skipping.")
+            return None
+
+        return dict(
+            x_raw=x_raw,
+            y_raw=y_raw,
+            image_dimensions=image_dimensions,
+            pixel_to_um_manual=pixel_to_um_manual,
+            pixel_to_um_calc=ctx.get("pixel_to_um_calc", None),
+            unit_hint_raw=unit_hint_raw,
+            off_tol=0.25,
+            tiles_iter=tiles_iter,
+            app_name="NIS-Elements",  # triggers FlipX logic in writer if you keep that behavior
+            # NOTE: out_xml_path intentionally NOT included (pipeline passes it)
+            deconvolution_method=deconvolution_method,
+            deconvolution_iterations=num_iterations,
+            objective_mag=ctx.get("objective_mag", None),
+            objective_mag_source=ctx.get("objective_mag_source", None),
+        )
+
+    # -----------------------------
+    # Close region (release ND2 handle)
+    # -----------------------------
+    def close_region(self, ctx: Dict[str, Any]) -> None:
+        f = ctx.get("nd2_file", None)
+        try:
+            if f is not None:
+                f.close()
+        except Exception:
+            pass
+        finally:
+            ctx["nd2_file"] = None
+            ctx["nd2_darr"] = None
+            ctx["nd2_sizes"] = None
+            ctx["nd2_filepath"] = None
+            ctx["nd2_coords"] = None
+            ctx["nd2_tile_dim"] = None
+
+# Get handler 
+
+def get_handler(mode: str) -> BaseHandler:
+    """
+    Factory for dataset handlers.
+
+    Parameters
+    ----------
+    mode : str
+        Dataset mode / format identifier, e.g.:
+          - "tif_autosaved"
+          - "tif_exported"
+          - "lif"
+          - "czi"
+          - "nd2"
+
+    Returns
+    -------
+    BaseHandler
+        An initialized handler instance appropriate for the dataset type.
+    """
+    m = str(mode).strip().lower()
+
+    if m in ("tif_autosaved", "tif_exported"):
+        # TIFF handler needs to know WHICH Leica naming convention is used
+        return TiffHandler(mode=m)
+
+    if m == "lif":
+        return LifHandler()
+
+    if m == "czi":
+        return CziHandler()
+
+    if m == "nd2":
+        return Nd2Handler()
+
+    raise ValueError(f"Unsupported mode: {mode!r}")
 
 
 # -------------------------------------------------------------------------------------
@@ -508,58 +3961,90 @@ def preprocessing_main(input_dirs,
     """
     Main preprocessing pipeline for microscopy image data.
 
-    This function processes microscopy images stored in various formats/modes 
-    (autosaved TIFF, exported TIFF, LIF, CZI and Nd2 files) and performs operations such as 
-    region detection, deconvolution, and creation of OME-TIFF files. It organizes 
-    outputs into directories, manages PSF generation, and optionally applies 
-    Maximum Intensity Projection (MIP).
+    This function processes microscopy image datasets stored in various formats/modes
+    (autosaved/exported TIFF, LIF, ND2, CZI) and performs:
+
+      1) Deconvolution (optional) and Maximum Intensity Projection (MIP) or stack export
+      2) Writing TileScanInfo metadata XML (per region/cycle) when available
+      3) Conversion of per-tile MIPs to per-cycle OME-TIFFs
+      4) Cross-cycle alignment + stitching (Ashlar)
+      5) Retiling stitched mosaics into fixed-size tiles
 
     Parameters
     ----------
-    input_dir : str or Path
-        Path to the input directory containing raw microscopy image files.
+    input_dirs : Sequence[Union[str, Path]]
+        One input directory per cycle, containing the raw files for that cycle.
+        Must be the same length/order as `cycles`.
 
-    output_dir_prefix : str or Path
-        Base path prefix where output directories and processed files will be saved.
+    cycles : Sequence[Union[int, str]]
+        Cycle identifiers corresponding to `input_dirs` (e.g., [1, 2, 3] or ["1","2","3"]).
+        These are used in output folder/file naming (e.g., Cycle{cycle}).
 
-    cycle : int or str
-        Identifier for the current imaging cycle being processed (e.g., cycle number).
+    output_dir_prefix : Union[str, Path]
+        Base output directory. Region folders are created under this prefix (e.g., R1, R2, ...).
 
     mode : str
-        Input data format/mode. Supported values:
-        - 'tif_autosaved': TIFF files saved automatically by Leica software.
-        - 'tif_exported': TIFF files exported manually.
-        - 'lif': Leica Image File (LIF) format.
+        Input format/mode. Supported values:
+          - 'tif_autosaved' : TIFF files autosaved by Leica software
+          - 'tif_exported'  : TIFF files exported manually
+          - 'lif'           : Leica Image File (LIF)
+          - 'nd2'           : Nikon ND2
+          - 'czi'           : Zeiss CZI
 
-    deconvolution_method : str or None, optional
-        Deconvolution algorithm to use. Supported values:
-        - 'deconwolf'
-        - 'redlionfish'
-        - None (skip deconvolution)
+    n_total_cycles : int
+        Total number of cycles expected for the experiment.
+        Used as a safety check before running alignment/stitching to ensure all cycles exist.
 
-    PSF_metadata : dict or None
-        Metadata required to generate the Point Spread Function (PSF) for deconvolution.
-        Required if deconvolution is to be performed.
+    regions_to_process : Optional[Sequence[int]]
+        Optional subset of regions to process, using 1-based region numbers (user-facing).
+        Example: [1, 3, 4] processes R1, R3, R4.
+
+    deconvolution_method : Optional[str]
+        Deconvolution algorithm to use:
+          - 'deconwolf'
+          - 'redlionfish'
+          - None (skip deconvolution)
+
+    num_iterations : int, optional
+        Number of iterations for the selected deconvolution method. Default is 25.
+
+    PSF_metadata : Optional[dict]
+        Metadata required to generate the PSF for deconvolution.
+        Required if `deconvolution_method` is not None.
 
     align_channel : int, optional
-        Channel index used for image alignment. Default is 4.
+        Channel index used for alignment in Ashlar. Default is 4.
 
     mip : bool, optional
-        Whether to apply Maximum Intensity Projection (MIP) to image stacks. Default is True.
+        If True, save Maximum Intensity Projections (2D) per tile/channel.
+        If False, save full Z-stacks per tile/channel. Default is True.
 
     tile_dimension : int, optional
-        Dimension (in pixels) of image tiles for processing. Default is 6000.
+        Tile size (pixels) used when retiling stitched mosaics. Default is 6000.
 
-    chunk_size : int or None, optional
-        Size of chunks for processing large images in segments. Default is None (process whole image).
+    pixel_to_um : Optional[float]
+        Pixel size in microns per pixel (µm/px). If provided, it is used where metadata-derived
+        pixel size is unavailable (and may also be written into metadata outputs depending on handlers).
+
+    chunk_size : Optional[int]
+        Chunk/tile size used for chunked processing in deconvolution backends that support it
+        (e.g., Deconwolf tiling). Default is None.
 
     Raises
     ------
     ValueError
-        If `mode` or `deconvolution_method` is invalid, or required parameters are missing.
+        If `mode` is unsupported, `deconvolution_method` is invalid, or PSF metadata is missing
+        when deconvolution is requested.
 
+    Notes
+    -----
+    - This function orchestrates the pipeline and delegates work to:
+        `deconvolve_and_mip()`, `mipped_to_OME_tiffs()`, `align_and_stitch()`,
+        and `retile_stitched_images()`.
+    - Outputs are organized as:
+        {output_dir_prefix}/R{region_number}/preprocessing/Cycle{cycle}/...
     """
-    
+   
     script_start_time = time.time()
 
     valid_modes = {'tif_autosaved', 'tif_exported', 'lif', 'nd2', 'czi'}
@@ -629,20 +4114,61 @@ def deconvolve_and_mip(
     chunk_size: Optional[int] = None
 ) -> list:
     """
-    Deconvolve Leica microscopy data for a given cycle.
-    
-    Parameters:
-        input_dir (Path): Directory containing input image files.
-        output_dir_prefix (Path): output directory.
-        mode (str): One of 'tif_autosaved', 'tif_exported', or 'lif'.
-        deconvolution_method (str | None): 'redlionfish', 'deconwolf', or None.
-        PSF_metadata (dict): Metadata needed to generate PSFs.
-        mip (bool): Whether to save maximum intensity projections (MIP).
-        chunk_size (int | None): Tile size for Deconwolf processing.
-        
-    Returns:
-        List of directories for each region. Saves output images and metadata files to disk.
-    """ 
+    Deconvolve (optional) and write MIP/stack outputs per region and cycle.
+
+    This function loops over (cycle, input_dir) pairs and, for each selected region:
+      - Opens the dataset via the mode-specific handler
+      - Infers tiles/channels and image dimensions
+      - Extracts + writes TileScanInfo metadata XML when available
+      - Processes only missing tile×channel outputs:
+          * reads the Z-stack
+          * optionally deconvolves (redlionfish / deconwolf)
+          * writes either a Maximum Intensity Projection (MIP) or the full stack
+
+    Parameters
+    ----------
+    input_dirs : Sequence[Union[str, Path]]
+        One input directory per cycle, containing the raw files for that cycle.
+        Must be the same length/order as `cycles`.
+    cycles : Sequence[Union[int, str]]
+        Cycle identifiers corresponding to `input_dirs` (e.g., [1, 2, 3]).
+    output_dir_prefix : Union[str, Path]
+        Base output directory. Region folders are created under this prefix (e.g., R1, R2, ...).
+    mode : str
+        Input format/mode. Supported values:
+          - 'tif_autosaved' : Leica autosaved TIFF
+          - 'tif_exported'  : Leica exported TIFF
+          - 'lif'           : Leica Image File (LIF)
+          - 'nd2'           : Nikon ND2
+          - 'czi'           : Zeiss CZI
+    regions_to_process : Optional[Sequence[int]]
+        Optional subset of regions to process, using 1-based region numbers (user-facing).
+    deconvolution_method : Optional[str]
+        Deconvolution algorithm to use:
+          - 'deconwolf'
+          - 'redlionfish'
+          - None (skip deconvolution)
+    num_iterations : int, optional
+        Number of iterations for the selected deconvolution method. Default is 25.
+    PSF_metadata : Optional[dict]
+        Metadata required to generate the PSF for deconvolution.
+        Required if `deconvolution_method` is not None.
+    mip : bool, optional
+        If True, save Maximum Intensity Projections (2D) per tile/channel.
+        If False, save full Z-stacks per tile/channel. Default is True.
+    pixel_to_um : Optional[float]
+        Manual pixel size in microns per pixel (µm/px). Used when metadata-derived pixel size
+        is unavailable (and may also be written into TileScanInfo depending on the handler).
+    chunk_size : Optional[int]
+        Chunk/tile size used for chunked processing in deconvolution backends that support it
+        (e.g., Deconwolf tiling). Default is None.
+
+    Returns
+    -------
+    List[str]
+        List of region directory paths as strings (e.g., [".../R1", ".../R2", ...]).
+        These region directories are used downstream by OME-TIFF conversion, alignment, and retiling.
+    """
     print(f"\033[1;96mDeconvolution and mipping\033[0m")
     
     valid_modes = {'tif_autosaved', 'tif_exported', 'lif', 'nd2', 'czi'}
@@ -652,6 +4178,14 @@ def deconvolve_and_mip(
     valid_methods = {'deconwolf', 'redlionfish', None}
     if deconvolution_method not in valid_methods:
         raise ValueError(f"Unsupported deconvolution method: {deconvolution_method}. Choose from {valid_methods - {None}} or None.")
+
+    # ======================================================================
+    # (0) build handler ONCE
+    # ======================================================================
+    handler = get_handler(mode)
+
+    if len(cycles) != len(input_dirs):
+        raise ValueError(f"len(cycles)={len(cycles)} must match len(input_dirs)={len(input_dirs)}")
 
     for cycle, input_dir in zip(cycles, input_dirs):
 
@@ -669,1095 +4203,323 @@ def deconvolve_and_mip(
         input_dir = Path(input_dir)
         output_dir_prefix = Path(output_dir_prefix)  
     
-        # STEP 1: Detect regions to process
+        # STEP 1: detect regions via handler 
         
-        # --- Processing Leica .tif files ---
-        if mode == 'tif_exported':
-            tif_files = [
-                f.name
-                for f in input_dir.iterdir()
-                if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
-            ]
-            # Use underscore split
-            region_names = set()
-            for f in tif_files:
-                base = f.rsplit('.', 1)[0]
-                chunks = base.split('_')
-                region_name = chunks[0]
-                region_names.add(region_name)
-            regions = sorted(region_names)
-            num_regions = len(regions)
+        all_regions = handler.discover_regions(input_dir)   # full list, in dataset order
+        num_regions = len(all_regions)
         
-        elif mode == 'tif_autosaved':
-            tif_files = [
-                f.name
-                for f in input_dir.iterdir()
-                if f.suffix == '.tif' and 'dw' not in f.name and '.txt' not in f.name
-            ]
-            # Use double-dash split
-            region_names = set()
-            for f in tif_files:
-                base = f.rsplit('.', 1)[0]
-                chunks = base.split('--')
-                region_name = chunks[0]
-                region_names.add(region_name)
-            regions = sorted(region_names)
-            num_regions = len(regions)
-        
-        # --- Processing Leica .lif files ---
-        elif mode == 'lif':
-            lif_files = [f for f in input_dir.iterdir() if f.suffix == '.lif']
-            num_files = len(lif_files)
-    
-            image_names = []   # To store names of images inside .lif files
-            
-            if num_files > 1:
-                # Case: one file per region
-                num_regions = num_files                           # one file for each region
-                for file in lif_files:
-                    lif_file = LifFile(file)
-                    image_dict = lif_file.image_list[0]           # Each .lif has one image per region
-                    image_names.append(image_dict['name'])    
-            
-            elif num_files == 1:
-                # Case: one .lif file containing multiple regions
-                lif_file = LifFile(lif_files[0])
-                num_regions = len(lif_file.image_list)            # number of images = number of regions
-                for image_dict in lif_file.image_list:
-                    image_names.append(image_dict['name'])
-    
-            # Use unique image names directly as region names 
-            regions = sorted(set(image_names))
+        # Build (dataset_index, region_name, region_number)
+        # region_number is what the USER sees (1-based)
+        region_items = [
+            (idx, name, idx + 1)
+            for idx, name in enumerate(all_regions)
+        ]
 
-        # --- Processing Zeiss .czi files ---
-        elif mode == 'czi':
-            czi_files = [f for f in input_dir.iterdir() if f.suffix == '.czi']
-            if not czi_files:
-                raise ValueError("No CZI files found in input_dir")
-        
-            file = czi_files[0] if len(czi_files) == 1 else czi_files[region_index]
-            print(f"Using CZI file: {file.name}")
-        
-            czi = CziFile(str(file))
-            dims = normalize_dims_shape(czi)
-        
-            print("CZI dims:", dims)
-        
-            # --- Regions (Scenes = S dimension) ---
-            num_regions = dims.get("S", 1)
-            regions = [f"Region_{i+1}" for i in range(num_regions)]        
-    
-
-        # --- Processing Nikon .nd2 files ---
-        elif mode == 'nd2':
-            nd2_files = [f for f in input_dir.iterdir() if f.suffix == '.nd2']
-            num_files = len(nd2_files)
-        
-            image_names = []
-            if num_files > 1:
-                # One ND2 per region
-                num_regions = num_files
-                for file in nd2_files:
-                    ndfile = nd2.ND2File(file)
-                    image_names.append(file.stem)
-                    ndfile.close()
-            elif num_files == 1:
-                # One ND2 with multiple regions
-                ndfile = nd2.ND2File(nd2_files[0])
-                num_regions = ndfile.sizes.get("M", 1)  # number of mosaic positions
-                image_names = [f"Region_{i+1}" for i in range(num_regions)]
-                ndfile.close()
-            else:
-                raise ValueError("No ND2 files found in input_dir")
-        
-            regions = sorted(set(image_names))
-
-        # rename regions    
-        region_numbers = list(range(1, num_regions + 1))  # [1, 2, ..., num_regions]
-
-        # select a subset of regions to be processed
+        # Apply user selection (regions_to_process is 1-based, user-facing)
         if regions_to_process is not None:
-            # Convert region_numbers (1-based) into indexes (0-based)
-            selected_indices = [i - 1 for i in regions_to_process 
-                                if 1 <= i <= len(regions)]
+            ordered = []
+            for rnum in regions_to_process:
+                rnum = int(rnum)
+                if 1 <= rnum <= num_regions:
+                    idx = rnum - 1
+                    ordered.append((idx, all_regions[idx], rnum))
+                else:
+                    print(f"{BOLD}[WARN]⚠️ {RESET} regions_to_process contains out-of-range region {rnum}; skipping.")
+            region_items = ordered
+
+        if not region_items:
+            print(f"{BOLD}[WARN]⚠️ {RESET} No regions selected; skipping this cycle.")
+            continue
+
         
-            # Reduce regions and region_numbers
-            regions = [regions[i] for i in selected_indices]
-            region_numbers = [region_numbers[i] for i in selected_indices]
-        
-            #print(f"User-selected regions_to_process = {regions_to_process}")
-            #print(f"Reduced regions = {regions}")
-            #print(f"Reduced region_numbers = {region_numbers}")
-                
-    
-        print("Regions to be processed:", regions) 
+        print("Regions to be processed:", [name for _, name, _ in region_items])
         print("=" * width + "\033[0m")
-    
-        region_directories = []  # To collect all processed region directories
-    
+        
+        region_directories = []
+        
         # Process each region
-        for region_index, region in enumerate(regions):
-            print(f"\033[1;90mProcessing R{region_numbers[region_index]}\033[0m")
-    
-            # Define output directory for this region, always append "R{region_number}" to distinguish them
-            region_directory = output_dir_prefix / f"R{region_numbers[region_index]}"
-    
+        for region_index, region_name, region_number in region_items:
+            print(f"\033[1;90mProcessing R{region_number}\033[0m")
+        
+            # IMPORTANT:
+            # - region_index → used for opening data
+            # - region_number → used for output naming
+        
+            region_directory = output_dir_prefix / f"R{region_number}"
             region_directories.append(str(region_directory))
-            # Create region directory (with parent folders, if needed)
-            region_directory.mkdir(parents=True, exist_ok=True)
+            safe_mkdir(region_directory)
+        
+            cycle_directory = region_directory / "preprocessing" / f"Cycle{cycle}"
+            safe_mkdir(cycle_directory)
+        
+            mipped_directory = cycle_directory / "1_mipped"
+            safe_mkdir(mipped_directory)
+        
+            stacked_directory = cycle_directory / "1_stacked"
+            metadata_directory = cycle_directory / "MetaData"
+            safe_mkdir(metadata_directory)
+
     
-            # Create cycle directory inside region directory: "preprocessing/Cycle{cycle}"
-            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
-            cycle_directory.mkdir(parents=True, exist_ok=True)  
-        
-            # Create directory to store MIP (Maximum Intensity Projection) images
-            mipped_directory = cycle_directory / '1_mipped'
-            mipped_directory.mkdir(exist_ok=True)
-    
-            # Prepare directory to store stacked images
-            stacked_directory = cycle_directory / '1_stacked'
-        
-            # Create directory to store metadata files
-            metadata_directory = cycle_directory / 'MetaData'
-            metadata_directory.mkdir(exist_ok=True)
-        
-            # ----- STEP 1: PREPARE FILE LISTS BASED ON MODE -----
-            # --- tif file preparations ---
-            if mode in ('tif_autosaved', 'tif_exported'):
-                # List all .tif files in input_dir (skip ".txt" and "dw" files)
-                tif_files = [
-                    f for f in input_dir.iterdir() 
-                    if f.suffix == '.tif' and 'dw' not in f.name and not f.name.endswith('.txt')
-                ]
-                # Filter only files for the current region
-                filtered_tifs = [f for f in tif_files if region in f.name]
-    
-                # --- Find all channels from filenames ---
-                channel_set = set()
-                if mode == 'tif_autosaved':
-                    channel_pattern = re.compile(r'--C(\d{2})')    # channels in format "--C01", "--C02", ...
-                elif mode == 'tif_exported':
-                    # Match "_ch00", "_Ch00", "_CH00", "_ch0", etc. (case-insensitive)
-                    channel_pattern = re.compile(r'_c[hH](\d+)', re.IGNORECASE)
-
-            
-                # Populate channel set by scanning filenames
-                for f in filtered_tifs:
-                    if (m := channel_pattern.search(f.name)):
-                        channel_set.add(int(m.group(1)))           # store channels as integers
-            
-                channels = sorted(channel_set)
-                if not channels:
-                    raise RuntimeError(f"No channels detected in files for region {region}")
-
-                # --- Detect tiles and find sample tile(s) ---
-                if mode == 'tif_autosaved':
-                    tile_pattern = re.compile(r'--Stage(\d+)--')      # tile number in "--StageXX--"
-                    sample_indicator = re.compile(r'--Stage0+--')     # matches "--Stage0--", "--Stage00--", etc.
-                elif mode == 'tif_exported':
-                    tile_pattern = re.compile(r'_s(\d+)_')            # capture tile number in "_s###_"
-                    sample_indicator = re.compile(r'_s0+_')           # matches "_s0_", "_s00_", "_s000_", etc.
-                
-                # Extract tile numbers and collect sample tile files
-                tiles = set()        # unique tile numbers (ints)
-                sample_tiles = []    # files belonging to tile 0 (any form of 0-padded index)
-                
-                for f in filtered_tifs:
-                    m = tile_pattern.search(f.name)
-                    if m:
-                        tiles.add(int(tile_pattern.search(f.name).group(1)))         # <-- int, not string
-                
-                    if sample_indicator.search(f.name):
-                        sample_tiles.append(f)
-
-                # Safe fallback: if no tile 0 exists, pick the lowest available tile
-                if not sample_tiles and tiles:
-                    lowest_tile = min(int(t) for t in tiles)
-                    # Build regex dynamically depending on mode
-                    if mode == 'tif_exported':
-                        fallback_pattern = re.compile(rf'_s0*{lowest_tile}_')
-                    else:  # tif_autosaved
-                        fallback_pattern = re.compile(rf'--Stage0*{lowest_tile}--')
-                    sample_tiles = [f for f in filtered_tifs if fallback_pattern.search(f.name)]
-        
-                # Sort tile list and compute total number of tiles
-                tiles = sorted(tiles)
-                n_tiles = len(tiles)
-                # Infer Z-size from number of sample_tile files divided by number of channels
-                size_z = int(len(sample_tiles) / len(channels))
-                # Infer image dimensions (X, Y) from the first sample tile
-                sample_tile = tifffile.imread(sample_tiles[0])
-                image_dimensions = sample_tile.shape[::-1]  # (width, height)
-
-                print(f"Tiles: {n_tiles}, Z-slices: {size_z}, Channels: {len(channels)}")
-                print(f"Image dimensions: {image_dimensions[0]} × {image_dimensions[1]} (X × Y)")
-        
-                # --- Pre-index files by tile and channel to speed up lookups ---
-                tile_to_files = {}
-                for tile in tiles:  # tile is int now
-                    if mode == 'tif_autosaved':
-                        tile_files = [f for f in filtered_tifs if re.search(rf"--Stage0*{tile}--", f.name)]
-                    else:
-                        tile_files = [f for f in filtered_tifs if re.search(rf"_s0*{tile}_", f.name)]
-                    tile_to_files[tile] = tile_files
-                        
-                tile_channel_files = {}
-                for tile, files_in_tile in tile_to_files.items():
-                    for channel in channels:
-                
-                        if mode == 'tif_autosaved':
-                            # Example filenames:  ...--C01--..., ...--C10--...
-                            pattern = re.compile(rf"--C{str(channel).zfill(2)}", re.IGNORECASE)
-                
-                        else:
-                            # tif_exported: supports 1–N digits, any zero padding, any case
-                            # Matches: _ch0, _ch00, _ch000, _Ch02, _CH2, etc.
-                            pattern = re.compile(rf"_ch0*{channel}(?=\D|$)", re.IGNORECASE)
-                
-                        tile_channel_files[(tile, channel)] = [f for f in files_in_tile if pattern.search(f.name)]
-
-                        
-            # --- lif file preparations ---
-            elif mode == 'lif':
-                # List all .lif files in input_dir
-                lif_files = [f for f in input_dir.iterdir() if f.suffix == '.lif']
-                num_files = len(lif_files)
-                
-                if num_files > 1:
-                    # Case: multiple .lif files → one file per region
-                    filepath = lif_files[region_index]
-                    file = LifFile(filepath)
-                    image_dict = file.image_list[0]  # always take first image from multi-file set
-                    image_name = image_dict['name']
-                    image = file.get_image(0)
-                elif num_files == 1:
-                    # Case: single .lif file → contains multiple regions
-                    filepath = lif_files[0]
-                    file = LifFile(filepath)
-                    image_dict = file.image_list[region_index]  # select image by region_index if single file
-                    image_name = image_dict['name']
-                    image = file.get_image(region_index)
-            
-                print(f"Image name: {image_name}")
-                # Replace "/" with "_" in image name (prevent file system issues)
-                image_name = image_name.replace('/', '_')
-        
-                dims = image_dict['dims']                        # Extract dimensions
-                image_dimensions = (dims.x, dims.y)  # (width, height)
-                size_z = dims.z                                  # number of Z slices
-                n_tiles = dims.m                                 # number of mosaic tiles (if any)
-                tiles = list(range(n_tiles))                     # tile indices 0..n_tiles-1
-                tiles = sorted(tiles, key=int)
-                mosaic = image_dict.get('mosaic_position', None) # Get mosaic positions
-                num_channels = image_dict['channels']
-                channels = list(range(num_channels))  # [0, 1, 2, 3, 4, 5]
-
-            # --- czi file preparations ---
-            elif mode == 'czi':
-               # --- Gather basic CZI info ---
-                size_z = dims.get("Z", 1)
-                num_channels = dims.get("C", 1)
-                n_tiles = dims.get("M", 1)
-                image_dimensions = (dims.get("X"), dims.get("Y"))
-                channels = list(range(num_channels))
-            
-                tiles = []
-                for m in range(n_tiles):
-                    try:
-                        # Try reading the first Z and C without specifying S or B
-                        img, shp = czi.read_image(M=m, C=0, Z=0)
-                        if img is not None:
-                            tiles.append(m)
-                    except Exception as e:
-                        print(f"[INFO] Skipping tile {m} ({e.__class__.__name__})")
-            
-                print(
-                    f"{len(tiles)} valid tiles (out of {n_tiles}), "
-                    f"{size_z} Z-slices, {num_channels} channels, "
-                    f"image size {image_dimensions[0]} × {image_dimensions[1]}"
-                )
-
-
-            # --- nd2 file preparations ---
-            elif mode == 'nd2':
-                print(f"\033[1;93m[ND2 MODE] Initializing Nikon ND2 processing for region {region}\033[0m")
-            
-                # Collect all .nd2 files in the input directory
-                nd2_files = [f for f in input_dir.iterdir() if f.suffix == '.nd2']
-                print(f"Found {len(nd2_files)} ND2 file(s) in input directory")
-            
-                # Pick the correct file depending on acquisition setup
-                filepath = nd2_files[0] if len(nd2_files) == 1 else nd2_files[region_index]
-                print(f"Using ND2 file: {filepath.name}")
-            
-                # --- Load ND2 and normalize to (M, Z, C, Y, X) ---
-                with nd2.ND2File(filepath) as f:
-                    sizes = f.sizes
-                    print("ND2 sizes:", sizes)   # e.g. {'X': 3789, 'Y': 3789, 'M': 5}
-            
-                    # Load full array
-                    arr = f.to_dask().compute()
-                    arr = normalize_nd2_array(arr, sizes)  # -> (M, Z, C, Y, X)
-            
-                    # Try extracting stage coordinates
-                    coords = []
-                    exp = f.experiment
-                    if hasattr(exp, "points") and exp.points:
-                        for p in exp.points:
-                            coords.append((p.x, p.y))
-                        print(f"Extracted {len(coords)} stage coordinate(s) from experiment.points")
-                    else:
-                        exp_str = str(exp)
-                        for match in re.finditer(r"x=([-+]?\d*\.?\d+), y=([-+]?\d*\.?\d+)", exp_str):
-                            coords.append((float(match.group(1)), float(match.group(2))))
-                        if coords:
-                            print(f"Extracted {len(coords)} stage coordinate(s) from regex parsing")
-                        else:
-                            print("\033[91m[WARN] No stage coordinates found in ND2 metadata\033[0m")
-                            print("Experiment object (repr):", repr(exp))
-                            print("Experiment object (str):", exp_str[:500], "..." if len(exp_str) > 500 else "")
-            
-                            # Debug raw metadata for deeper inspection
-                            try:
-                                meta = f.metadata
-                                print("Top-level ND2 metadata keys:", list(meta.keys()))
-                            except Exception as e:
-                                print(f"[DEBUG] Could not access f.metadata: {e}")
-            
-                # --- Assign variables for downstream code ---
-                msize = arr.shape[0]                       # number of tiles (M)
-                size_z = arr.shape[1]                      # z-slices
-                channels = list(range(arr.shape[2]))       # channel indices
-                image_dimensions = (arr.shape[4], arr.shape[3])  # (X, Y)
-                tiles = list(range(msize))
-                n_tiles = msize
-            
-                print(f"Normalized ND2 array shape: {arr.shape} (M, Z, C, Y, X)")
-                print(f"Tiles: {n_tiles}, Z-slices: {size_z}, Channels: {len(channels)}")
-                print(f"Image dimensions: {image_dimensions[0]} × {image_dimensions[1]} (X × Y)")
-
-
-                    
-            # ----- STEP 2: COPY METADATA IF AVAILABLE -----
+            # ----- STEP 2: WRITE TileScanInfo via handler -----
             print("\033[96mExtracting metadata\033[0m")
-                        
-            # --- tif metadata (Leica → LAS/CZI-style; positions written in µm with explicit provenance) ---
-            if mode in ('tif_autosaved', 'tif_exported'):
-                # --- Read Leica XML from INPUT/Metadata ---
-                # --- Locate Leica metadata folder (case-insensitive) ---
-                input_metadata_dir = next(
-                    (p for p in input_dir.iterdir()
-                     if p.is_dir() and p.name.lower() == 'metadata'),
-                    None
+
+            ctx = None
+            # Open region using TRUE dataset index
+            ctx = handler.open_region(
+                input_dir=input_dir,
+                region_index=region_index,   # ← original index
+                region_name=region_name,
+            )
+
+            try: 
+                inf = handler.infer_tiles_channels(ctx)
+                tiles = inf["tiles"]
+                channels = inf["channels"]
+                size_z = inf["size_z"]
+                image_dimensions = inf["image_dimensions"]
+    
+                # Build metadata args
+                metadata_args = handler.build_metadata_args(
+                    ctx,
+                    pixel_to_um_manual=pixel_to_um,
+                    deconvolution_method=deconvolution_method,
+                    num_iterations=num_iterations,
+                )
+    
+                
+                if metadata_args:
+                    decide_and_write_tilescan(
+                        **metadata_args,
+                        out_xml_path=metadata_directory / f"R{region_number}.xml",
+                    )
+    
+    
+                # ----- STEP 3: SKIP EXISTING FILES -----
+                print("\033[96mProcessing files\033[0m")
+                
+                out_dir = (mipped_directory if mip else stacked_directory)
+                
+                # Count only VALID outputs (avoid getting stuck because a corrupted/empty file exists)
+                valid_existing = set()
+                for f in out_dir.glob(f"Cycle{cycle}_s*_ch*.tif"):
+                    m = re.search(r"_s0*(\d+)_ch0*(\d+)", f.name, re.IGNORECASE)
+                    if m and file_exists_and_valid(f, min_size=1024):
+                        valid_existing.add((int(m.group(1)), int(m.group(2))))
+                
+                # IMPORTANT:
+                # tiles_all represents the FULL expected tile set for this region.
+                # Do NOT reuse this variable for "tiles to process" later.
+                tiles_all = list(tiles)
+                
+                total_expected = len(tiles_all) * len(channels)
+                total_valid = len(valid_existing)
+                total_remaining = total_expected - total_valid
+                
+                print(
+                    f"[INFO] Expected outputs this region/cycle: {total_expected} "
+                    f"(tiles={len(tiles_all)} × channels={len(channels)}). "
+                    f"Valid already present: {total_valid}. Remaining: {total_remaining}."
                 )
                 
-                if input_metadata_dir is None:
-                    print(f"[ERROR] No Leica metadata folder found in {input_dir} (case-insensitive search). Skipping region.")
-                    continue
-
-                else:
-                    # Gather all plausible XML/XLF files (ignore property dumps)
-                    md_files = [
-                        f for f in input_metadata_dir.iterdir()
-                        if f.suffix.lower() in ('.xml', '.xlif') and 'properties' not in f.name.lower()
-                    ]
+                # Determine missing channels per tile (based on VALID outputs only)
+                missing_channels_by_tile = {}
+                for tile in tiles_all:
+                    t = int(tile)
+                    miss = [int(ch) for ch in channels if (t, int(ch)) not in valid_existing]
+                    if miss:
+                        missing_channels_by_tile[t] = miss
                 
-                    if not md_files:
-                        print(f"[ERROR] No Leica XML/XLF files found in {input_metadata_dir}. Skipping region.")
-                        continue
+                if not missing_channels_by_tile:
+                    print(
+                        f"All expected files for Cycle {cycle} already exist "
+                        f"(and look valid) in {out_dir}. Skipping processing."
+                    )
+                    continue
+                
+                tiles = sorted(missing_channels_by_tile.keys())
+                print(f"{len(tiles)} tile(s) have missing outputs. Proceeding with missing tile-channel combos only.")
 
-                    else:
-                        # Heuristic: prefer files whose stem contains a region token; else newest file
-                        region_token = (str(region) or "").strip()
-                        if not region_token and filtered_tifs:
-                            region_token = Path(filtered_tifs[0]).stem.split('_')[0]
-             
-                        # Case-insensitive preference for files whose stem contains the token
-                        prio = [f for f in md_files if region_token and region_token.lower() in f.stem.lower()]
-                        md_file = prio[0] if prio else max(md_files, key=lambda p: p.stat().st_mtime)
-                        
-                        print(f"[META] Using Leica XML: {md_file.name} ({md_file})")
-                        
-                        # Parse robustly; clear error message on failure; also guard empty root
-                        try:
-                            tree = ET.parse(md_file)
-                            root = tree.getroot()
-                            if root is None:
-                                print(f"[ERROR] Parsed empty/None XML root from {md_file}. Skipping region.")
-                                continue
-                        except Exception as e:
-                            print(f"[ERROR] Failed to parse Leica XML '{md_file}': {e}. Skipping region.")
-                            continue
-                       
 
-                # ---------- Helpers ----------
-                def _f(x):
+    
+                # ----- STEP 4: GENERATE PSFS FOR ALL CHANNELS -----
+                print("Calculating the PSF")
+                
+                psf_dict = {}
+                
+                if deconvolution_method is None:
+                    print("Skipping PSF generation — deconvolution method is None.")
+                    psf_dict = {}  # keep for downstream compatibility
+                
+                elif deconvolution_method == "redlionfish":
+                    if PSF_metadata is None:
+                        raise ValueError("PSF_metadata is required for redlionfish deconvolution.")
+                
+                    # For now: generate a tile-sized PSF (same XY as the image tile).
+                    # NOTE: this can be heavy; later you can replace this with a smaller psf_xy (e.g. 256).
+                    psf_x = int(image_dimensions[0])
+                    psf_y = int(image_dimensions[1])
+                    print(f"[INFO] Generating RL PSF at tile size: {psf_x}×{psf_y} px")
+                
+                    # Optional: warn if PSF magnification doesn't match metadata magnification
+                    # (only if you have objective_mag in ctx and PSF_metadata has 'm')
                     try:
-                        return float(x)
+                        meta_mag = ctx.get("objective_mag", None)
+                        psf_mag = float(PSF_metadata.get("m")) if PSF_metadata.get("m") is not None else None
+                        if meta_mag is not None and psf_mag is not None and not np.isclose(meta_mag, psf_mag, rtol=0.02):
+                            print(
+                                f"{BOLD}[WARN]⚠️ {RESET} PSF magnification ({psf_mag:g}x) differs from metadata objective ({meta_mag:g}x) - check input parameter PSF_metadata!"
+                            )
                     except Exception:
-                        return None
-            
-                def _px_um_from_dim(dn, axis):
-                    """Return pixel size in µm/px from Leica Dimensions, plus a short source tag."""
-                    if dn is None:
-                        return None, f"{axis}:missing"
-                    N = _f(dn.attrib.get("NumberOfElements") or dn.attrib.get("Elements"))
-                    L = _f(dn.attrib.get("Length"))
-                    if not (N and L):
-                        return None, f"{axis}:no_length_or_count"
-                    raw = L / N  # length per pixel in declared units
-                    # Magnitude-based normalization to µm (independent of Unit label reliability)
-                    if 1e-9 <= raw <= 1e-4:      # meters/px (1 nm .. 100 µm)
-                        return raw * 1e6, f"{axis}:Length/N (meters→µm ×1e6)"
-                    else:                         # treat as µm/px
-                        return raw, f"{axis}:Length/N (assumed µm)"
-            
-                # ---------- 1) Pixel size (µm/px): manual + metadata-derived "calc" ----------
-                pixel_to_um_manual = float(pixel_to_um) if pixel_to_um is not None else None
-            
-                dim_x = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='1']")
-                dim_y = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='2']")
-                px_um_x, src_x = _px_um_from_dim(dim_x, "X")
-                px_um_y, src_y = _px_um_from_dim(dim_y, "Y")
-            
-                pixel_to_um_calc = None
-                if px_um_x and px_um_y:
-                    rel = abs(px_um_x - px_um_y) / max(px_um_x, px_um_y)
-                    pixel_to_um_calc = (px_um_x + px_um_y) / 2.0
-                    print(f"[META] Pixel size from metadata: {pixel_to_um_calc:.6f} µm/px "
-                          f"(X={px_um_x:.6f} [{src_x}], Y={px_um_y:.6f} [{src_y}])")
-                    if rel > 0.02:
-                        print(f"[WARN] X vs Y pixel sizes differ by {rel*100:.2f}% "
-                              f"(X={px_um_x:.6f}, Y={px_um_y:.6f}). Using average {pixel_to_um_calc:.6f}.")
-                else:
-                    pixel_to_um_calc = px_um_x or px_um_y
-                    if pixel_to_um_calc is not None:
-                        print(f"[META] Pixel size from single axis: {pixel_to_um_calc:.6f} µm/px "
-                              f"({src_x if px_um_x is not None else src_y})")
-            
-                if pixel_to_um_manual is not None:
-                    print(f"[META] Manual pixel_to_um: {pixel_to_um_manual:.6f} µm/px")
-            
-                # ---------- 2) Choose pixel size (prefer manual, warn if mismatch) ----------
-                effective_pixel_to_um = None
-                if (pixel_to_um_calc is not None) and (pixel_to_um_manual is not None):
-                    if not np.isclose(pixel_to_um_calc, pixel_to_um_manual, rtol=0.02):
-                        print(f"[WARN] Manual pixel size ({pixel_to_um_manual:.6f} µm/px) differs "
-                              f"from metadata value ({pixel_to_um_calc:.6f} µm/px).")
-                    effective_pixel_to_um = pixel_to_um_manual
-                    print(f"[META] Using manual pixel size: {effective_pixel_to_um:.6f} µm/px")
-                elif pixel_to_um_manual is not None:
-                    effective_pixel_to_um = pixel_to_um_manual
-                    print(f"[META] Using manual pixel size: {effective_pixel_to_um:.6f} µm/px")
-                elif pixel_to_um_calc is not None:
-                    effective_pixel_to_um = pixel_to_um_calc
-                    print(f"[META] No manual pixel size provided — using metadata pixel size: {effective_pixel_to_um:.6f} µm/px")
-                else:
-                    print(f"[ERROR] No pixel size information available — please provide 'pixel_to_um' manually. Skipping region.")
-                    continue
-
-            
-                # ---------- 3) Objective magnification info (best-effort) ----------
-                mag = None
-                for xp in (".//Instrument//Objective",
-                           ".//Attachment[@Name='HardwareSetting']//ATLCameraSettingDefinition"):
-                    n = root.find(xp)
-                    if n is not None:
-                        mag = _f(n.attrib.get("Magnification")
-                                 or n.attrib.get("NominalMagnification")
-                                 or n.attrib.get("TotalVideoMag"))
-                        if mag:
-                            break
-                if mag:
-                    print(f"[META] Objective magnification: {mag:g}x")
-            
-                # ---------- 4) Collect raw stage positions + unit hint ----------
-                tile_nodes = root.findall(".//Attachment[@Name='TileScanInfo']//Tile")
-                if not tile_nodes:
-                    print("[WARN] No <Tile> nodes found under TileScanInfo — nothing to write.")
-                    tiles_iter = []
-                    x_raw = np.empty((0,), dtype=float)
-                    y_raw = np.empty((0,), dtype=float)
-                else:
-                    x_raw = np.array([float(n.attrib["PosX"]) for n in tile_nodes], dtype=float)
-                    y_raw = np.array([float(n.attrib["PosY"]) for n in tile_nodes], dtype=float)
-            
-                    tiles_iter = [
-                        (int(n.attrib["FieldX"]), int(n.attrib["FieldY"]),
-                         float(n.attrib["PosX"]), float(n.attrib["PosY"]))
-                        for n in sorted(tile_nodes, key=lambda e: (int(e.attrib["FieldY"]), int(e.attrib["FieldX"])))
-                    ]
-            
-                # Leica's declared unit hint (from Dimensions X)
-                unit_hint_raw = (dim_x.attrib.get("Unit", "") if dim_x is not None else "").strip().lower()
-            
-            
-                # ---------- 5) Write tilescan XML via your helper ----------
-                _ = decide_and_write_tilescan(
-                    x_raw=x_raw,
-                    y_raw=y_raw,
-                    image_dimensions=image_dimensions,           # (X, Y) in pixels
-                    pixel_to_um_manual=pixel_to_um_manual,       # keep both for traceability
-                    pixel_to_um_calc=pixel_to_um_calc,           # computed above
-                    unit_hint_raw=unit_hint_raw,                 # e.g. 'm', 'µm', etc.
-                    off_tol=0.25,                                # your overlap tolerance
-                    tiles_iter=tiles_iter,
-                    app_name="LAS X",
-                    out_xml_path=metadata_directory / f"{region}.xml",
-                    deconvolution_method=deconvolution_method,       
-                    deconvolution_iterations=num_iterations
-                    )
-            
-
-            # --- lif metadata (Leica LIF → LAS-style XML; include pixel size, magnification, unit conversion) ---
-            elif mode == 'lif':
-                try:
-                    if mosaic is None:
-                        print(f"[ERROR] No mosaic information found for LIF region '{image_name}' — skipping XML metadata.")
-                        continue
-            
-                    print("[INFO] Generating LIF TileScanInfo XML metadata")
-            
-                    # --- 1) Extract pixel size (voxel size) and magnification from LIF metadata ---
-                    pixel_to_um_manual = float(pixel_to_um) if pixel_to_um is not None else None
-                    pixel_to_um_calc = None
-                    mag = None
-                        
-                    # Load the LIF metadata
-                    xml_text = file.xml_header.decode("utf-8", errors="replace") if isinstance(file.xml_header, (bytes, bytearray)) else str(file.xml_header or "")
-                    root = getattr(file, "xml_root", None)
-            
-                    # --- (a) Objective magnification ---
-                    m = re.search(r'Magnification\s*=\s*["\']([\d.]+)["\']', xml_text, re.IGNORECASE)
-                    if m:
-                        try:
-                            mag = float(m.group(1))
-                            print(f"[META] Objective magnification: {mag:g}x")
-                        except Exception:
-                            pass
-                    else:
-                        print("[META] No magnification info found in xml_header.")
-            
-                    # --- (b) Pixel size from VoxelSizeX/Y/Z (meters → µm) ---
-                    voxels = re.findall(r'VoxelSize[XYZ]\s*=\s*["\']([\deE.+-]+)["\']', xml_text, re.IGNORECASE)
-                    if voxels:
-                        try:
-                            vals_um = [float(v) * 1e6 for v in voxels[:2] if v]
-                            if vals_um:
-                                pixel_to_um_calc = sum(vals_um) / len(vals_um)
-                                print(f"[META] Pixel size from VoxelSize*: {pixel_to_um_calc:.6f} µm/px")
-                        except Exception:
-                            print("[WARN] Could not parse VoxelSize values from LIF xml_header.")
-                    
-            
-                    # --- (c) Fallback: Dimensions (Length/Elements) if no VoxelSize* ---
-                    if pixel_to_um_calc is None and root is not None:
-                        dim_x = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='1']")
-                        dim_y = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='2']")
-            
-                        def _safe_float(x):
-                            try:
-                                return float(x)
-                            except Exception:
-                                return None
-            
-                        def _dim_to_um(el):
-                            if el is None:
-                                return None
-                            N = _safe_float(el.attrib.get("NumberOfElements") or el.attrib.get("Elements"))
-                            L = _safe_float(el.attrib.get("Length"))
-                            if not N or not L or N <= 0:
-                                return None
-                            raw = L / N
-                            return raw * 1e6 if 1e-9 <= raw <= 1e-3 else raw  # meters → µm
-            
-                        vals = [v for v in (_dim_to_um(dim_x), _dim_to_um(dim_y)) if v is not None]
-                        if vals:
-                            pixel_to_um_calc = sum(vals) / len(vals)
-
-                    if pixel_to_um_calc is not None:
-                        print(f"[META] Pixel size from metadata: {pixel_to_um_calc:.6f} µm/px")
-            
-                    # --- 2) Choose pixel size (prefer manual, warn if mismatch) ---
-                    effective_pixel_to_um = None
-                    if (pixel_to_um_calc is not None) and (pixel_to_um_manual is not None):
-                        if not np.isclose(pixel_to_um_calc, pixel_to_um_manual, rtol=0.02):
-                            print(f"[WARN] Manual pixel size ({pixel_to_um_manual:.6f}) differs "
-                                  f"from metadata value ({pixel_to_um_calc:.6f}).")
-                        effective_pixel_to_um = pixel_to_um_manual
-                        print(f"[META] Using manual pixel size: {effective_pixel_to_um:.6f} µm/px")
-                    elif pixel_to_um_manual is not None:
-                        effective_pixel_to_um = pixel_to_um_manual
-                        print(f"[META] Using manual pixel size: {effective_pixel_to_um:.6f} µm/px")
-                    elif pixel_to_um_calc is not None:
-                        effective_pixel_to_um = pixel_to_um_calc
-                        print(f"[META] No manual pixel size provided — using metadata pixel size: {effective_pixel_to_um:.6f} µm/px")
-                    else:
-                        print("[ERROR] No pixel size information available — please provide 'pixel_to_um' manually. Skipping region")
-                        continue
-            
-            
-                    # --- 3) Stage positions from LIF mosaic (raw) ---
-                    try:
-                        x_raw = np.array([float(p[2]) for p in mosaic], dtype=float)
-                        y_raw = np.array([float(p[3]) for p in mosaic], dtype=float)
-                        tiles_list = mosaic
-                    except Exception as _e:
-                        print(f"[WARN] Could not read LIF mosaic positions: {_e}")
-                        x_raw = np.array([], dtype=float)
-                        y_raw = np.array([], dtype=float)
-                        tiles_list = []
-            
-                    # --- 4) Unit hint ---
-                    # LIF mosaic stage coordinates have no declared physical unit in metadata.
-                    # Leave this empty to let the hypothesis logic infer it automatically (usually 'pixels').
-                    unit_hint_raw = ""
-            
-                    # --- 5) Write TileScanInfo XML via shared helper ---
-                    _ = decide_and_write_tilescan(
-                        x_raw=x_raw,
-                        y_raw=y_raw,
-                        image_dimensions=image_dimensions,
-                        pixel_to_um_manual=pixel_to_um_manual,
-                        pixel_to_um_calc=pixel_to_um_calc,
-                        unit_hint_raw=unit_hint_raw,
-                        off_tol=0.25,
-                        tiles_iter=tiles_list,
-                        app_name="LAS AF",
-                        out_xml_path=metadata_directory / f"{image_name}.xml",
-                        deconvolution_method=deconvolution_method,       
-                        deconvolution_iterations=num_iterations
-                    )
-            
-                    print(f"[INFO] Wrote LIF TileScanInfo for {image_name} (positions in µm)")
-            
-                except Exception as e:
-                    print(f"[WARN] Could not parse/write LIF metadata for '{image_name}': {e}")
-
-            # --- czi metadata ---
-            elif mode == 'czi':
-                try:
-                    # --- 1) Collect stage positions (tile bounding boxes) ---
-                    tiles_list = []
-                    x_list, y_list = [], []
-                    for m in range(dims.get("M", 1)):
-                        try:
-                            bb = czi.get_mosaic_tile_bounding_box(M=m, Z=0, C=0)
-                            x, y = float(bb.x), float(bb.y)
-                            tiles_list.append((m, 0, x, y))   # (FieldX, FieldY, PosX_raw, PosY_raw)
-                            x_list.append(x)
-                            y_list.append(y)
-                        except Exception as e:
-                            print(f"[WARN] Could not get bounding box for tile {m}: {e}")
-            
-                    if not tiles_list:
-                        print("No CZI tile positions available to write TileScanInfo.")
-            
-                    x_raw = np.array(x_list, dtype=float)
-                    y_raw = np.array(y_list, dtype=float)
-                    
-            
-                    # --- 2) Parse XML metadata directly from czi.meta ---
-                    meta_root = getattr(czi, "meta", None)
-                    if meta_root is None:
-                        print("CZI metadata XML not available (meta is None).")
-            
-                    if not isinstance(meta_root, ET.Element):
-                        meta_root = ET.fromstring(meta_root)  # handles bytes/str
-            
-                    # Namespace-agnostic helpers
-                    def _local(tag):
-                        return tag.split('}')[-1] if '}' in tag else tag
-            
-                    def _iter(root, name):
-                        for n in root.iter():
-                            if _local(n.tag) == name:
-                                yield n
-            
-                    def _first_text_path(root, path_elems):
-                        node = root
-                        for name in path_elems:
-                            found = None
-                            for ch in node:
-                                if _local(ch.tag) == name:
-                                    found = ch
-                                    break
-                            if found is None:
-                                return None
-                            node = found
-                        return (node.text.strip() if node is not None and node.text else None)
-            
-                    # --- 3) Extract pixel size (prefer X/Y from Scaling/Items/Distance) ---
-                    def _get_pixel_to_um(root):
-                        vals_um = []
-                        for dist in _iter(root, "Distance"):
-                            axis = dist.get("Id") or dist.get("Dimension") or dist.get("Axis")
-                            if axis not in ("X", "Y"):
-                                continue
-                            val_txt = None
-                            unit_txt = None
-                            for ch in dist:
-                                lname = _local(ch.tag)
-                                if lname in ("Value", "MeasuredValue") and ch.text:
-                                    val_txt = ch.text.strip()
-                                elif lname in ("DefaultUnit", "Unit") and ch.text:
-                                    unit_txt = ch.text.strip().lower().replace("μ", "µ")
-                            if val_txt:
-                                try:
-                                    v = float(val_txt)
-                                    if unit_txt in (None, "", "m", "meter", "metre", "meters", "metres"):
-                                        vals_um.append(v * 1e6)  # m → µm
-                                    elif unit_txt in ("µm", "um", "micrometer", "micrometre", "micron", "microns"):
-                                        vals_um.append(v)        # already µm
-                                    elif unit_txt in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
-                                        vals_um.append(v * 1e-3) # nm → µm
-                                    else:
-                                        vals_um.append(v * 1e6)  # unknown → assume meters
-                                except Exception:
-                                    print(f"[WARN] Could not parse pixel size for axis {axis}: {val_txt}")
-                        return (sum(vals_um) / len(vals_um)) if vals_um else None
-            
-                    pixel_to_um_calc = _get_pixel_to_um(meta_root)
-                    if pixel_to_um_calc is not None:
-                        print(f"[META] Pixel size from CZI metadata: {pixel_to_um_calc:.6f} µm/px")
-                    else:
-                        print("[WARN] No pixel size information available from metadata")
-            
-            
-                    # --- 4) Extract objective magnification (numeric only) ---
-                    mag = None
-                    root = meta_root  # alias for findtext calls
-            
-                    for path in [
-                        ".//Information/Instrument/Objectives/Objective/NominalMagnification",
-                        ".//Information/Instrument/Objectives/Objective/ManufacturerData/Magnification",
-                        ".//Scaling/Objectives/Objective/NominalMagnification",
-                    ]:
-                        txt = root.findtext(path)
-                        if txt:
-                            m = re.search(r"([\d.]+)", txt)
-                            if m:
-                                mag = float(m.group(1))
-                                break
-            
-                    if mag:
-                        print(f"[META] Objective magnification: {mag:g}x")
-                    else:
-                        print("[META] No magnification info found.")
-            
-                    # --- 5) Choose pixel size (prefer manual, warn if mismatch) ---
-                    pixel_to_um_manual = float(pixel_to_um) if pixel_to_um is not None else None
-                    effective_pixel_to_um = None
-            
-                    if pixel_to_um_calc and pixel_to_um_manual:
-                        if not np.isclose(pixel_to_um_calc, pixel_to_um_manual, rtol=0.02):
-                            print(f"[WARN] Manual pixel size ({pixel_to_um_manual:.6f}) differs "
-                                  f"from metadata value ({pixel_to_um_calc:.6f}).")
-                        effective_pixel_to_um = pixel_to_um_manual
-                        print(f"[META] Using manual pixel size: {effective_pixel_to_um:.6f} µm/px")
-                    elif pixel_to_um_manual:
-                        effective_pixel_to_um = pixel_to_um_manual
-                        print(f"[META] Using manual pixel size: {effective_pixel_to_um:.6f} µm/px")
-                    elif pixel_to_um_calc:
-                        effective_pixel_to_um = pixel_to_um_calc
-                        print(f"[META] No manual pixel size provided — using metadata pixel size: {effective_pixel_to_um:.6f} µm/px")
-                    else:
-                        print("[ERROR] No pixel size information available — please provide 'pixel_to_um' manually. Skipping region")
-                        continue
-                        
-                    # --- 6) Unit hint for stage positions (for TileScanInfo generation) ---
-                    # Mosaic tile bounding boxes lack a declared unit; leave empty so the hypothesis test
-                    # infers the correct interpretation (often pixels → µm/px).
-                    unit_hint_raw = ""
-            
-                    # --- 7) Write TileScanInfo XML via helper ---
-                    _ = decide_and_write_tilescan(
-                        x_raw=x_raw,
-                        y_raw=y_raw,
-                        image_dimensions=image_dimensions,
-                        pixel_to_um_manual=pixel_to_um_manual,
-                        pixel_to_um_calc=pixel_to_um_calc,
-                        unit_hint_raw=unit_hint_raw,
-                        off_tol=0.25,
-                        tiles_iter=tiles_list,
-                        app_name="Zeiss CZI",
-                        out_xml_path=metadata_directory / f"{region}.xml",
-                        deconvolution_method=deconvolution_method,       
-                        deconvolution_iterations=num_iterations
-                        )
-            
-                except Exception as e:
-                    print(f"[WARN] Could not parse/write CZI metadata: {e}")
-                                                   
-            # --- nd2 metadata ---
-            elif mode == 'nd2':
-                data = ET.Element("Data")
-                image_elem = ET.SubElement(data, "Image", TextDescription="")
-            
-                attachment = ET.SubElement(
-                    image_elem,
-                    "Attachment",
-                    Name="TileScanInfo",
-                    Application="NIS-Elements",
-                    FlipX="0", FlipY="0", SwapXY="0"
-                )
-            
-                if coords:
-                    print(f"Extracting {len(coords)} stage coordinate(s) from ND2")
-                    for idx, (x, y) in enumerate(coords):
-                        ET.SubElement(
-                            attachment, "Tile",
-                            FieldX=str(idx),
-                            FieldY="0",
-                            PosX=f"{x:.10f}",
-                            PosY=f"{y:.10f}"
-                        )
-                else:
-                    if n_tiles == 1:
-                        print("[INFO] ND2 file has no stage coords but only one tile → writing dummy (0,0)")
-                        ET.SubElement(
-                            attachment, "Tile",
-                            FieldX="0",
-                            FieldY="0",
-                            PosX="0.0000000000",
-                            PosY="0.0000000000"
-                        )
-                    else:
-                        raise ValueError(
-                            f"No stage coordinates found in ND2 file {filepath.name}, "
-                            f"but multiple tiles detected ({n_tiles}). Cannot generate OME-TIFF without positions."
-                        )
-            
-                # Save XML file
-                xml_path = metadata_directory / f"{region}.xml"
-                tree = ET.ElementTree(data)
-                tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-                print(f"Metadata XML written: {xml_path}")
-
-
-            # ----- STEP 3: SKIP EXISTING FILES -----
-            print("\033[96mProcessing files\033[0m")
-            
-            # Build set of already-existing outputs (fast)
-            existing = set()
-            out_dir = (mipped_directory if mip else stacked_directory)
-            for f in out_dir.glob(f"Cycle{cycle}_s*_ch*.tif"):
-                m = re.search(r"_s0*(\d+)_ch0*(\d+)", f.name, re.IGNORECASE)
-                if m:
-                    existing.add((int(m.group(1)), int(m.group(2))))
-            
-            # Determine missing channels per tile (only what you need)
-            missing_channels_by_tile = {}
-            for tile in tiles:
-                t = int(tile)
-                miss = [int(ch) for ch in channels if (t, int(ch)) not in existing]
-                if miss:
-                    missing_channels_by_tile[t] = miss
-            
-            if not missing_channels_by_tile:
-                print(f"All expected files for Cycle {cycle} already exist in {out_dir}. Skipping processing.")
-                continue
-            
-            tiles = sorted(missing_channels_by_tile.keys())
-            print(f"{len(tiles)} tile(s) have missing outputs. Proceeding with missing tile-channel combos only.")
-
-            # ----- STEP 4: GENERATE PSFS FOR ALL CHANNELS -----
-            print("Calculating the PSF")
-        
-            if deconvolution_method is None:
-                print("Skipping PSF generation — deconvolution method is None.")
-                psf_dict = {}  # Initialize empty dict for compatibility
-        
-            elif deconvolution_method == 'redlionfish': 
-                psf_dict = {}
-                for channel, info in PSF_metadata['channels'].items():
-        
-                    print(f"Generating PSF for channel {channel}")
-                    psf_volume = fd_psf.GibsonLanni(
-                        na=float(PSF_metadata['na']),
-                        m=float(PSF_metadata['m']),
-                        ni0=float(PSF_metadata['ni0']),
-                        res_lateral=float(PSF_metadata['res_lateral']),
-                        res_axial=float(PSF_metadata['res_axial']),
-                        wavelength=float(info['wavelength']),
-                        size_x=image_dimensions[0],
-                        size_y=image_dimensions[1],
-                        size_z=size_z
-                    ).generate()
-        
-                    psf_dict[channel] = psf_volume  
-                    
-            elif deconvolution_method == 'deconwolf':
-        
-                # Prepare output directory for PSF files
-                psf_dir = cycle_directory / 'PSF'
-                psf_dir.mkdir(parents=True, exist_ok=True)
+                        pass
                 
-                psf_dict = {}
-                # Generate PSF files for each channel using the external generate_psf function
-                for channel, info in PSF_metadata['channels'].items():
-                    wavelength_nm = float(info['wavelength']) * 1000      # Convert wavelength to nanometers
-                    psf_filename = psf_dir / f"PSF_channel_{channel}.tif" # Output file path for this channel's PSF
-                    
-                    # Call PSF generation function with parameters in nanometers
-                    generate_psf(
-                        psf_output=psf_filename,
-                        resxy=PSF_metadata['res_lateral'] * 1000,         # Lateral resolution in nm
-                        resz=PSF_metadata['res_axial'] * 1000,            # Axial resolution in nm
-                        wavelength=wavelength_nm,
-                        NA=PSF_metadata['na'],
-                        ni=PSF_metadata['ni0'])
-                    
-                    # Store path to generated PSF file in dictionary
-                    psf_dict[channel] = psf_filename
-
-        
-            # ----- STEP 5: DECONVOLVE EACH TILE AND CHANNEL -----
-            # If you rebuilt `tiles = sorted(missing_channels_by_tile.keys())` earlier, update n_tiles:
-            n_tiles = len(tiles)
-
-            print("Single tile imaging." if n_tiles == 1 else f"Number of tiles to process: {n_tiles}")
+                    for channel, info in PSF_metadata["channels"].items():
+                        print(f"Generating PSF for channel {channel}")
+                        psf_volume = fd_psf.GibsonLanni(
+                            na=float(PSF_metadata["na"]),
+                            m=float(PSF_metadata["m"]),
+                            ni0=float(PSF_metadata["ni0"]),
+                            res_lateral=float(PSF_metadata["res_lateral"]),
+                            res_axial=float(PSF_metadata["res_axial"]),
+                            wavelength=float(info["wavelength"]),
+                            size_x=psf_x,
+                            size_y=psf_y,
+                            size_z=size_z,
+                        ).generate()
+                        psf_dict[str(channel)] = psf_volume
+                
+                elif deconvolution_method == "deconwolf":
+                    if PSF_metadata is None:
+                        raise ValueError("PSF_metadata is required for deconwolf deconvolution.")
+                
+                    psf_dir = cycle_directory / "PSF"
+                    safe_mkdir(psf_dir)
+                
+                    for channel, info in PSF_metadata["channels"].items():
+                        print(f"Generating PSF for channel {channel}")
+                        wavelength_nm = float(info["wavelength"]) * 1000  # µm -> nm
+                        psf_filename = psf_dir / f"PSF_channel_{channel}.tif"
+                
+                        generate_psf(
+                            psf_output=psf_filename,
+                            resxy=float(PSF_metadata["res_lateral"]) * 1000,
+                            resz=float(PSF_metadata["res_axial"]) * 1000,
+                            wavelength=wavelength_nm,
+                            NA=float(PSF_metadata["na"]),
+                            ni=float(PSF_metadata["ni0"]),
+                        )
+                        psf_dict[str(channel)] = psf_filename
+                     
+                # ----- STEP 5: DECONVOLVE EACH TILE AND CHANNEL -----
+                # If you rebuilt `tiles = sorted(missing_channels_by_tile.keys())` earlier, update n_tiles:
+                n_tiles = len(tiles)
     
-            # Prepare directory to save stacked images
-            stacked_directory.mkdir(exist_ok=True, parents=True)
-    
-            # Loop over each tile (spatial subdivision of the image)
-            for tile in tqdm(tiles, desc="Processing tiles", leave=False):
-                tile = int(tile)
-            
-                for channel in missing_channels_by_tile.get(tile, []):  # only missing channels (safe)
-                    channel = int(channel)
-            
-                    print(f"\033[90m[\033[96mCycle {cycle}\033[90m] Tile {tile}, Channel {channel}...\033[0m")
-                    tile_channel_start = time.time()
-            
-                    output_file_path = (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
+                print("Single tile imaging." if n_tiles == 1 else f"Number of tiles to process: {n_tiles}")
         
-                    # Skip processing if output file already exists
-                    if output_file_path.exists():
-                        print(f"File {output_file_path} already exists. Skipping.")
-                        continue
+                # Prepare directory to save stacked images
+                safe_mkdir(stacked_directory)
         
-                    # Load stacked images depending on mode
-                    if mode in ('tif_autosaved', 'tif_exported'):
-
-                        channel_files = tile_channel_files.get((tile, channel), [])
-                        stacked_images = np.stack([tifffile.imread(f) for f in channel_files])
-                    elif mode == 'lif':
-                        # For lif files, iterate through z-planes in the tile and channel
-                        z_planes = [np.array(z_frame) for z_frame in image.get_iter_z(m=tile, c=channel)]
-                        stacked_images = np.stack(z_planes, axis=0)
-                    
-                    elif mode == 'czi':
-                        dim_sizes = dict(zip(czi.dims, czi.size))
-                        max_Z = dim_sizes.get("Z", 1)
-                    
-                        z_planes = []
-                        for z in range(max_Z):
-                            try:
-                                # Build safe kwargs — only include dimensions that exist
-                                kwargs = {"Z": int(z)}
-                                if "S" in dim_sizes:
-                                    kwargs["S"] = int(region_index)
-                                if "M" in dim_sizes:
-                                    kwargs["M"] = int(tile)
-                                if "C" in dim_sizes:
-                                    kwargs["C"] = int(channel)
-                                if "B" in dim_sizes:
-                                    kwargs["B"] = 0  # base resolution if pyramid exists
-                    
-                                # Keep only valid keys that appear in czi.dims
-                                kwargs = {k: v for k, v in kwargs.items() if k in czi.dims}
-                    
-                                # Try reading — if overspecified, drop S and retry
-                                try:
-                                    img, shp = czi.read_image(**kwargs)
-                                except Exception as e:
-                                    if "S value" in str(e):
-                                        kwargs.pop("S", None)
-                                        img, shp = czi.read_image(**kwargs)
-                                    else:
-                                        raise
-                    
-                                z_planes.append(img.squeeze())
-                    
-                            except RuntimeError as e:
-                                if "Not enough data read" in str(e):
-                                    print(f"[WARN] Missing plane at Tile {tile}, Channel {channel}, Z {z}. Using {len(z_planes)} planes.")
-                                    break
-                                raise
-                    
-                        if not z_planes:
-                            print(f"[WARN] No Z planes for Tile {tile}, Channel {channel} (Cycle {cycle}). Skipping.")
+                # Loop over each tile (spatial subdivision of the image)
+                for tile in tqdm(tiles, desc="Processing tiles", leave=False):
+                    tile = int(tile)
+                
+                    for channel in missing_channels_by_tile.get(tile, []):  # only missing channels (safe)
+                        channel = int(channel)
+                
+                        print(f"\033[90m[\033[96mCycle {cycle}\033[90m] Tile {tile}, Channel {channel}...\033[0m")
+                        tile_channel_start = time.time()
+                
+                        output_file_path = (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
+            
+                        # Skip processing if output file already exists
+                        if file_exists_and_valid(output_file_path, min_size=1024):
+                            # (optional) keep your message if you want
+                            # print(f"Valid output exists: {output_file_path}. Skipping.")
                             continue
-                    
-                        stacked_images = np.stack(z_planes, axis=0)  # (Z_actual, Y, X)
 
 
-                    elif mode == 'nd2':
-                        # ND2 array has shape (M, Z, C, Y, X)
-                        # Select one tile (M), all Z, one channel (C), full XY
-                        stacked_images = arr[int(tile), :, int(channel), :, :]
-
-        
-                    # Deconvolution with RedLionFish method
-                    if deconvolution_method == 'redlionfish':
-                        deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=num_iterations)
-                        # Save max projection if MIP requested, otherwise full stack
-                        processed_img = np.max(deconvolved_images, axis=0).astype('uint16') if mip else deconvolved_images.astype('uint16')
-                        tifffile.imwrite(output_file_path, processed_img)
-                        print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
-                        
-        
-                    # Deconvolution with Deconwolf method
-                    elif deconvolution_method == 'deconwolf':
-                        # Create temporary directory for Deconwolf input
-                        dw_input_directory = cycle_directory / 'deconwolf input tmp'
-                        dw_input_directory.mkdir(parents=True, exist_ok=True)
-                        
-                        dw_input_path = dw_input_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
-                        tifffile.imwrite(dw_input_path, stacked_images)    # Write input stack for Deconwolf
-                        
-                        dw_output_path = stacked_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
-        
-                        # Run Deconwolf deconvolution externally
-                        deconvolve_image(
-                            input_image=dw_input_path,
-                            psf_image=psf_dict[str(channel)],
-                            output_image=dw_output_path,
-                            iterations=20,
-                            tilesize=chunk_size)
-        
-                        # If MIP requested, generate max projection from deconvolved images and save
-                        if mip:
-                            deconvolved_images = tifffile.imread(dw_output_path)
-                            mipped_img = np.max(deconvolved_images, axis=0).astype('uint16')
-                            tifffile.imwrite(output_file_path, mipped_img)
-                            print(f"Mipped images saved in directory: {mipped_directory}")
-                            
-                        else:
-                            print(f"Stacked files saved in directory: {stacked_directory}")
-        
-                        # Remove temporary Deconwolf input directory after processing
-                        if dw_input_directory.exists():
-                            shutil.rmtree(dw_input_directory)
-                            print(f"Deleted directory: {dw_input_directory}")
-        
-                    # No deconvolution, just save max projection or stack
-                    elif deconvolution_method is None:
-                        processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
-                        tifffile.imwrite(output_file_path, processed_img)
-                        print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
+                        stacked_images = handler.read_stack(ctx, tile=tile, channel=channel)
     
+                        if stacked_images.ndim != 3:
+                            raise ValueError(
+                                f"Expected (Z,Y,X) stack, got shape {stacked_images.shape} "
+                                f"for mode={mode}, tile={tile}, channel={channel}"
+                            )
+                        if stacked_images.dtype != np.uint16:
+                            stacked_images = stacked_images.astype(np.uint16, copy=False)
     
-                    tile_channel_end = time.time()
-                    print(f"\033[1;37m[Timing] Full deconvolution/mipping cycle for Tile {tile}, Channel {channel} took {tile_channel_end - tile_channel_start:.2f} seconds\033[0m")
             
-            # After all tiles and channels are done
-            if mip and stacked_directory.exists():
-                shutil.rmtree(stacked_directory)
-                print(f"Deleted stacked directory: {stacked_directory}")
-    
+                        # Deconvolution with RedLionFish method
+                        if deconvolution_method == 'redlionfish':
+                            deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=num_iterations)
+                            # Save max projection if MIP requested, otherwise full stack
+                            if mip:
+                                processed_img = to_uint16_safe(
+                                    np.max(deconvolved_images, axis=0),
+                                    context=f"tile={tile} ch={channel}",
+                                )
+                            else:
+                                processed_img = to_uint16_safe(
+                                    deconvolved_images,
+                                    context=f"tile={tile} ch={channel}",
+                                )
+                            tifffile.imwrite(output_file_path, processed_img)
+                            print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
+                            
+            
+                        # Deconvolution with Deconwolf method
+                        elif deconvolution_method == 'deconwolf':
+                            # Create temporary directory for Deconwolf input
+                            dw_input_directory = cycle_directory / 'deconwolf_input_tmp'
+                            safe_mkdir(dw_input_directory)
+                            
+                            dw_input_path = dw_input_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
+                            tifffile.imwrite(dw_input_path, stacked_images)    # Write input stack for Deconwolf
+                            
+                            dw_output_path = stacked_directory / f'Cycle{cycle}_s{tile}_ch{channel}.tif'
+            
+                            # Run Deconwolf deconvolution externally
+                            deconvolve_image(
+                                input_image=dw_input_path,
+                                psf_image=psf_dict[str(channel)],
+                                output_image=dw_output_path,
+                                iterations=int(num_iterations),
+                                tilesize=chunk_size)
+            
+                            # If MIP requested, generate max projection from deconvolved images and save
+                            if mip:
+                                deconvolved_images = tifffile.imread(dw_output_path)
+                                mipped_img = np.max(deconvolved_images, axis=0).astype('uint16')
+                                tifffile.imwrite(output_file_path, mipped_img)
+                                print(f"Mipped images saved in directory: {mipped_directory}")
+                                
+                            else:
+                                print(f"Stacked files saved in directory: {stacked_directory}")
+            
+                            # Remove temporary Deconwolf input directory after processing
+                            if dw_input_directory.exists():
+                                shutil.rmtree(dw_input_directory)
+                                print(f"Deleted directory: {dw_input_directory}")
+            
+                        # No deconvolution, just save max projection or stack
+                        elif deconvolution_method is None:
+                            processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
+                            tifffile.imwrite(output_file_path, processed_img)
+                            print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
+        
+        
+                        tile_channel_end = time.time()
+                        print(f"\033[1;37m[Timing] Full deconvolution/mipping cycle for Tile {tile}, Channel {channel} took {tile_channel_end - tile_channel_start:.2f} seconds\033[0m")
+                
+                # After all tiles and channels are done
+                if mip and stacked_directory.exists():
+                    shutil.rmtree(stacked_directory)
+                    print(f"Deleted stacked directory: {stacked_directory}")
+
+            finally:
+                # cleanup
+                if ctx is not None:
+                    handler.close_region(ctx)
+    # NOTE: region_directories are identical across cycles (R1, R2, ...),
     print("\n🔹 region_directories:\n", region_directories)
     
     return region_directories
@@ -1765,256 +4527,364 @@ def deconvolve_and_mip(
 
 
 
-def mipped_to_OME_tiffs(region_directories, cycles, pixel_to_um=None):
-    """
-    Convert per-tile MIPs into an OME-TIFF with spatial metadata.
-    Assumes metadata Tile positions (PosX/PosY) are already in microns.
-    No unit detection or scaling is performed here; we only read/choose pixel size.
-    """
+# ======================================================================================
+# OME-TIFF conversion (reads TileScanInfo written above; assumes positions already µm)
+# ======================================================================================
 
+def mipped_to_OME_tiffs(
+    region_directories: List[str],
+    cycles: List[int],
+    pixel_to_um: Optional[float] = None,
+) -> None:
+    """
+    Convert per-tile MIPs to OME-TIFF with spatial Plane PositionX/PositionY (µm).
+
+    Key behaviors
+    -------------
+    - Reads TileScanInfo XML written earlier (positions already in µm).
+    - Writes one OME-TIFF per (region, cycle): Cycle{cycle}.ome.tiff
+    - **No guessing** tile ordering:
+        1) Prefer TileIndex mapping (best; deterministic)
+        2) Else fall back to FieldX mapping ONLY if it matches on-disk tile ids
+        3) Else skip (to avoid wrong order)
+      Positions are normalized so min(X)=min(Y)=0.
+    - ND2 fix: if TileScanInfo/Application indicates NIS-Elements (ND2 path), we flip X
+      (PositionX -> -PositionX) to match the microscope coordinate handedness you observed.
+      This is controlled by FlipX/FlipY attributes if present; otherwise inferred from Application.
+    - Pixel size:
+        Prefer PixelSizeUm stored in XML, else fall back to pixel_to_um argument.
+    - Writes an optional coords CSV for debugging.
+    """
     print("\033[1;96mConverting to OME-TIFFs\033[0m")
 
+    # ==================================================================================
+    # Helper: read PixelSizeUm from TileScanInfo if present
+    # ==================================================================================
+    def _get_pixel_size_um_from_xml(att: Optional[ET.Element]) -> Optional[float]:
+        if att is None:
+            return None
+        raw_px = (att.attrib.get("PixelSizeUm") or "").strip()
+        if not raw_px:
+            return None
+        try:
+            return float(re.sub(r"[^\d.,+\-eE]", "", raw_px).replace(",", "."))
+        except Exception:
+            return None
+
+    # ==================================================================================
+    # Helper: find Tile nodes robustly under TileScanInfo
+    # ==================================================================================
+    def _find_tilescan_tiles(root: ET.Element) -> List[ET.Element]:
+        tiles = root.findall(".//Attachment[@Name='TileScanInfo']//Tile")
+        if tiles:
+            return tiles
+        return root.findall(".//Tile")
+
+    # ==================================================================================
+    # Helper: determine if we should flip coordinates (ND2 / NIS-Elements handedness)
+    # ==================================================================================
+    def _get_flip_flags(att: Optional[ET.Element]) -> Tuple[bool, bool]:
+        """
+        Returns (flip_x, flip_y).
+        Priority:
+          1) explicit FlipX/FlipY attributes on TileScanInfo
+          2) infer from Application == NIS-Elements
+        """
+        flip_x = False
+        flip_y = False
+
+        if att is not None:
+            fx = (att.attrib.get("FlipX", "") or "").strip()
+            fy = (att.attrib.get("FlipY", "") or "").strip()
+
+            if fx in ("1", "true", "True", "YES", "yes"):
+                flip_x = True
+            if fy in ("1", "true", "True", "YES", "yes"):
+                flip_y = True
+
+            if fx == "" and fy == "":
+                app = (att.attrib.get("Application", "") or "").strip().lower()
+                if app == "nis-elements":
+                    # Your plots show (-x, y) is the correct orientation for ND2.
+                    flip_x = True
+
+        return flip_x, flip_y
+
+    # ==================================================================================
+    # Helper: read TileScanInfo positions keyed by tile id (TileIndex)
+    # ==================================================================================
+    def _positions_um_by_tile_from_tilescaninfo(
+        tile_nodes: List[ET.Element],
+        tiles_from_files: List[int],
+    ) -> Tuple[Dict[int, Tuple[float, float]], str]:
+        """
+        Returns (pos_by_tile, source) using ONLY TileIndex.
+    
+        If TileIndex doesn't overlap with on-disk tile ids, returns ({}, "none").
+        """
+        tiles_set = set(tiles_from_files)
+    
+        pos_by_index: Dict[int, Tuple[float, float]] = {}
+        saw_any = False
+        for n in tile_nodes:
+            ti = n.attrib.get("TileIndex", None)
+            if ti is None:
+                continue
+            saw_any = True
+            try:
+                tid = int(ti)
+                pos_by_index[tid] = (float(n.attrib["PosX"]), float(n.attrib["PosY"]))
+            except Exception:
+                continue
+    
+        if saw_any:
+            overlap = tiles_set.intersection(pos_by_index.keys())
+            if overlap:
+                return pos_by_index, "TileIndex"
+    
+        return {}, "none"
+
+
+    # ==================================================================================
+    # Main loop
+    # ==================================================================================
     for cycle in cycles:
         print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
 
         for region_directory in region_directories:
-            region_suffix = region_directory[-2:]
-            if re.match(r"R\d+", region_suffix):
-                print(f"\033[1mProcessing {region_suffix}\033[0m")
-
             region_directory = Path(region_directory)
-            cycle_directory    = region_directory / 'preprocessing' / f'Cycle{cycle}'
-            mipped_directory   = cycle_directory / '1_mipped'
-            ome_tiff_directory = cycle_directory / '2_ome_tiffs'
-            ome_tiff_path      = ome_tiff_directory / f'Cycle{cycle}.ome.tiff'
-            metadata_directory = cycle_directory / 'MetaData'
+            cycle_directory = region_directory / "preprocessing" / f"Cycle{cycle}"
 
-            ome_tiff_directory.mkdir(parents=True, exist_ok=True)
+            # Input MIPs
+            mipped_directory = cycle_directory / "1_mipped"
 
+            # Output OME-TIFF
+            ome_tiff_directory = safe_mkdir(cycle_directory / "2_ome_tiffs")
+            ome_tiff_path = ome_tiff_directory / f"Cycle{cycle}.ome.tiff"
+
+            # XML metadata folder
+            metadata_directory = cycle_directory / "MetaData"
+
+            # ----------------------------------------------------------------------
+            # STEP 0 — Skip if already converted
+            # ----------------------------------------------------------------------
             if ome_tiff_path.exists():
-                print(f"OME-TIFF already exists: {ome_tiff_path}. Skipping.")
+                print(f"OME-TIFF exists: {ome_tiff_path}. Skipping.")
                 continue
 
-            tif_files = list(mipped_directory.glob('*.tif'))
+            # ----------------------------------------------------------------------
+            # STEP 1 — Gather per-tile MIP files
+            # ----------------------------------------------------------------------
+            tif_files = natsorted(list(mipped_directory.glob("*.tif")))
             if not tif_files:
-                print(f"No TIFF files found in {mipped_directory}. Skipping.")
+                print(f"No .tif files in {mipped_directory}. Skipping.")
                 continue
 
             # Build file index: tile -> channel -> path
-            file_index = defaultdict(dict)
+            file_index: Dict[int, Dict[int, Path]] = defaultdict(dict)
             for f in tif_files:
-                m = re.search(r'_s0*(\d+)_ch0*(\d+)', f.name, re.IGNORECASE)
+                m = re.search(r"_s0*(\d+)_ch0*(\d+)", f.name, re.IGNORECASE)
                 if m:
                     tile, channel = map(int, m.groups())
                     file_index[tile][channel] = f
 
-
-            tiles = sorted(file_index.keys(), key=int)
-            channels = sorted({ch for chs in file_index.values() for ch in chs}, key=int)
-            if not channels:
-                print(f"[WARN] No channels found in {mipped_directory}. Check filename pattern.")
+            tiles_from_files = sorted(file_index.keys())
+            channels = sorted({ch for d in file_index.values() for ch in d.keys()})
+            if not channels or not tiles_from_files:
+                print("{BOLD}[WARN]⚠️ {RESET} Could not infer tiles/channels from filenames. Skipping.")
                 continue
 
-            # ----- Load positions (already µm) -----
-            md_candidates = sorted(metadata_directory.glob('*.xml'))
-            if not md_candidates:
-                print(f"No metadata found in {metadata_directory}. Skipping.")
-                continue
+            print(
+                f"[INFO] Found {len(tiles_from_files)} tile(s) on disk "
+                f"for Cycle {cycle}, region '{region_directory.name}'."
+            )
 
-            # Prefer a file whose stem matches the region token in the image filenames (e.g., "Region1_*")
-            region_token = None
-            if tiles:
-                any_tile_any_ch = next(iter(file_index[tiles[0]].values()))
-                region_token = any_tile_any_ch.stem.split('_')[0]  # ".../MyRegion_s0_ch0.tif" → "MyRegion"
-            md_file = next((p for p in md_candidates if region_token and region_token in p.stem), md_candidates[0])
+
+            # ----------------------------------------------------------------------
+            # STEP 2 — Load TileScanInfo XML (prefer region_id.xml)
+            # ----------------------------------------------------------------------
+            region_id = region_directory.name
+            preferred = metadata_directory / f"{region_id}.xml"
+            md_candidates = sorted(metadata_directory.glob("*.xml"))
+
+            if preferred.exists():
+                md_file = preferred
+            elif md_candidates:
+                md_file = md_candidates[0]
+                print(f"{BOLD}[WARN]⚠️ {RESET} Preferred XML missing; using {md_file.name}")
+            else:
+                print(f"No XML metadata in {metadata_directory}. Skipping.")
+                continue
 
             try:
                 root = ET.parse(md_file).getroot()
             except Exception as e:
-                print(f"[WARN] Could not parse XML {md_file.name}: {e}. Skipping.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} Failed to parse {md_file}: {e}. Skipping.")
                 continue
 
             att = root.find(".//Attachment[@Name='TileScanInfo']")
-            unit_attr = (att.attrib.get("Unit") if att is not None else None)
-            if unit_attr and unit_attr.lower() not in ("µm", "um", "micron", "microns", "micron(s)", "micrometer", "micrometers"):
-                print(f"[WARN] Metadata Unit='{unit_attr}' but this function assumes microns. Proceeding as µm.")
-
-            # --- Read pixel size (µm/px) from XML if available (or compute from TileWidthUm/TileWidthPx) ---
-            pixel_to_um_from_xml = None
-            pixel_source = None
-            if att is not None:
-                raw_px = (att.attrib.get("PixelSizeUm") or "").strip()
-                if raw_px:
-                    cleaned = re.sub(r"[^\d.,+\-eE]", "", raw_px).replace(",", ".")
-                    try:
-                        pixel_to_um_from_xml = float(cleaned)
-                        pixel_source = "XML"
-                        print(f"[META] Pixel size read from XML: {pixel_to_um_from_xml:.6f} µm/px")
-                    except Exception:
-                        print(f"[WARN] Could not parse PixelSizeUm='{raw_px}' in {md_file.name}")
-                        pixel_to_um_from_xml = None
-
-                # Fallback: compute from TileWidthUm/TileWidthPx if present
-                if pixel_to_um_from_xml is None:
-                    tpx = att.attrib.get("TileWidthPx")
-                    tum = att.attrib.get("TileWidthUm")
-                    if tpx and tum:
-                        try:
-                            tpx_i = int(re.sub(r"[^\d]", "", tpx))
-                            tum_f = float(re.sub(r"[^\d.,+\-eE]", "", tum).replace(",", "."))
-                            if tpx_i > 0:
-                                pixel_to_um_from_xml = tum_f / tpx_i
-                                pixel_source = "XML (TileWidthUm/TileWidthPx)"
-                                print(f"[META] Pixel size computed from XML widths: {pixel_to_um_from_xml:.6f} µm/px")
-                        except Exception:
-                            pass
-
-            # Choose effective pixel_to_um: XML > argument
-            effective_pixel_to_um = None
-            if pixel_to_um_from_xml is not None:
-                effective_pixel_to_um = pixel_to_um_from_xml
-                source = pixel_source or "XML"
-            elif pixel_to_um is not None:
-                effective_pixel_to_um = float(pixel_to_um)
-                source = "argument"
-            else:
-                source = None
-
-            if source:
-                print(f"[META] Using PixelSizeUm from {source}: {effective_pixel_to_um:.6f} µm/px")
-            else:
-                print("[WARN] No pixel size available (XML/argument). Overlap estimation and OME scale will be omitted.")
-
-            # Sort tiles by FieldY then FieldX (raster order)
-            tile_nodes = root.findall(".//Tile")
+            tile_nodes = _find_tilescan_tiles(root)
             if not tile_nodes:
-                print(f"[WARN] No <Tile> elements found in {md_file.name}. Skipping.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} No <Tile> positions in {md_file.name}. Skipping.")
                 continue
 
-            tile_nodes_sorted = sorted(
-                tile_nodes,
-                key=lambda e: (int(e.attrib.get("FieldY", "0")), int(e.attrib.get("FieldX", "0")))
+            flip_x, flip_y = _get_flip_flags(att)
+            if flip_x or flip_y:
+                print(f"[META] Applying coordinate flip(s): FlipX={int(flip_x)} FlipY={int(flip_y)}")
+
+            # ----------------------------------------------------------------------
+            # STEP 3 — Decide effective pixel size (µm/px): XML > argument
+            # ----------------------------------------------------------------------
+            px_from_xml = _get_pixel_size_um_from_xml(att)
+            effective_px = px_from_xml if px_from_xml is not None else (
+                float(pixel_to_um) if pixel_to_um is not None else None
             )
 
-            # Positions (normalize origin to 0,0)
-            try:
-                x_um_raw = np.array([float(n.attrib['PosX']) for n in tile_nodes_sorted], dtype=float)
-                y_um_raw = np.array([float(n.attrib['PosY']) for n in tile_nodes_sorted], dtype=float)
-            except Exception as e:
-                print(f"[WARN] Malformed <Tile> positions in {md_file.name}: {e}. Skipping.")
+            if effective_px is None:
+                print(
+                    "{BOLD}[WARN]⚠️ {RESET} No pixel size available (neither XML PixelSizeUm nor pixel_to_um arg). "
+                    "OME will be written without PhysicalSizeX/Y."
+                )
+            else:
+                print(
+                    f"[META] Using pixel size: {effective_px:.10f} µm/px "
+                    f"({'XML' if px_from_xml is not None else 'argument'})"
+                )
+
+            # ----------------------------------------------------------------------
+            # STEP 4 — Map XML positions to filename tile ids (NO sorting fallback)
+            # ----------------------------------------------------------------------
+            # TileIndex is an *identity key*, not an ordering.
+            #
+            # We ONLY join by:
+            #   filename tile id (from CycleX_s{tile}_ch{ch}.tif)
+            #        <->  XML TileIndex
+            #        <->  (PosX, PosY) in microns
+            #
+            # Spatial layout is determined by (PosX, PosY) — NOT by TileIndex order and
+            # NOT by FieldX/FieldY. This avoids “guessing” and stays correct for snake,
+            # non-raster, or irregular acquisitions.
+            #
+            # If the TileIndex mapping is missing/inconsistent, we fail fast rather than
+            # silently writing a wrong mosaic.
+            # ----------------------------------------------------------------------
+            
+            pos_um_by_tile, pos_source = _positions_um_by_tile_from_tilescaninfo(tile_nodes, tiles_from_files)
+            if not pos_um_by_tile:
+                print(
+                    "[ERROR] TileScanInfo has no usable TileIndex mapping to file tile ids. "
+                    "Skipping OME-TIFF to avoid wrong tile placement."
+                )
                 continue
+            
+            print(f"[META] Position mapping source: {pos_source}")
+            
+            # Report tile counts: on-disk vs XML-declared
+            tiles_from_xml = sorted(pos_um_by_tile.keys())
+            tiles_on_disk = sorted(tiles_from_files)
+            
+            print(f"[INFO] Tiles on disk: {len(tiles_on_disk)}")
+            print(f"[INFO] Tiles declared in XML: {len(tiles_from_xml)}")
+            
+            # XML tiles missing on disk → will show as black/empty areas in mosaic viewers
+            missing_on_disk = [t for t in tiles_from_xml if t not in set(tiles_on_disk)]
+            if missing_on_disk:
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} XML declares {len(missing_on_disk)} tile(s) that do not exist on disk. "
+                    f"Viewers may show these as black/empty regions. "
+                    f"Example missing: {missing_on_disk[:10]}{'...' if len(missing_on_disk) > 10 else ''}"
+                )
+            
+            # On-disk tiles missing in XML → cannot place them, so we skip them
+            missing_in_xml = [t for t in tiles_on_disk if t not in pos_um_by_tile]
+            if missing_in_xml:
+                print(
+                    f"{BOLD}[WARN]⚠️ {RESET} XML missing positions for {len(missing_in_xml)} on-disk tile(s); "
+                    f"these will be skipped. "
+                    f"Example missing: {missing_in_xml[:10]}{'...' if len(missing_in_xml) > 10 else ''}"
+                )
+            
+            # Keep on-disk tile id ordering, but only for tiles we can position
+            tiles_aligned = [t for t in tiles_on_disk if t in pos_um_by_tile]
+            if not tiles_aligned:
+                print("{BOLD}[WARN]⚠️ {RESET} No overlapping tiles between files and XML positions. Skipping.")
+                continue
+            
+            print(
+                f"[INFO] Will write {len(tiles_aligned)} tile(s) to OME-TIFF "
+                f"(intersection of disk ∩ XML)."
+            )
+            
+            x_um_raw = np.array([pos_um_by_tile[t][0] for t in tiles_aligned], dtype=float)
+            y_um_raw = np.array([pos_um_by_tile[t][1] for t in tiles_aligned], dtype=float)
 
-            x_um = x_um_raw - x_um_raw.min() if x_um_raw.size else x_um_raw
-            y_um = y_um_raw - y_um_raw.min() if y_um_raw.size else y_um_raw
+            # Apply ND2 flips BEFORE normalization (equivalent after, but clearer)
+            if flip_x:
+                x_um_raw = -x_um_raw
+            if flip_y:
+                y_um_raw = -y_um_raw
 
-            # Sanity: counts match?
-            if len(x_um) != len(tiles):
-                print(f"[WARN] Tile count mismatch: metadata has {len(x_um)} tiles, files show {len(tiles)} tiles.")
-                n = min(len(x_um), len(tiles))
-                x_um = x_um[:n]; y_um = y_um[:n]; tiles = tiles[:n]
+            # Normalize origin AFTER alignment (so x/y correspond to same tile ids)
+            x_um = x_um_raw - float(np.min(x_um_raw))
+            y_um = y_um_raw - float(np.min(y_um_raw))
 
-            # Image size (from any file)
-            first_tile_dict = next(iter(file_index.values()))
-            first_img_path  = next(iter(first_tile_dict.values()))
+            # Optional coord CSV for debugging
+            if effective_px is not None:
+                x_px = x_um / float(effective_px)
+                y_px = y_um / float(effective_px)
+                pd.DataFrame(
+                    {"tile": tiles_aligned, "x_um": x_um, "y_um": y_um, "x_px": x_px, "y_px": y_px}
+                ).to_csv(
+                    ome_tiff_directory / f"Cycle{cycle}_coords.csv",
+                    index=False,
+                )
+
+            # ----------------------------------------------------------------------
+            # STEP 5 — Read one tile to determine image dimensions
+            # ----------------------------------------------------------------------
+            first_tile = tiles_aligned[0]
+            first_ch = channels[0]
+            first_img_path = file_index[first_tile][first_ch]
             try:
                 height_px, width_px = tifffile.imread(first_img_path).shape
             except Exception as e:
-                print(f"[WARN] Could not read image to get dimensions ({first_img_path}): {e}. Skipping.")
+                print(f"{BOLD}[WARN]⚠️ {RESET} Could not read {first_img_path} for dims: {e}. Skipping.")
                 continue
 
-            # Tile width in µm if we have pixel size
-            tile_width_um = None
-            if effective_pixel_to_um is not None:
-                tile_width_um = width_px * float(effective_pixel_to_um)
-
-            # --- Robust overlap estimation (median of valid tile steps) ---
-            def robust_step(vals_um, expected_width_um):
-                """Estimate spacing using robust filtering near the expected width."""
-                if vals_um is None or len(vals_um) < 2:
-                    return None
-                u = np.unique(np.round(vals_um, 9))
-                if u.size < 2:
-                    return None
-                d = np.diff(np.sort(u))
-                d = d[d > 0]
-                if d.size == 0:
-                    return None
-                if expected_width_um:
-                    lo, hi = 0.5 * expected_width_um, 1.2 * expected_width_um
-                    band = d[(d >= lo) & (d <= hi)]
-                    if band.size == 0:
-                        # fallback: largest 30% of steps
-                        k = max(1, int(0.3 * d.size))
-                        band = np.sort(d)[-k:]
-                    return float(np.median(band))
-                # no expected width: fall back to the median of the largest 30% of steps
-                k = max(1, int(0.3 * d.size))
-                return float(np.median(np.sort(d)[-k:]))
-
-            def ov_pct(step_um, width_um):
-                if step_um is None or not width_um:
-                    return None
-                return (1.0 - step_um / width_um) * 100.0
-
-            dx = robust_step(x_um, tile_width_um)
-            dy = robust_step(y_um, tile_width_um)
-
-            if effective_pixel_to_um is not None:
-                if dx is not None:
-                    ovx = ov_pct(dx, tile_width_um)
-                    print(f"[INFO] Tile spacing X≈{dx:.2f} µm; est width≈{tile_width_um:.2f} µm → overlap≈{ovx:.1f}%")
-                if dy is not None:
-                    ovy = ov_pct(dy, tile_width_um)
-                    print(f"[INFO] Tile spacing Y≈{dy:.2f} µm; est width≈{tile_width_um:.2f} µm → overlap≈{ovy:.1f}%")
-            else:
-                if dx is not None:
-                    print(f"[INFO] Tile spacing X≈{dx:.2f} µm (pixel size unknown)")
-                if dy is not None:
-                    print(f"[INFO] Tile spacing Y≈{dy:.2f} µm (pixel size unknown)")
-
-            # Optional: write pixel-grid indices (debug) if we know pixel size
-            if effective_pixel_to_um is not None:
-                x_idx = (x_um / float(effective_pixel_to_um))
-                y_idx = (y_um / float(effective_pixel_to_um))
-                pd.DataFrame({'x': x_idx, 'y': y_idx}).to_csv(
-                    ome_tiff_directory / f'Cycle{cycle}_coords.csv', index=False
-                )
-
-            # ----- Write OME-TIFF -----
+            # ----------------------------------------------------------------------
+            # STEP 6 — Write OME-TIFF (T tiles, C channels per tile)
+            # ----------------------------------------------------------------------
             with tifffile.TiffWriter(ome_tiff_path, bigtiff=True, ome=True) as tif:
-                for tile_idx, tile in enumerate(tiles):
+                for i, tile_id in enumerate(tiles_aligned):
                     image_stack = np.empty((len(channels), height_px, width_px), dtype=np.uint16)
 
                     for ci, ch in enumerate(channels):
                         try:
-                            image_stack[ci] = tifffile.imread(file_index[tile][ch]).astype(np.uint16)
-                        except Exception as e:
-                            print(f"[WARN] Tile {tile}, Channel {ch} missing or unreadable: {e}")
+                            image_stack[ci] = tifffile.imread(file_index[tile_id][ch]).astype(np.uint16)
+                        except Exception:
                             image_stack[ci] = np.zeros((height_px, width_px), dtype=np.uint16)
 
-                    posX_um = float(x_um[tile_idx]) if tile_idx < len(x_um) else 0.0
-                    posY_um = float(y_um[tile_idx]) if tile_idx < len(y_um) else 0.0
+                    posX_um = float(x_um[i])
+                    posY_um = float(y_um[i])
 
-                    # Build OME metadata
+                    # Pixels metadata (physical size)
                     pixels_md = {}
-                    if effective_pixel_to_um is not None:
+                    if effective_px is not None:
                         pixels_md = {
-                            'PhysicalSizeX': float(effective_pixel_to_um),
-                            'PhysicalSizeXUnit': 'µm',
-                            'PhysicalSizeY': float(effective_pixel_to_um),
-                            'PhysicalSizeYUnit': 'µm',
+                            "PhysicalSizeX": float(effective_px), "PhysicalSizeXUnit": "µm",
+                            "PhysicalSizeY": float(effective_px), "PhysicalSizeYUnit": "µm",
                         }
 
+                    # Plane metadata (position per channel plane)
                     plane_md = {
-                        'PositionX': [posX_um] * len(channels),
-                        'PositionY': [posY_um] * len(channels)
+                        "PositionX": [posX_um] * len(channels),
+                        "PositionY": [posY_um] * len(channels),
                     }
 
-                    metadata = {'Pixels': pixels_md, 'Plane': plane_md} if pixels_md else {'Plane': plane_md}
+                    metadata = {"Pixels": pixels_md, "Plane": plane_md} if pixels_md else {"Plane": plane_md}
                     tif.write(image_stack, metadata=metadata)
 
             print(f"[DONE] Wrote OME-TIFF: {ome_tiff_path}")
-#---------
 
 
 def align_and_stitch(
@@ -2060,70 +4930,108 @@ def align_and_stitch(
 
     print("\033[1;96mAligning and stitching tiles\033[0m")
     print("\033[1mProcessing all cycles \033[0m")
+    
+    import ashlar.scripts.ashlar as ashlar
     ashlar.configure_terminal()
 
     maximum_shift=200
     filter_sigma=3
     
     for region_directory in region_directories:
-        region_suffix = region_directory[-2:]
-        if re.match(r"R\d+", region_suffix):
-            print(f"\033[1mProcessing {region_suffix}\033[0m")
-        
+
         region_directory = Path(region_directory)
+        region_suffix = region_directory.name  # e.g. "R1", "R10"
+        
+        if re.match(r"^R\d+$", region_suffix):
+            print(f"\033[1mProcessing {region_suffix}\033[0m")            
 
         # --- STEP 1: Make directories for each cycle ---
         for cycle in cycles:
             cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
             ome_tiff_directory = cycle_directory / '2_ome_tiffs'
             stitched_directory = cycle_directory / '3_stitched'
-            stitched_directory.mkdir(exist_ok=True)
+            safe_mkdir(stitched_directory)
 
-        # --- STEP 2: Collect OME-TIFFs and validate cycles ---
-        ome_tiffs = natsorted([
-            f for f in (region_directory / "preprocessing").rglob("*.ome.tiff")
+        # --- STEP 2: Build OME-TIFF inputs in the EXACT requested cycles order ---
+        ome_tiffs: List[Path] = []
+        missing = []
+        
+        for cyc in cycles:
+            ome_path = (
+                region_directory
+                / "preprocessing"
+                / f"Cycle{cyc}"
+                / "2_ome_tiffs"
+                / f"Cycle{cyc}.ome.tiff"
+            )
+            if not ome_path.exists():
+                missing.append(str(ome_path))
+            else:
+                ome_tiffs.append(ome_path)
+        
+        if missing:
+            raise RuntimeError(
+                "Missing OME-TIFF(s) for requested cycles. Expected these files:\n  - "
+                + "\n  - ".join(missing)
+            )
+        
+        print(f"Using OME-TIFF inputs (in cycles order): {cycles}")
+        # NOTE: This order defines Ashlar output indices Cycle0, Cycle1, ... (temporary outputs)
+
+        # --- PRECHECK: enforce full experiment cycle count before running Ashlar ---
+        # We intentionally do NOT allow Ashlar to run unless the dataset on disk contains
+        # the expected total number of cycles for this experiment (n_total_cycles).
+        # Earlier pipeline steps can run on subsets; alignment/stitching must not.
+        all_ome_tiffs = natsorted([
+            f for f in (region_directory / "preprocessing").rglob("2_ome_tiffs/*.ome.tiff")
         ])
         
-        # Extract cycle numbers from filenames like Cycle1_xxx.ome.tif
         found_cycles = sorted(set(
-            int(re.search(r"Cycle(\d+)", f.name).group(1))
-            for f in ome_tiffs if re.search(r"Cycle(\d+)", f.name)
+            int(m.group(1))
+            for f in all_ome_tiffs
+            for m in [re.search(r"Cycle(\d+)", f.name)]
+            if m
         ))
         
-        # Sanity check: must match the expected number of cycles
-        if len(found_cycles) != n_total_cycles:
-            print(f"Expected {n_total_cycles} cycles, but found {len(found_cycles)}: {found_cycles}")
+        if len(found_cycles) != int(n_total_cycles):
             raise RuntimeError(
-                f"Cycle mismatch. Expected {n_total_cycles} cycles, but found {found_cycles}."
+                f"[ERROR] Refusing to run Ashlar: expected n_total_cycles={n_total_cycles} "
+                f"but found {len(found_cycles)} cycle(s) on disk for {region_directory.name}: {found_cycles}. "
+                f"Generate OME-TIFFs for all cycles (or fix n_total_cycles) before stitching."
             )
-        else:
-            print(f"Found all {n_total_cycles} cycles: {found_cycles}")
 
 
 
-        # --- STEP 3: Define expected outputs ---
-        # Get number of channels from first OME-TIFF
-        with tifffile.TiffFile(ome_tiffs[0]) as tif:
-            n_channels = tif.series[0].shape[tif.series[0].axes.index('C')]
+        # --- STEP 3: Determine n_channels from the first input (safe: guaranteed exists now) ---
+        with tifffile.TiffFile(str(ome_tiffs[0])) as tif:
+            # axes like 'TCZYX' or similar; robustly find 'C'
+            axes = tif.series[0].axes
+            if "C" not in axes:
+                raise RuntimeError(f"OME-TIFF missing channel axis 'C': {ome_tiffs[0]}")
+            n_channels = int(tif.series[0].shape[axes.index("C")])
 
-       # Define the stitched output pattern as a format string
-        ashlar_filename_pattern = str(
-            region_directory / "preprocessing" / "Cycle{cycle}" / "3_stitched" / "Cycle{cycle}_ch{channel}.tif"
-        )
-        
-        # Build a list of expected outputs for all cycles + channels
+        # Validate align_channel
+        if not (0 <= int(align_channel) < int(n_channels)):
+            raise ValueError(
+                f"align_channel={align_channel} out of range for n_channels={n_channels} "
+                f"(valid: 0..{n_channels-1})"
+            )
+
+        # --- STEP 3.1: Define expected stitched outputs for requested cycles ---
         expected_outputs = [
-            Path(ashlar_filename_pattern.format(cycle=cyc, channel=ch))
+            Path(region_directory) / "preprocessing" / f"Cycle{cyc}" / "3_stitched" / f"Cycle{cyc}_ch{ch}.tif"
             for cyc in cycles
             for ch in range(n_channels)
         ]
 
-
-        # Skip only if *all* expected outputs exist
-        if all(p.exists() for p in expected_outputs):
-            print(f"Stitched images already exist for all {n_total_cycles} cycles. Skipping.")
-            continue
-       
+        # Skip only if *all* expected outputs exist AND are non-trivially sized (valid).
+        # This prevents skipping when a previous run left tiny/corrupted files behind.
+        if all(file_exists_and_valid(p, min_size=1024) for p in expected_outputs):
+            print(
+                f"Stitched images already exist (and look valid) for all requested cycles "
+                f"(cycles={len(cycles)}, channels={n_channels}). Skipping."
+            )
+            continue 
 
         # --- STEP 4: Validate Ashlar parameters ---
         # **Validate pyramid/tile size configuration**
@@ -2173,37 +5081,39 @@ def align_and_stitch(
         tmp_pattern = str(
             tmp_path / "Cycle{cycle}_ch{channel}.tif"
         )
-        Path(tmp_pattern).parent.mkdir(parents=True, exist_ok=True)
+        safe_mkdir(Path(tmp_pattern).parent)
     
-        # --- STEP 5: Run Ashlar ---
-        try:
-            ome_tiff_files = [str(f) for f in ome_tiffs]
-            if not ome_tiff_files:
-                raise RuntimeError("No OME-TIFF inputs found for this region.")
+        # --- STEP 5: Run Ashlar with inputs in the correct order ---
+        ome_tiff_files = [str(p) for p in ome_tiffs]
         
+        tmp_path = region_directory / "preprocessing" / "ashlar_tmp"
+        safe_mkdir(tmp_path)
+        
+        tmp_pattern = str(tmp_path / "Cycle{cycle}_ch{channel}.tif")
+        
+        try:
             if plates:
                 rc = ashlar.process_plates(
                     ome_tiff_files,
-                    None,                  # no base output dir
-                    tmp_pattern,           # full pattern string
+                    None,
+                    tmp_pattern,
                     flip_x, flip_y,
                     ffp_paths, dfp_paths,
-                    0.0,                   # ✅ barrel_correction explicitly included
+                    0.0,
                     aligner_args, mosaic_args,
                     pyramid, quiet
                 )
             else:
                 rc = ashlar.process_single(
                     ome_tiff_files,
-                    tmp_pattern,           # same pattern string
+                    tmp_pattern,
                     flip_x, flip_y,
                     ffp_paths, dfp_paths,
-                    0.0,                   # ✅ barrel_correction explicitly included
+                    0.0,
                     aligner_args, mosaic_args,
                     pyramid, quiet
                 )
         
-            # Optional: Check return code
             if rc not in (None, 0):
                 raise RuntimeError(f"Ashlar returned non-zero status code: {rc}")
         
@@ -2213,28 +5123,61 @@ def align_and_stitch(
         
         except Exception as e:
             ashlar.print_error(f"Unexpected error during Ashlar run: {e}")
-            continue
-        
-         
-        # --- STEP 6: Remap cycles provided by user ---
-        tmp_dir = Path(tmp_pattern).parent
+            continue  
+            
+        # --- STEP 6: Remap Ashlar temp cycle indices back onto REAL cycle numbers ---
+        #
+        # IMPORTANT ASSUMPTION (now enforced explicitly):
+        # Ashlar writes:
+        #   Cycle0_ch*, Cycle1_ch*, ...
+        # where the numeric index corresponds EXACTLY to the order of ome_tiff_files.
+        #
+        # In this pipeline:
+        #   ome_tiff_files are ordered to match `cycles`
+        # Therefore:
+        #   tmp Cycle{i}  →  real Cycle{cycles[i]}
+        #
+
+        tmp_path = Path(tmp_pattern).parent
+
+        # Sanity check: ensure all expected temp files exist BEFORE moving anything
+        expected_tmp = [
+            tmp_path / f"Cycle{cyc_idx}_ch{ch}.tif"
+            for cyc_idx in range(len(cycles))
+            for ch in range(n_channels)
+        ]
+
+        missing_tmp = [p for p in expected_tmp if not p.exists()]
+        if missing_tmp:
+            raise FileNotFoundError(
+                f"Ashlar temp output incomplete: missing {len(missing_tmp)} file(s). "
+                f"Example missing: {missing_tmp[:5]}"
+            )
+
+        # Now remap safely
         for cyc_idx, cyc in enumerate(cycles):
             stitched_dir = region_directory / "preprocessing" / f"Cycle{cyc}" / "3_stitched"
-            stitched_dir.mkdir(parents=True, exist_ok=True)
-
+            safe_mkdir(stitched_dir)
 
             for ch in range(n_channels):
-                tmp_file = tmp_dir / f"Cycle{cyc_idx}_ch{ch}.tif"
-                if not tmp_file.exists():
-                    raise FileNotFoundError(f"Expected {tmp_file} not found")
+                tmp_file = tmp_path / f"Cycle{cyc_idx}_ch{ch}.tif"
                 final_file = stitched_dir / f"Cycle{cyc}_ch{ch}.tif"
-                tmp_file.rename(final_file)
-        print(f"Moved stitched and aligned images from {tmp_path} → {stitched_dir}")
 
-        # Clean up temporary folder
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        
+                # Overwrite protection: warn but replace
+                if final_file.exists():
+                    print(f"{BOLD}[WARN]⚠️ {RESET} Overwriting existing stitched file: {final_file}")
+
+                tmp_file.replace(final_file)
+
+        print(
+            f"[INFO] Remapped Ashlar outputs: "
+            f"{len(cycles)} cycles × {n_channels} channels "
+            f"from {tmp_path} → region Cycle folders"
+        )
+
+        # Clean up temporary Ashlar directory
+        shutil.rmtree(tmp_path, ignore_errors=True)
+   
     
 def retile_stitched_images(
     region_directories,
@@ -2242,129 +5185,157 @@ def retile_stitched_images(
     tile_dimension=6000
 ):
     """
-    Tiles stitched .tif images from a directory and saves them with a specific naming convention.
+    Tiles stitched .tif images from each region/cycle and saves them with a naming convention:
+        Cycle{cycle}_s{tile_index}_ch{channel}.tif
 
-    Args:
-        region_directories (list of Path): List of region base directories.
-        cycle (int): Cycle number for naming.
-        tile_dimension (int): Tile dimension size. Default 6000.
+    Also writes a CSV of tile upper-left pixel coordinates (x,y) for the tiling grid.
 
-    Returns:
-        None. Saves tiled images and tile positions CSV.
+    Notes / assumptions
+    -------------------
+    - Input stitched images are 2D per channel (Y, X).
+    - All stitched channel images in a given (region, cycle) are the same shape.
+    - Output tile indices (s*) are per-channel (i.e. each channel gets s0..sN-1).
     """
+    def _import_cv2():
+        import cv2
+        return cv2
+        
+    cv2 = _import_cv2()
+
     print(f"\033[1;96mRetiling stitched images\033[0m")
 
     for cycle in cycles:
         print(f"\033[1;90mProcessing Cycle {cycle}\033[0m")
 
         for region_directory in region_directories:
-            region_suffix = region_directory[-2:]
-            if re.match(r"R\d+", region_suffix):
-                print(f"\033[1mProcessing {region_suffix}\033[0m")
-            
             region_directory = Path(region_directory)
-    
-            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
-            stitched_directory = cycle_directory / '3_stitched'
-            retiled_directory = cycle_directory / '4_retiled'
-            retiled_directory.mkdir(exist_ok=True, parents=True)
-    
-            tif_files = sorted([
-                f for f in stitched_directory.iterdir()
-                if f.is_file() and f.suffix == '.tif'
-            ])
-    
+
+            region_name = region_directory.name
+            if re.match(r"^R\d+$", region_name):
+                print(f"\033[1mProcessing {region_name}\033[0m")
+
+            cycle_directory = region_directory / "preprocessing" / f"Cycle{cycle}"
+            stitched_directory = cycle_directory / "3_stitched"
+            retiled_directory = cycle_directory / "4_retiled"
+            safe_mkdir(retiled_directory)
+
+            tif_files = sorted([p for p in stitched_directory.iterdir() if p.is_file() and p.suffix.lower() == ".tif"])
             if not tif_files:
                 print(f"No stitched TIFFs found for cycle {cycle} in {stitched_directory}")
                 continue
-    
-            # === Pre-check: Skip if all expected tile files already exist ===
-            sample_img = tifffile.imread(tif_files[0])  # input stitched image
-            pad_height = math.ceil(sample_img.shape[0] / tile_dimension) * tile_dimension - sample_img.shape[0]
-            pad_width = math.ceil(sample_img.shape[1] / tile_dimension) * tile_dimension - sample_img.shape[1]
-            padded_height = sample_img.shape[0] + pad_height
-            padded_width = sample_img.shape[1] + pad_width
-            
-            expected_tiles_per_img = (padded_height // tile_dimension) * (padded_width // tile_dimension)
+
+            # ------------------------------------------------------------------
+            # Pre-check: determine expected tiling grid from FIRST stitched file
+            # (avoid loading full image just to get shape)
+            # ------------------------------------------------------------------
+            try:
+                with tifffile.TiffFile(str(tif_files[0])) as tf:
+                    shape = tf.series[0].shape
+            except Exception as e:
+                print(f"[ERROR] Could not read shape from {tif_files[0].name}: {e}")
+                continue
+
+            if len(shape) != 2:
+                print(f"[ERROR] Expected 2D stitched image (Y,X) but got shape={shape} in {tif_files[0].name}")
+                continue
+
+            img_h, img_w = int(shape[0]), int(shape[1])
+
+            pad_h = (math.ceil(img_h / tile_dimension) * tile_dimension) - img_h
+            pad_w = (math.ceil(img_w / tile_dimension) * tile_dimension) - img_w
+            padded_h = img_h + pad_h
+            padded_w = img_w + pad_w
+
+            nrows = padded_h // tile_dimension
+            ncols = padded_w // tile_dimension
+            expected_tiles_per_img = nrows * ncols
             expected_total_tiles = expected_tiles_per_img * len(tif_files)
-    
-            existing_tiles = list(retiled_directory.glob(f'Cycle{cycle}_s*_ch*.tif'))
-    
-            # If the number of tiles is correct, only then sample-check 1–2 tile shapes
-            if len(existing_tiles) == expected_total_tiles:
-                sample_tile = tifffile.imread(existing_tiles[0])
-                if sample_tile.shape != (tile_dimension, tile_dimension):
-                    print(f"[WARN] Sample tile shape mismatch: expected ({tile_dimension}, {tile_dimension}), got {sample_tile.shape}")
-                    for tile in existing_tiles:
-                        tile.unlink()
-                    print(f"Reprocessing due to tile shape mismatch.")
+
+            # Compute tile grid coords ONCE (same for all channels/images)
+            x_positions = [col * tile_dimension for row in range(nrows) for col in range(ncols)]
+            y_positions = [row * tile_dimension for row in range(nrows) for col in range(ncols)]
+
+            existing_tiles = list(retiled_directory.glob(f"Cycle{cycle}_s*_ch*.tif"))
+
+            # If the number of tiles matches, sample-check one tile size
+            if len(existing_tiles) == expected_total_tiles and existing_tiles:
+                try:
+                    sample_tile = tifffile.imread(existing_tiles[0])
+                except Exception as e:
+                    print(f"{BOLD}[WARN]⚠️ {RESET} Could not read sample existing tile: {existing_tiles[0].name}: {e}")
+                    sample_tile = None
+
+                if sample_tile is None or sample_tile.shape != (tile_dimension, tile_dimension):
+                    print(
+                        f"{BOLD}[WARN]⚠️ {RESET} Existing tiles look wrong (expected {tile_dimension}×{tile_dimension}). "
+                        f"Reprocessing all tiles in {retiled_directory}."
+                    )
+                    for p in existing_tiles:
+                        p.unlink()
                 else:
-                    print(f"All expected tiles found and shape of first tile is correct (tile_dimension = {tile_dimension}) in {retiled_directory}. Skipping.")
+                    print(
+                        f"All expected tiles found ({expected_total_tiles}) and sample tile shape matches "
+                        f"({tile_dimension}×{tile_dimension}). Skipping."
+                    )
+                    # Still ensure coords CSV exists (optional but useful)
+                    coords_csv_path = retiled_directory / f"Cycle{cycle}_retiled_coords.csv"
+                    if not coords_csv_path.exists():
+                        pd.DataFrame({"x": x_positions, "y": y_positions}).to_csv(coords_csv_path, header=False, index=False)
                     continue
             else:
-                print(f"Missing tiles (expected {expected_total_tiles}, found {len(existing_tiles)}). Reprocessing all.")
-                for tile in existing_tiles:
-                    tile.unlink()
-    
-    
-            # === Begin tiling ===
-            x_positions = []
-            y_positions = []
-    
+                print(f"Missing/extra tiles (expected {expected_total_tiles}, found {len(existing_tiles)}). Reprocessing all.")
+                for p in existing_tiles:
+                    p.unlink()
+
+            # ------------------------------------------------------------------
+            # Begin tiling (per stitched channel image)
+            # ------------------------------------------------------------------
             for tif_path in tif_files:
                 try:
-                    image = tifffile.imread(tif_path)
+                    image = tifffile.imread(str(tif_path))
+                    if image.ndim != 2:
+                        raise ValueError(f"Expected 2D image, got shape={image.shape}")
+
                     print(f"Tiling: {tif_path.name}")
-    
-                    pad_height = math.ceil(image.shape[0] / tile_dimension) * tile_dimension - image.shape[0]
-                    pad_width = math.ceil(image.shape[1] / tile_dimension) * tile_dimension - image.shape[1]
-    
+
+                    # Pad to multiple of tile_dimension (pad is on bottom/right only)
+                    pad_h = (math.ceil(image.shape[0] / tile_dimension) * tile_dimension) - image.shape[0]
+                    pad_w = (math.ceil(image.shape[1] / tile_dimension) * tile_dimension) - image.shape[1]
+
                     image_padded = cv2.copyMakeBorder(
                         image,
-                        top=0, bottom=pad_height,
-                        left=0, right=pad_width,
-                        borderType=cv2.BORDER_CONSTANT
+                        top=0, bottom=pad_h,
+                        left=0, right=pad_w,
+                        borderType=cv2.BORDER_CONSTANT,
+                        value=0,  # explicit black padding
                     )
-    
+
                     img_height, img_width = image_padded.shape
                     nrows = img_height // tile_dimension
                     ncols = img_width // tile_dimension
-    
-                    tiled_array = image_padded.reshape(nrows, tile_dimension, ncols, tile_dimension)
-                    tiled_array = tiled_array.swapaxes(1, 2)
-    
-                    filename_stem = tif_path.stem
-                    channel_match = re.search(r'ch(\d+)', filename_stem)
-                    channel = int(channel_match.group(1)) if channel_match else 0
-    
-                    tile_count = 0
-                    # Reset coordinates for each image (only last one will remain)
-                    x_positions, y_positions = [], []
 
+                    # (nrows, tile, ncols, tile) -> (nrows, ncols, tile, tile)
+                    tiled_array = image_padded.reshape(nrows, tile_dimension, ncols, tile_dimension).swapaxes(1, 2)
+
+                    # Channel from filename "..._chX.tif"
+                    m = re.search(r"ch(\d+)", tif_path.stem, re.IGNORECASE)
+                    channel = int(m.group(1)) if m else 0
+
+                    tile_count = 0
                     for row in range(nrows):
                         for col in range(ncols):
-                            x_positions.append(col * tile_dimension)
-                            y_positions.append(row * tile_dimension)
-
                             tile_img = tiled_array[row, col]
-                            tile_filename = retiled_directory / f'Cycle{cycle}_s{tile_count}_ch{channel}.tif'
-                            tifffile.imwrite(tile_filename, tile_img)
+                            tile_filename = retiled_directory / f"Cycle{cycle}_s{tile_count}_ch{channel}.tif"
+                            tifffile.imwrite(str(tile_filename), tile_img)
                             tile_count += 1
-    
+
                 except Exception as e:
                     print(f"[ERROR] Processing {tif_path.name}: {e}")
                     continue
 
-            # Always overwrite the coordinates CSV with the most recent image's tile grid
-            tile_positions_df = pd.DataFrame({'x': x_positions, 'y': y_positions})
-            coords_csv_path = retiled_directory / f'Cycle{cycle}_retiled_coords.csv'
-            tile_positions_df.to_csv(coords_csv_path, header=False, index=False)
- 
-    
+            # Write coords CSV once (grid coords)
+            coords_csv_path = retiled_directory / f"Cycle{cycle}_retiled_coords.csv"
+            pd.DataFrame({"x": x_positions, "y": y_positions}).to_csv(coords_csv_path, header=False, index=False)
             print(f"Tiling complete. Positions saved to {coords_csv_path}")
-    
-
-
-
 
 
