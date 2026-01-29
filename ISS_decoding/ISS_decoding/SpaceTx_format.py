@@ -86,6 +86,8 @@ class ISS2DAuxTileFetcher(TileFetcher):
 # Main function to create SpaceTx-compatible experiment and codebook files for a region
 def make_spacetx_format(input_dir, 
                         codebook_csv,
+                        regions_to_process=None,
+                        output_dir_prefix=None,
                         pixelscale=0.1625,
                         channels=["DAPI", "Cy3", "Cy5", "AF750", "AF488"],
                         DO_decorators=["AF750", "Cy5", "Cy3", "AF488"],
@@ -111,21 +113,86 @@ def make_spacetx_format(input_dir,
     input_dir = Path(input_dir)
     print(f"Processing directory: {input_dir}")
 
+    # --- Output directory prefix handling ---
+    if output_dir_prefix is not None:
+        output_dir_prefix = Path(output_dir_prefix)
+        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
+    else:
+        print("[INFO] Using default output location under each region directory")
+    
+
     codebook_csv = Path(codebook_csv)
     print('Codebook: ', codebook_csv) 
 
     nuclei_channel = channels.index("DAPI") + 1 # 1-indexed
 
-    # --- Step 1: Find all region directories matching R\d+ ---
-    region_pattern = re.compile(r'^R\d+$')
-    region_directories = [r for r in input_dir.iterdir() if r.is_dir() and region_pattern.match(r.name)]
-    region_names = [r.name for r in region_directories]
+    # --- Step 1: Find/select region directories matching R\d+ ---
+    region_pattern = re.compile(r"^R(\d+)$")
     
-    for region_directory, region_name in zip(region_directories, region_names):
+    regions_found = []
+    for r in input_dir.iterdir():
+        if not r.is_dir():
+            continue
+        m = region_pattern.match(r.name)
+        if m:
+            regions_found.append((int(m.group(1)), r))
+    
+    regions_found.sort(key=lambda t: t[0])  # R1, R2, R10 correctly
+    
+    if not regions_found:
+        raise RuntimeError(f"No regions found in {input_dir} (expected folders like R1, R2, ...)")
+    
+    available_numbers = [n for n, _ in regions_found]
+    available_map = {n: p for n, p in regions_found}
+    
+    all_regions = [f"R{n}" for n in available_numbers]
+    print(f"[INFO] Regions found on disk ({len(all_regions)}): {all_regions}")
+    
+    # --- Select regions to process ---
+    if regions_to_process is None:
+        region_numbers = available_numbers
+    else:
+        if not isinstance(regions_to_process, (list, tuple)):
+            raise TypeError("regions_to_process must be a list of 1-based ints, e.g. [1, 2].")
+    
+        region_numbers = [int(x) for x in regions_to_process]
+        if any(x < 1 for x in region_numbers):
+            raise ValueError(f"regions_to_process contains invalid region numbers: {regions_to_process}")
+    
+        missing = [n for n in region_numbers if n not in available_map]
+        if missing:
+            raise FileNotFoundError(
+                f"Requested region(s) not found: {[f'R{n}' for n in missing]}. "
+                f"Available regions: {all_regions}"
+            )
+    
+    # keep the user’s requested order
+    region_directories = [available_map[n] for n in region_numbers]
+    
+    selected_regions = [f"R{n}" for n in region_numbers]
+    skipped_regions = [r for r in all_regions if r not in selected_regions]
+    
+    print(f"[INFO] Regions selected ({len(selected_regions)}): {selected_regions}")
+    if skipped_regions:
+        print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
+    
+    print("Regions to be processed:", selected_regions)
+
+    
+    for region_directory in region_directories:
+        region_name = region_directory.name
 
         # Create SpaceTx output directory for this region
-        SpaceTX_dir = region_directory / "decoding" / "1_SpaceTX_format"
+        if output_dir_prefix is None:
+            # Original behavior: write under each region folder
+            SpaceTX_dir = region_directory / "decoding" / "1_SpaceTX_format"
+        else:
+            # New behavior: write under output_dir_prefix, mirroring region name
+            SpaceTX_dir = Path(output_dir_prefix) / region_directory.name / "decoding" / "1_SpaceTX_format"
+        
         SpaceTX_dir.mkdir(parents=True, exist_ok=True)
+
 
         # ===== EARLY EXIT / MINIMAL WORK BRANCHING =====
         experiment_json_path = SpaceTX_dir / "experiment.json"
