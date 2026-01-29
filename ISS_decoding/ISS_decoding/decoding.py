@@ -12,12 +12,9 @@ import pandas as pd
 from starfish import Codebook, Experiment, FieldOfView
 from starfish.image import ApplyTransform, Filter, LearnTransform
 from starfish.spots import DecodeSpots, FindSpots
-from starfish.types import Axes, TraceBuildingStrategies
+from starfish.types import Axes, TraceBuildingStrategies, Levels
 from starfish.core.spots.DecodeSpots.trace_builders import build_spot_traces_exact_match
 
-# Spotiflow
-from spotiflow.model import Spotiflow
-from spotiflow.starfish import SpotiflowDetector
 
 
 def QC_score_calc(decoded):
@@ -214,6 +211,8 @@ def ISS_pipeline(
 
 def process_experiment(
     input_dir, 
+    regions_to_process=None,
+    output_dir_prefix=None,
     register=False, 
     register_dapi=False,
     masking_radius=15, 
@@ -255,32 +254,100 @@ def process_experiment(
         - Output files are written in a subfolder of each region, named 'decoded' or 'decoded_dense'.
     """
         
-     # --- Step 1: Discover all region directories ---
+    # --- Step 1: Discover/select region directories ---
     input_dir = Path(input_dir)
     print(f"Processing directory: {input_dir}")
 
-    if dense:
-        print('DENSE (per-channel) decoding')
-
-    if dense and decode_mode != 'PRMC':
-        print(f"dense=True → overriding decode_mode='{decode_mode}' to 'PRMC'")
-        decode_mode = 'PRMC'
-    
-    region_pattern = re.compile(r'^R\d+$')
-    region_directories = [r for r in input_dir.iterdir() if r.is_dir() and region_pattern.match(r.name)]
-
-    # --- Step 2: Load model once (if detection mode is spotiflow) ---
-    if spot_detection_mode == 'spotiflow':
-        SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
+    # --- Output directory prefix handling ---
+    if output_dir_prefix is not None:
+        output_dir_prefix = Path(output_dir_prefix)
+        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
     else:
-        SPOTIFLOW_MODEL = None
+        print("[INFO] Using default output location under each region directory")
+    
+    if dense:
+        print("DENSE (per-channel) decoding")
+    
+    if dense and decode_mode != "PRMC":
+        print(f"dense=True → overriding decode_mode='{decode_mode}' to 'PRMC'")
+        decode_mode = "PRMC"
+    
+    region_pattern = re.compile(r"^R(\d+)$")
+
+    # --- Discover all regions on disk (for logging + validation) ---
+    regions_found = []
+    for r in input_dir.iterdir():
+        if not r.is_dir():
+            continue
+        m = region_pattern.match(r.name)
+        if m:
+            regions_found.append((int(m.group(1)), r))
+    
+    regions_found.sort(key=lambda t: t[0])  # R1, R2, R10 correctly
+    
+    if not regions_found:
+        raise RuntimeError(f"No regions found in {input_dir} (expected folders like R1, R2, ...)")
+    
+    available_numbers = [n for n, _ in regions_found]
+    available_map = {n: p for n, p in regions_found}
+    
+    # --- Select regions to process ---
+    if regions_to_process is not None:
+        if not isinstance(regions_to_process, (list, tuple)):
+            raise TypeError("regions_to_process must be a list of 1-based ints, e.g. [1, 2].")
+    
+        wanted = [int(x) for x in regions_to_process]
+        if any(x < 1 for x in wanted):
+            raise ValueError(f"regions_to_process contains invalid region numbers: {regions_to_process}")
+    
+        missing = [n for n in wanted if n not in available_map]
+        if missing:
+            raise FileNotFoundError(
+                f"Requested region(s) not found: {[f'R{n}' for n in missing]}. "
+                f"Available regions: {[f'R{n}' for n in available_numbers]}"
+            )
+    
+        # keep user-requested order
+        region_numbers = wanted
+        region_directories = [available_map[n] for n in wanted]
+    else:
+        region_numbers = available_numbers
+        region_directories = [available_map[n] for n in available_numbers]
+    
+    # --- Logging (mirrors SpaceTx style) ---
+    all_regions = [f"R{n}" for n in available_numbers]
+    selected_regions = [f"R{n}" for n in region_numbers]
+    skipped_regions = [r for r in all_regions if r not in selected_regions]
+    
+    print(f"[INFO] Regions found on disk ({len(all_regions)}): {all_regions}")
+    print(f"[INFO] Regions selected for decoding ({len(selected_regions)}): {selected_regions}")
+    if skipped_regions:
+        print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
+    
+        
+    # --- Step 2: Load model once (only if detection mode is spotiflow) ---
+    SPOTIFLOW_MODEL = None
+    SpotiflowDetector = None  # define the name even if we don't import it
+    
+    if spot_detection_mode == "spotiflow":
+        from spotiflow.model import Spotiflow
+        from spotiflow.starfish import SpotiflowDetector
+    
+        SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
+    
 
     # --- Step 3: Process each region directory ---
     for region_directory in region_directories:
         
         region_name = region_directory.name
-        decoded_dir = region_directory / 'decoding' / ('2_decoded_dense' if dense else '2_decoded')
+        if output_dir_prefix is None:
+            decoded_dir = region_directory / 'decoding' / ('2_decoded_dense' if dense else '2_decoded')
+        else:
+            decoded_dir = output_dir_prefix / region_directory.name / 'decoding' / ('2_decoded_dense' if dense else '2_decoded')
+        
         decoded_dir.mkdir(parents=True, exist_ok=True)
+
 
         print("=" * 60)
         print(f"\033[1mProcessing region {region_name}\033[0m")
@@ -295,7 +362,11 @@ def process_experiment(
 
 
         # --- Step 4: Load SpaceTx experiment metadata ---
-        SpaceTX_dir = (region_directory / 'decoding' / '1_SpaceTX_format').resolve()
+        if output_dir_prefix is None:
+            SpaceTX_dir = (region_directory / 'decoding' / '1_SpaceTX_format').resolve()
+        else:
+            SpaceTX_dir = (output_dir_prefix / region_directory.name / 'decoding' / '1_SpaceTX_format').resolve()
+
         experiment = Experiment.from_json(str(SpaceTX_dir / 'experiment.json'))
 
         tiles = list(experiment.keys())
