@@ -3033,6 +3033,26 @@ class CziHandler(BaseHandler):
             pixel_to_um_calc=pixel_to_um_calc,
         )
         return ctx
+        
+    # ------------------------------------------------------------------
+    # Get valid tiles
+    # ------------------------------------------------------------------
+    def get_valid_tiles(self, ctx: Dict[str, Any]) -> List[int]:
+        """
+        Return the tile indices that are valid *mosaic tiles* (have stage coords / bbox),
+        suitable for downstream processing and expected output enumeration.
+        """
+        # If metadata parsing ran, ctx["mosaic_tiles_iter"] is the authoritative source
+        tiles_iter = ctx.get("mosaic_tiles_iter", None)
+        if tiles_iter:
+            return sorted({int(t[0]) for t in tiles_iter})
+    
+        # If metadata parsing didn't run, fall back to inferred tiles
+        tiles = ctx.get("tiles", None)
+        if tiles:
+            return sorted({int(t) for t in tiles})
+    
+        return []
 
     # ------------------------------------------------------------------
     # Infer tiles/channels/dims (NO mosaic parsing here)
@@ -3042,21 +3062,28 @@ class CziHandler(BaseHandler):
         - Determine tiles / channels / size_z / image_dimensions
         - Do NOT parse or normalize mosaic positions here
           (that belongs in build_metadata_args)
+    
+        Updated behavior:
+        - Prefer mosaic tile indices from czi_get_mosaic_positions() when available.
+          This avoids admitting non-mosaic M planes (label/overview/preview) that can be
+          readable but have no mosaic bbox/stage coords.
+        - Fall back to the previous "probe read_image" method if mosaic positions
+          cannot be obtained.
         """
         dims: Dict[str, int] = ctx["czi_dims"]
-
+    
         size_z = int(dims.get("Z", 1) or 1)
-
+    
         num_channels = int(dims.get("C", 1) or 1)
         if num_channels <= 0:
             num_channels = 1
         channels = list(range(num_channels))
-
+    
         # CZI uses M for mosaic tile index in many datasets
         n_tiles = int(dims.get("M", 1) or 1)
         if n_tiles <= 0:
             n_tiles = 1
-
+    
         x_px = int(dims.get("X", 1) or 1)
         y_px = int(dims.get("Y", 1) or 1)
         if x_px <= 0 or y_px <= 0:
@@ -3065,37 +3092,67 @@ class CziHandler(BaseHandler):
                 f"for region '{ctx.get('region')}'."
             )
         image_dimensions = (x_px, y_px)
-
-        # Find valid tile ids (some files report M>0 but some M indices are empty)
+    
         czi = ctx["czi"]
         tiles: List[int] = []
-
+    
+        # ------------------------------------------------------------
+        # Prefer true mosaic tile indices if available
+        # ------------------------------------------------------------
         if n_tiles <= 1:
             tiles = [0]
         else:
-            for m in range(n_tiles):
-                try:
-                    img, _ = czi.read_image(M=m, C=0, Z=0)
-                    if img is not None:
-                        tiles.append(int(m))
-                except Exception:
-                    pass
+            try:
+                scene_index = int(ctx.get("region_index", 0)) if "S" in (dims or {}) else None
+                block_index = 0 if "B" in (dims or {}) else None
+    
+                out = czi_get_mosaic_positions(
+                    czi,
+                    n_tiles=n_tiles,
+                    scene_index=scene_index,
+                    block_index=block_index,
+                )
+    
+                raw_tiles_iter = None
+                if isinstance(out, tuple) and len(out) >= 1:
+                    raw_tiles_iter = list(out[0] or [])
+    
+                if raw_tiles_iter:
+                    # raw tuples are expected to begin with TileIndex
+                    mosaic_tile_ids = sorted({int(t[0]) for t in raw_tiles_iter if t and len(t) >= 1})
+                    if mosaic_tile_ids:
+                        tiles = mosaic_tile_ids
+            except Exception:
+                # If mosaic positions aren't available, fall back to probing planes
+                tiles = []
+    
+            # ------------------------------------------------------------
+            # Fallback: probe read_image to find readable tile ids
+            # ------------------------------------------------------------
             if not tiles:
-                tiles = list(range(n_tiles))
-
-        # Update ctx in-place 
+                for m in range(n_tiles):
+                    try:
+                        img, _ = czi.read_image(M=m, C=0, Z=0)
+                        if img is not None:
+                            tiles.append(int(m))
+                    except Exception:
+                        pass
+                if not tiles:
+                    tiles = list(range(n_tiles))
+    
+        # Update ctx in-place
         ctx.update(dict(
             tiles=tiles,
             channels=channels,
             size_z=size_z,
             image_dimensions=image_dimensions,
-        
+    
             mosaic_tiles_iter=None,
             mosaic_x_raw=None,
             mosaic_y_raw=None,
             mosaic_unit_hint_raw=None,
         ))
-        
+    
         return {
             "tiles": ctx["tiles"],
             "channels": ctx["channels"],
@@ -4292,7 +4349,35 @@ def deconvolve_and_mip(
                         **metadata_args,
                         out_xml_path=metadata_directory / f"R{region_number}.xml",
                     )
-    
+
+                # ----- Determine valid mosaic tiles -----
+                valid_tiles = None
+                
+                # Preferred: handler provides it (best, no XML parsing)
+                if hasattr(handler, "get_valid_tiles"):
+                    valid_tiles = handler.get_valid_tiles(ctx)
+                
+                # Fallback: use tiles as-is
+                if valid_tiles is None:
+                    valid_tiles = list(tiles)
+                
+                valid_tiles = sorted({int(t) for t in valid_tiles})
+
+                # Sanity check: never allow an empty valid_tiles list
+                if not valid_tiles:
+                    print(
+                        f"{BOLD}[WARN]⚠️ {RESET} No valid mosaic tiles found; "
+                        f"falling back to inferred tiles list."
+                    )
+                    valid_tiles = sorted({int(t) for t in tiles})
+                
+
+                all_tiles_inferred = sorted({int(t) for t in tiles})
+                skipped = sorted(set(all_tiles_inferred) - set(valid_tiles))
+                if skipped:
+                    print(f"{BOLD}[WARN]⚠️ {RESET} Skipping {len(skipped)} non-mosaic tile(s) (no bbox/stage coords): {skipped[:20]}{'...' if len(skipped) > 20 else ''}")
+                
+
     
                 # ----- STEP 3: SKIP EXISTING FILES -----
                 print("\033[96mProcessing files\033[0m")
@@ -4309,7 +4394,9 @@ def deconvolve_and_mip(
                 # IMPORTANT:
                 # tiles_all represents the FULL expected tile set for this region.
                 # Do NOT reuse this variable for "tiles to process" later.
-                tiles_all = list(tiles)
+                # tiles_all should be the FULL expected *VALID MOSAIC* tile set for this region.
+                tiles_all = list(valid_tiles)
+
                 
                 total_expected = len(tiles_all) * len(channels)
                 total_valid = len(valid_existing)
@@ -4437,7 +4524,15 @@ def deconvolve_and_mip(
                             continue
 
 
-                        stacked_images = handler.read_stack(ctx, tile=tile, channel=channel)
+                        try:
+                            stacked_images = handler.read_stack(ctx, tile=tile, channel=channel)
+                        except Exception as e:
+                            msg = str(e)
+                            if ("PixelType( Unknown type )" in msg) or ("PylibCZI_PixelTypeException" in msg):
+                                print(f"{BOLD}[WARN]⚠️ {RESET} Skipping tile={tile}, ch={channel}: unsupported CZI pixel type.")
+                                continue
+                            raise
+
     
                         if stacked_images.ndim != 3:
                             raise ValueError(
