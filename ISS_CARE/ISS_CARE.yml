@@ -1,0 +1,16 @@
+name: iss_care
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - tifffile
+  # Jupyter (optional but handy)
+  - notebook
+  - jupyterlab
+  - ipywidgets
+  - ipykernel
+  - pip:
+      - csbdeep
+      - tensorflow[and-cuda]==2.15.*
