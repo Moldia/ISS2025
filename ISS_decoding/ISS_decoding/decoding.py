@@ -3,6 +3,12 @@ import math
 import re
 from pathlib import Path
 from typing import Tuple
+import xml.etree.ElementTree as ET
+
+# NOTE (provenance policy):
+#   - We ONLY write a decoding XML if this run actually writes the region-level CSV.
+#   - We NEVER overwrite existing XMLs: each productive run writes a uniquely-named XML.
+#   - Runs that skip because outputs already exist produce NO XML.
 
 # Third-party
 import numpy as np
@@ -258,6 +264,21 @@ def process_experiment(
     input_dir = Path(input_dir)
     print(f"Processing directory: {input_dir}")
 
+    # -------------------------------------------------------------------------
+    # XML provenance run id
+    #
+    # One run_id per process_experiment() invocation. We will only emit a decoding
+    # XML for a region if this run actually writes the region-level CSV for that
+    # region (i.e., not skipped, and concatenation happened).
+    #
+    # We NEVER overwrite XMLs: each productive run writes a unique XML.
+    # -------------------------------------------------------------------------
+    run_id = ET.datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") if hasattr(ET, "datetime") else None
+    # NOTE: xml.etree.ElementTree doesn't provide datetime; keep policy local below.
+    # We'll create run_id using the standard library without changing behavior elsewhere.
+    from datetime import datetime as _dt
+    run_id = _dt.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+
     # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
@@ -354,6 +375,8 @@ def process_experiment(
         print(f"Output decoded directory: {decoded_dir}")
 
         # ===== EARLY EXIT CHECK =====
+        # If the region-level CSV exists, we skip the entire region and write NO XML
+        # (because this run did not generate region-level outputs).
         final_csv = decoded_dir / f"{region_name}_decoded.csv"
         if final_csv.exists():
             print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
@@ -407,6 +430,10 @@ def process_experiment(
 
         # --- Step 7: Write region-level concatenated CSV by reading per-tile files named "fov*.csv" ---
         print(f"\nWriting region-level concatenated CSV for {region_name!r} ...")
+
+        # Track whether this run actually wrote the region-level output CSV.
+        # If False, we do NOT write an XML for this region.
+        wrote_region_csv = False
         
         # find all per-tile CSVs that start with "fov" (and end in .csv)
         csv_paths = sorted(decoded_dir.glob("fov*.csv"))
@@ -426,49 +453,50 @@ def process_experiment(
         
             out_file = decoded_dir / f"{region_name}_decoded.csv"
             concat.to_csv(out_file, index=False)
+            wrote_region_csv = True  # region-level file was generated in this run
             print(f" → Wrote {len(concat)} total rows to {out_file.name}")
         
 
+        # --- ADDED: Write an XML manifest in the decoded folder (per region) ---
+        #
+        # Provenance policy requested:
+        #   - Only write XML if this run wrote the region-level CSV.
+        #   - Never overwrite existing XMLs: use a unique filename with run_id.
+        if wrote_region_csv:
+            xml_path = decoded_dir / f"decoding_run_{run_id}.xml"
+            root = ET.Element("ISSDecodingRun", attrib={"region": str(region_name)})
 
+            # Optional: store run_id inside XML too (useful when filenames are moved/copied)
+            root.set("run_id", str(run_id))
 
-def plot_starfish_output(spots_file, 
-                        dpi = 500, 
-                        fig_size = (15,10), 
-                        conversion = 0.1625, 
-                        size_of_spots = 1):
-    
-    import matplotlib as mpl
-    import matplotlib.pyplot as plt
-    mpl.rcParams['text.color'] = 'w'
-    plt.style.use('dark_background')
-    plt.rcParams["figure.figsize"] = fig_size
-    mpl.rcParams['figure.dpi'] = dpi
-    import pandas as pd
-    
-    df_concat = pd.read_csv(spots_file)
-    spots_filt = df_concat[df_concat['target'].notna()]
-    
-    groups1 = spots_filt.groupby('target')
-    fig, ax = plt.subplots()
-    ax.margins(0.05) # Optional, just adds 5% padding to the autoscaling
-    #io.imshow(dapi*10)
-    for i, gene in enumerate(sorted(spots_filt.target.unique())):
-        group1 = spots_filt[spots_filt.target == gene]
-        ax.scatter(group1.xc/0.1625, group1.yc/0.1625, marker='.', linewidth=0, s=size_of_spots, label=gene)
+            paths_el = ET.SubElement(root, "Paths")
+            ET.SubElement(paths_el, "DecodedDir").text = str(decoded_dir)
+            ET.SubElement(paths_el, "SpaceTXDir").text = str(SpaceTX_dir)
+            ET.SubElement(paths_el, "ExperimentJSON").text = str(SpaceTX_dir / "experiment.json")
+            ET.SubElement(paths_el, "FinalCSV").text = str(decoded_dir / f"{region_name}_decoded.csv")
 
-    plt.gca().invert_yaxis()
-    from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
-    import matplotlib.font_manager as fm
-    fontprops = fm.FontProperties(size=10)
-    scalebar = AnchoredSizeBar(ax.transData,
-                               615.3846153846, '200 μm', 'lower right', 
-                               pad=0.1,
-                               color='white',
-                               frameon=False,
-                               size_vertical=5,
-                               fontproperties=fontprops)
-    ax.add_artist(scalebar)
-    plt.axis('scaled')
-    plt.axis('off')
-    plt.title('Starfish decoding' + '\n' + 'Count: ' + str(spots_filt.shape[0]), size = 10)
-    plt.show()
+            params_el = ET.SubElement(root, "Parameters")
+            ET.SubElement(params_el, "dense").text = str(dense)
+            ET.SubElement(params_el, "register").text = str(register)
+            ET.SubElement(params_el, "register_dapi").text = str(register_dapi)
+            ET.SubElement(params_el, "masking_radius").text = str(masking_radius)
+            ET.SubElement(params_el, "normalization_method").text = str(normalization_method)
+            ET.SubElement(params_el, "decode_mode").text = str(decode_mode)
+            ET.SubElement(params_el, "spot_detection_mode").text = str(spot_detection_mode)
+            ET.SubElement(params_el, "int_threshold").text = str(int_threshold)
+            ET.SubElement(params_el, "sigma_vals").text = ",".join([str(x) for x in sigma_vals])
+            ET.SubElement(params_el, "prob_threshold").text = "None" if prob_threshold is None else str(prob_threshold)
+
+            tiles_el = ET.SubElement(root, "Tiles")
+            ET.SubElement(tiles_el, "tiles_total").text = str(len(tiles))
+            ET.SubElement(tiles_el, "tiles_done").text = str(len(tiles_done))
+            ET.SubElement(tiles_el, "tiles_remaining").text = str(len(not_done))
+
+            tree = ET.ElementTree(root)
+            try:
+                ET.indent(tree, space="  ", level=0)  # python>=3.9
+            except Exception:
+                pass
+            tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+            print(f"[{region_name}] Decoding XML written to: {xml_path}")
+        # --- END ADDED XML ---

@@ -3106,12 +3106,18 @@ class CziHandler(BaseHandler):
                 scene_index = int(ctx.get("region_index", 0)) if "S" in (dims or {}) else None
                 block_index = 0 if "B" in (dims or {}) else None
     
-                out = czi_get_mosaic_positions(
-                    czi,
-                    n_tiles=n_tiles,
-                    scene_index=scene_index,
-                    block_index=block_index,
-                )
+         
+                import contextlib
+                import io
+                
+                with contextlib.redirect_stdout(io.StringIO()):
+                    out = czi_get_mosaic_positions(
+                        czi,
+                        n_tiles=n_tiles,
+                        scene_index=scene_index,
+                        block_index=block_index,
+                    )
+
     
                 raw_tiles_iter = None
                 if isinstance(out, tuple) and len(out) >= 1:
@@ -4362,6 +4368,26 @@ def deconvolve_and_mip(
                     valid_tiles = list(tiles)
                 
                 valid_tiles = sorted({int(t) for t in valid_tiles})
+                
+                # ---- FIX: define these before using them ----
+                all_tiles_inferred = sorted({int(t) for t in tiles})
+                skipped = sorted(set(all_tiles_inferred) - set(valid_tiles))
+                
+                total_tiles = int(ctx["czi_dims"].get("M", len(all_tiles_inferred)) or len(all_tiles_inferred))
+
+                n_valid = len(valid_tiles)
+                n_skipped = len(skipped)
+                
+                min_tile = valid_tiles[0] if valid_tiles else None
+                max_tile = valid_tiles[-1] if valid_tiles else None
+                
+                print(
+                    f"[R{region_number}] Tiles: {n_valid} valid / {total_tiles} total "
+                    f"(min={min_tile}, max={max_tile})"
+                    + (f" ({n_skipped} skipped: no bbox)" if n_skipped else "")
+                )
+                
+
 
                 # Sanity check: never allow an empty valid_tiles list
                 if not valid_tiles:
