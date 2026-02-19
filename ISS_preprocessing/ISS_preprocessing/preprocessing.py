@@ -2499,6 +2499,10 @@ class TiffHandler(BaseHandler):
             xml_tiles = [(int(fx), int(fy), float(px), float(py)) for (fx, fy, px, py) in tiles_iter]
             n_xml = len(xml_tiles)
 
+            print(
+                "[META] Case B: XML has no TileIndex — preserving XML acquisition order."
+            )
+
             if not file_tiles_sorted:
                 print("[ERROR] TIFF handler: no on-disk tiles found for mapping. Skipping metadata.")
                 return None
