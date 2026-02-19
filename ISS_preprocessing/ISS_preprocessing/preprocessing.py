@@ -377,20 +377,29 @@ def decide_and_write_tilescan(
     
             recs.append(rec)
     
+
         # ------------------------------------------------------------------
         # Build XML
         # ------------------------------------------------------------------
         out = ET.Element("Data")
         img = ET.SubElement(out, "Image", TextDescription="")
+        
+        app = str(app_name).strip().lower()
+        
         att = ET.SubElement(
             img,
             "Attachment",
             Name="TileScanInfo",
             Application=str(app_name),
-            FlipX="1" if str(app_name).strip().lower() == "nis-elements" else "0",
-            FlipY="0",
+        
+            # keep your existing NIS special-case
+            FlipX="1" if app == "nis-elements" else "0",
+        
+            FlipY="0" ,
+        
             SwapXY="0",
         )
+
     
         # Global metadata
         att.set("Unit", "micron")
@@ -914,28 +923,37 @@ def tiff_extract_pixel_size_and_magnification(
 def tiff_collect_tiles_from_tilescaninfo(root: ET.Element) -> List[Tuple]:
     """
     Read Leica TileScanInfo tile positions from XML.
-
+    
     Returns
     -------
     List[Tuple]
         If TileIndex is present on tiles:
-          (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+            (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
+    
         Else:
-          (FieldX, FieldY, PosX_raw, PosY_raw)
-
+            (FieldX, FieldY, PosX_raw, PosY_raw)
+    
     Ordering
     --------
-    Deterministic grid order: sorted by (FieldY, FieldX).
-
+    If TileIndex is present:
+        Tiles are sorted by TileIndex (deterministic identity order).
+    
+    If TileIndex is NOT present:
+        XML document order is preserved exactly.
+    
+        This is intentional: Leica LAS AF / LAS X often writes tiles in
+        acquisition order (commonly serpentine). Sorting by (FieldY, FieldX)
+        would silently convert serpentine into raster order and break mapping
+        to on-disk filename tile ids (e.g., s0000, s0001, ...).
+    
     Validation
     ----------
     - If ANY <Tile> has TileIndex then ALL must have TileIndex (else ValueError).
     - FieldX, FieldY, PosX, PosY are required on every <Tile>.
     - Types are normalized:
-        FieldX/FieldY/TileIndex -> int
-        PosX/PosY -> float
+        FieldX / FieldY / TileIndex -> int
+        PosX / PosY -> float
     """
-
 
     def _require_attr(node: ET.Element, name: str) -> str:
         v = node.attrib.get(name, None)
@@ -958,13 +976,21 @@ def tiff_collect_tiles_from_tilescaninfo(root: ET.Element) -> List[Tuple]:
             "Inconsistent TileScanInfo: some <Tile> have TileIndex and others do not."
         )
 
-    # Deterministic grid order (FieldY, FieldX)
-    # NOTE: we intentionally use the required attrs here, so missing FieldX/FieldY
-    # fails loudly with context.
-    tile_nodes_sorted = sorted(
-        tile_nodes,
-        key=lambda n: (int(_require_attr(n, "FieldY")), int(_require_attr(n, "FieldX"))),
-    )
+    # Decide ordering policy based on presence of TileIndex.
+    #
+    # - If TileIndex exists: it's the only safe identity key. We sort by TileIndex so the
+    #   returned list is deterministic and aligns with filename tile ids when those are
+    #   acquisition-indexed (common in Leica exports).
+    #
+    # - If TileIndex does NOT exist: Leica often writes <Tile> elements in acquisition order
+    #   (commonly serpentine). Sorting by (FieldY, FieldX) would silently convert serpentine
+    #   into raster order and break the mapping to on-disk tile ids (s0000, s0001, ...).
+    #   Therefore we preserve the XML document order exactly.
+    if has_all_ti:
+        tile_nodes_sorted = sorted(tile_nodes, key=lambda n: int(_require_attr(n, "TileIndex")))
+    else:
+        tile_nodes_sorted = list(tile_nodes)  # preserve XML order (acquisition/path order)
+
 
     tiles_iter: List[Tuple] = []
 
@@ -2320,7 +2346,7 @@ class TiffHandler(BaseHandler):
     ) -> Optional[Dict[str, Any]]:
         """
         Prepare keyword arguments for decide_and_write_tilescan().
-    
+
         Responsibilities
         ----------------
         - Validate Leica metadata presence
@@ -2328,17 +2354,25 @@ class TiffHandler(BaseHandler):
             (TileIndex, FieldX, FieldY, PosX_raw, PosY_raw)
         - Align TileIndex with on-disk tile ids (ctx["tiles"]) so downstream mapping is stable
         - Return a kwargs dict for decide_and_write_tilescan() (caller supplies out_xml_path)
-    
+
         Subset policy
         -------------
-        - If XML provides TileIndex (5-tuples): keep only those tiles whose TileIndex exists on disk.
+        - If XML provides TileIndex (5-tuples):
+            * Treat TileIndex as an identity key.
+            * Keep only those tiles whose TileIndex exists on disk (supports subsets safely).
+            * Preserve on-disk ordering (sorted ctx["tiles"]) for deterministic downstream behavior.
+
         - If XML lacks TileIndex (4-tuples):
-            * Sort XML tiles by (FieldY, FieldX) to create a deterministic list.
-            * ASSUME on-disk filename tile ids are 0-based indices into that list:
+            * Preserve the XML <Tile> element order exactly.
+              IMPORTANT: Leica often writes tiles in acquisition order (commonly serpentine).
+              Sorting by (FieldY, FieldX) can silently convert serpentine → raster and corrupt
+              the mapping between filename tile ids (_s0000_, _s0001_, ...) and stage positions.
+            * ASSUME on-disk filename tile ids are 0-based indices into this XML order:
                 on_disk_tile_id t -> xml_tiles[t]
-            * This supports subsets but can misregister mosaics if filename ids do not correspond
-              to Leica’s grid ordering.
-    
+            * Supports subsets only if the on-disk tile ids remain a subset of [0..n_xml-1].
+              If filename ids are re-labeled / non-contiguous / not acquisition-indexed, mapping
+              may be invalid and should be rejected.
+
         Returns
         -------
         Optional[Dict[str, Any]]
@@ -2447,20 +2481,36 @@ class TiffHandler(BaseHandler):
         # Case B: 4-tuples (FieldX, FieldY, PosX, PosY)
         # ----------------------------
         else:
-            # Normalize + sort XML tiles into deterministic grid order
-            #   xml_tiles[i] is the i-th tile in Leica grid order
+            # ------------------------------------------------------------------
+            # IMPORTANT ORDERING POLICY (Case B: no TileIndex in XML)
+            #
+            # When Leica XML omits TileIndex, the <Tile> elements are often stored
+            # in *acquisition order* (commonly serpentine). In those files FieldX/FieldY
+            # may not represent a true 2D grid ordering, and sorting by (FieldY, FieldX)
+            # can silently corrupt the mapping from on-disk tile id -> stage position.
+            #
+            # Therefore:
+            #   - Preserve the XML order exactly.
+            #   - Assume filename tile ids are 0-based indices into that list:
+            #       on_disk_tile_id t  ->  xml_tiles[t]
+            # ------------------------------------------------------------------
+
+            # Normalize XML tiles but DO NOT sort them
             xml_tiles = [(int(fx), int(fy), float(px), float(py)) for (fx, fy, px, py) in tiles_iter]
-            xml_tiles = sorted(xml_tiles, key=lambda t: (t[1], t[0]))  # (FieldY, FieldX)
             n_xml = len(xml_tiles)
-    
+
+            print(
+                "[META] Case B: XML has no TileIndex — preserving XML acquisition order."
+            )
+
             if not file_tiles_sorted:
                 print("[ERROR] TIFF handler: no on-disk tiles found for mapping. Skipping metadata.")
                 return None
-    
+
             if n_xml <= 0:
                 print("[ERROR] TIFF handler: XML contains zero tiles (n_xml=0). Skipping metadata.")
                 return None
-    
+
             # Validate mapping range (tile id must be a valid index into xml_tiles)
             bad = [t for t in file_tiles_sorted if not (0 <= t < n_xml)]
             if bad:
@@ -2471,7 +2521,8 @@ class TiffHandler(BaseHandler):
                     "Cannot safely map tiles. Skipping metadata."
                 )
                 return None
-    
+
+
             # INFO: explain mapping decision
             preview = file_tiles_sorted[:10]
             print(
@@ -2480,14 +2531,14 @@ class TiffHandler(BaseHandler):
             )
             print(f"[INFO] TIFF handler: max on-disk tile id = {max(file_tiles_sorted)}")
             print(f"[INFO] TIFF handler: mapping {len(file_tiles_sorted)} on-disk tile(s) onto {n_xml} XML tile(s).")
-    
+
             # Build final tiles_iter using filename tile id as TileIndex
             mapped_tiles_iter: List[Tuple[int, int, int, float, float]] = []
             for tid in file_tiles_sorted:
                 fx, fy, px, py = xml_tiles[tid]
                 mapped_tiles_iter.append((tid, fx, fy, px, py))
             tiles_iter = mapped_tiles_iter
-    
+
             # INFO: show a few concrete mappings
             k = min(10, len(tiles_iter))
             pairs = [
@@ -2499,10 +2550,11 @@ class TiffHandler(BaseHandler):
                 + "; ".join(pairs)
                 + (f"; ... (+{len(tiles_iter)-k} more)" if len(tiles_iter) > k else "")
             )
-    
+
             # Rebuild x_raw / y_raw aligned with final tile order
             x_raw = np.asarray([t[3] for t in tiles_iter], dtype=float)
             y_raw = np.asarray([t[4] for t in tiles_iter], dtype=float)
+
     
         # Defensive: ensure we set x_raw/y_raw
         if x_raw is None or y_raw is None:
@@ -4356,25 +4408,48 @@ def deconvolve_and_mip(
                         out_xml_path=metadata_directory / f"R{region_number}.xml",
                     )
 
-                # ----- Determine valid mosaic tiles -----
+                # ----- Determine valid mosaic tiles (format-agnostic) -----
+                tiles_inferred = sorted({int(t) for t in tiles})
+                
+                # Preferred: handler provides valid tiles (e.g., CZI bbox-aware)
                 valid_tiles = None
-                
-                # Preferred: handler provides it (best, no XML parsing)
                 if hasattr(handler, "get_valid_tiles"):
-                    valid_tiles = handler.get_valid_tiles(ctx)
+                    try:
+                        valid_tiles = handler.get_valid_tiles(ctx)
+                    except Exception:
+                        valid_tiles = None
                 
-                # Fallback: use tiles as-is
-                if valid_tiles is None:
-                    valid_tiles = list(tiles)
+                # Fallback: assume all inferred tiles are valid
+                if not valid_tiles:
+                    valid_tiles = tiles_inferred
+                else:
+                    valid_tiles = sorted({int(t) for t in valid_tiles})
                 
-                valid_tiles = sorted({int(t) for t in valid_tiles})
+                # Sanity: never allow empty valid_tiles
+                if not valid_tiles:
+                    print(
+                        f"{BOLD}[WARN]⚠️ {RESET} No valid mosaic tiles found; "
+                        f"falling back to inferred tiles list."
+                    )
+                    valid_tiles = tiles_inferred
                 
-                # ---- FIX: define these before using them ----
-                all_tiles_inferred = sorted({int(t) for t in tiles})
-                skipped = sorted(set(all_tiles_inferred) - set(valid_tiles))
+                # Skipped = inferred tiles that are not valid
+                skipped = sorted(set(tiles_inferred) - set(valid_tiles))
                 
-                total_tiles = int(ctx["czi_dims"].get("M", len(all_tiles_inferred)) or len(all_tiles_inferred))
-
+                # Total tiles: use CZI-provided M only if present; otherwise inferred count
+                total_tiles = len(tiles_inferred)
+                if isinstance(ctx, dict):
+                    czi_dims = ctx.get("czi_dims")
+                    if isinstance(czi_dims, dict):
+                        m = czi_dims.get("M")
+                        if m is not None:
+                            try:
+                                m_int = int(m)
+                                if m_int > 0:
+                                    total_tiles = m_int
+                            except Exception:
+                                pass
+                
                 n_valid = len(valid_tiles)
                 n_skipped = len(skipped)
                 
@@ -4387,22 +4462,12 @@ def deconvolve_and_mip(
                     + (f" ({n_skipped} skipped: no bbox)" if n_skipped else "")
                 )
                 
-
-
-                # Sanity check: never allow an empty valid_tiles list
-                if not valid_tiles:
-                    print(
-                        f"{BOLD}[WARN]⚠️ {RESET} No valid mosaic tiles found; "
-                        f"falling back to inferred tiles list."
-                    )
-                    valid_tiles = sorted({int(t) for t in tiles})
-                
-
-                all_tiles_inferred = sorted({int(t) for t in tiles})
-                skipped = sorted(set(all_tiles_inferred) - set(valid_tiles))
                 if skipped:
-                    print(f"{BOLD}[WARN]⚠️ {RESET} Skipping {len(skipped)} non-mosaic tile(s) (no bbox/stage coords): {skipped[:20]}{'...' if len(skipped) > 20 else ''}")
-                
+                    print(
+                        f"{BOLD}[WARN]⚠️ {RESET} Skipping {len(skipped)} non-mosaic tile(s) "
+                        f"(no bbox/stage coords): {skipped[:20]}{'...' if len(skipped) > 20 else ''}"
+                    )
+
 
     
                 # ----- STEP 3: SKIP EXISTING FILES -----
