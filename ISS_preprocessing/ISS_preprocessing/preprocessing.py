@@ -1960,23 +1960,33 @@ class TiffHandler(BaseHandler):
         """
         Discover region identifiers from TIFF filenames.
     
-        Leica encodes the region name as the FIRST token in the filename.
-        Everything before the first separator belongs to the region.
-    
-        Examples:
-          Autosaved:  "R1--Stage0003--C02.tif"  -> region "R1"
-          Exported:   "R1_s0003_ch02.tif"       -> region "R1"
-    
-        We extract this token and return all unique region names,
-        sorted for deterministic processing order.
+        Rules:
+          - tif_autosaved: region = everything before "--Stage"
+          - tif_exported:  region = everything before "_s"
         """
+    
         tif_files = [f.name for f in self._iter_tiffs(input_dir)]
         region_names = set()
     
         for fn in tif_files:
             base = fn.rsplit(".", 1)[0]
-            chunks = base.split("--" if self.mode == "tif_autosaved" else "_")
-            region_names.add(chunks[0])
+    
+            if self.mode == "tif_autosaved":
+                if "--Stage" in base:
+                    region = base.split("--Stage", 1)[0]
+                else:
+                    # fallback safety
+                    region = base.split("--", 1)[0]
+    
+            else:  # tif_exported
+                if "_s" in base:
+                    region = base.split("_s", 1)[0]
+                else:
+                    # fallback safety
+                    region = base.split("_", 1)[0]
+    
+            region = region.strip()
+            region_names.add(region)
     
         return sorted(region_names)
 
