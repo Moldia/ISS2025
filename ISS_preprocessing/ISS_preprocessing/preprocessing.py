@@ -5174,6 +5174,14 @@ def align_and_stitch(
         print(f"Using OME-TIFF inputs (in cycles order): {cycles}")
         # NOTE: This order defines Ashlar output indices Cycle0, Cycle1, ... (temporary outputs)
 
+        # --- PRECHECK 0: stitching must run on ALL cycles (no subsets) ---
+        if len(cycles) != int(n_total_cycles):
+            raise RuntimeError(
+                f"[ERROR] Refusing to run stitching on a subset: "
+                f"len(cycles)={len(cycles)} but n_total_cycles={n_total_cycles}. "
+                f"Provide all cycles for stitching. cycles={cycles}"
+    )
+
         # --- PRECHECK: enforce full experiment cycle count before running Ashlar ---
         # We intentionally do NOT allow Ashlar to run unless the dataset on disk contains
         # the expected total number of cycles for this experiment (n_total_cycles).
