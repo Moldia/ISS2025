@@ -58,11 +58,47 @@ from natsort import natsorted
 # ============================
 # --- Local Modules ---
 # ============================
-import RedLionfishDeconv as rl
+
 import ISS_preprocessing.psf as fd_psf
 
 from skimage import img_as_ubyte
 from skimage.exposure import rescale_intensity
+
+
+# ======================================================================================
+# GPU selection
+# ======================================================================================
+
+
+def get_free_gpu_by_util_and_mem():
+    result = subprocess.check_output([
+        "nvidia-smi",
+        "--query-gpu=index,memory.used,utilization.gpu",
+        "--format=csv,nounits,noheader"
+    ]).decode("utf-8").strip().split("\n")
+
+    rows = []
+    for line in result:
+        idx, mem, util = [x.strip() for x in line.split(",")]
+        rows.append((int(idx), int(mem), int(util)))
+
+    # Prefer lowest utilization first, then lowest memory
+    rows.sort(key=lambda x: (x[2], x[1], x[0]))
+    gpu_id = rows[0][0]
+
+    # Set environment variables
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
+
+    RED_BOLD = "\033[1;31m"
+    RED = "\033[31m"
+    RESET = "\033[0m"
+
+    print(f"{RED_BOLD}Selected GPU {gpu_id}{RESET}")
+    print(f"{RED}CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}{RESET}")
+    print(f"{RED}PYOPENCL_CTX = {os.environ['PYOPENCL_CTX']}{RESET}")
+
+    return gpu_id
 
 # ======================================================================================
 # Small, reusable utilities
@@ -4539,6 +4575,16 @@ def deconvolve_and_mip(
                     psf_dict = {}  # keep for downstream compatibility
                 
                 elif deconvolution_method == "redlionfish":
+
+                    # select gpu and import redlionfish only when needed
+                    gpu_id = get_free_gpu_by_util_and_mem()
+                    #os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                    #os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
+                    #print(f"Selected GPU {gpu_id}")
+
+                    import RedLionfishDeconv as rl
+
+                    
                     if PSF_metadata is None:
                         raise ValueError("PSF_metadata is required for redlionfish deconvolution.")
                 
@@ -4645,7 +4691,8 @@ def deconvolve_and_mip(
     
             
                         # Deconvolution with RedLionFish method
-                        if deconvolution_method == 'redlionfish':
+                        if deconvolution_method == "redlionfish":
+    
                             deconvolved_images = rl.doRLDeconvolutionFromNpArrays(stacked_images, psf_dict[str(channel)], niter=num_iterations)
                             # Save max projection if MIP requested, otherwise full stack
                             if mip:
