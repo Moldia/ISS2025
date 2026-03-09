@@ -70,7 +70,10 @@ from skimage.exposure import rescale_intensity
 # ======================================================================================
 
 
-def get_free_gpu_by_util_and_mem():
+def choose_gpu_for_rl(
+    preferred_max_mem_mb=2000,
+    preferred_max_util=20,
+):
     result = subprocess.check_output([
         "nvidia-smi",
         "--query-gpu=index,memory.used,utilization.gpu",
@@ -82,11 +85,20 @@ def get_free_gpu_by_util_and_mem():
         idx, mem, util = [x.strip() for x in line.split(",")]
         rows.append((int(idx), int(mem), int(util)))
 
-    # Prefer lowest utilization first, then lowest memory
-    rows.sort(key=lambda x: (x[2], x[1], x[0]))
-    gpu_id = rows[0][0]
+    # Prefer GPUs that look truly free
+    preferred = [
+        r for r in rows
+        if r[1] <= preferred_max_mem_mb and r[2] <= preferred_max_util
+    ]
 
-    # Set environment variables
+    if preferred:
+        preferred.sort(key=lambda x: (x[1], x[2], x[0]))  # memory first
+        gpu_id = preferred[0][0]
+    else:
+        # fallback: choose least memory used overall
+        rows.sort(key=lambda x: (x[1], x[2], x[0]))
+        gpu_id = rows[0][0]
+
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
 
@@ -4577,10 +4589,7 @@ def deconvolve_and_mip(
                 elif deconvolution_method == "redlionfish":
 
                     # select gpu and import redlionfish only when needed
-                    gpu_id = get_free_gpu_by_util_and_mem()
-                    #os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-                    #os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
-                    #print(f"Selected GPU {gpu_id}")
+                    gpu_id = choose_gpu_for_rl()
 
                     import RedLionfishDeconv as rl
 
