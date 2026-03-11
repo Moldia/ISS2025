@@ -49,9 +49,9 @@ setup_env() {
     echo
 }
 
-setup_env "ISS_preprocessing" "preprocessing.yml" "ISS_preprocessing"
-setup_env "ISS_decoding" "decoding.yml" "ISS_decoding"
-setup_env "ISS_postprocessing" "postprocessing.yml" "ISS_postprocessing"
+setup_env "ISS_preprocessing" "ISS_preprocessing.yml" "ISS_preprocessing"
+setup_env "ISS_decoding" "ISS_decoding.yml" "ISS_decoding"
+setup_env "ISS_postprocessing" "ISS_postprocessing.yml" "ISS_postprocessing"
 setup_env "ISS_CARE" "ISS_CARE.yml" "ISS_CARE"
 
 echo "All environments installed or updated successfully."
