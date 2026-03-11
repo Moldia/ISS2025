@@ -1,47 +1,57 @@
 #!/usr/bin/env bash
 
-# Exit if any command fails
-set -e
+set -euo pipefail
 
-# Initialize conda so it works inside the script
+if ! command -v conda >/dev/null 2>&1; then
+    echo "Error: conda is not installed or not available in PATH."
+    exit 1
+fi
+
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-# Function to automate environment setup
+if [ ! -d "ISS_preprocessing" ] || [ ! -d "ISS_decoding" ] || [ ! -d "ISS_postprocessing" ]; then
+    echo "Error: run this script from the ISS2025 repository root."
+    exit 1
+fi
+
 setup_env() {
-    DIR=$1
-    YAML=$2
-    ENV_NAME=$3
+    DIR="$1"
+    YAML="$2"
+    ENV_NAME="$3"
 
     echo "----------------------------------------"
     echo "Setting up environment: $ENV_NAME"
-    echo "Directory: $DIR"
+    echo "Module directory: $DIR"
     echo "----------------------------------------"
 
-    cd "$DIR"
+    if conda env list | awk '{print $1}' | grep -Fxq "$ENV_NAME"; then
+        echo "Environment $ENV_NAME already exists. Updating from $DIR/$YAML ..."
+        conda env update -n "$ENV_NAME" -f "$DIR/$YAML"
+    else
+        echo "Environment $ENV_NAME does not exist. Creating from $DIR/$YAML ..."
+        conda env create -n "$ENV_NAME" -f "$DIR/$YAML"
+    fi
 
-    echo "Creating conda environment from $YAML..."
-    conda env create --name "$ENV_NAME" --file "$YAML"
-
-    echo "Activating environment $ENV_NAME..."
+    echo "Activating $ENV_NAME ..."
     conda activate "$ENV_NAME"
 
-    echo "Installing package..."
-    python setup.py install
+    echo "Installing/updating Python package in $DIR ..."
+    (
+        cd "$DIR"
+        pip install .
+    )
 
-    echo "Registering Jupyter kernel..."
+    echo "Registering Jupyter kernel for $ENV_NAME ..."
     python -m ipykernel install --user --name="$ENV_NAME"
 
-    echo "Deactivating environment..."
     conda deactivate
-
-    cd ..
+    echo "Finished $ENV_NAME"
+    echo
 }
 
-# Set up environments
 setup_env "ISS_preprocessing" "preprocessing.yml" "ISS_preprocessing"
 setup_env "ISS_decoding" "decoding.yml" "ISS_decoding"
 setup_env "ISS_postprocessing" "postprocessing.yml" "ISS_postprocessing"
 setup_env "ISS_CARE" "ISS_CARE.yml" "ISS_CARE"
 
-echo ""
-echo "All environments set up successfully."
+echo "All environments installed or updated successfully."
