@@ -20,11 +20,30 @@ Before running the setup script, make sure you have:
 Clone the repository and move into the project directory:
 
 ```bash
-git clone https://github.com/yourlab/ISS2025.git
+git clone https://github.com/Moldia/ISS2025.git
 cd ISS2025
 ```
 
 Run the setup script:
+
+```bash
+bash setup_envs.sh
+```
+
+---
+
+## Cloning the repository into a folder with another name
+
+You can clone the repository into a folder with a different name by specifying the target directory in the `git clone` command.
+
+```bash
+git clone <repository_url> <new_folder_name>
+cd <new_folder_name>
+```
+
+This will create a folder called `<new_folder_name>` instead of the default repository name.
+
+You can then run the installer as usual:
 
 ```bash
 bash setup_envs.sh
