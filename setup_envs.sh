@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -eo pipefail
 
 if ! command -v conda >/dev/null 2>&1; then
     echo "Error: conda is not installed or not available in PATH."
