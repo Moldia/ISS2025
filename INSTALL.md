@@ -1,7 +1,7 @@
 # ISS2025 Environment Setup
 
 This repository contains several modules that require separate Conda environments.  
-A setup script is provided to automatically create these environments and install the packages.
+A setup script is provided to automatically create or update these environments and install the packages.
 
 ---
 
@@ -32,16 +32,56 @@ bash setup_envs.sh
 
 ---
 
+## Updating the pipeline
+
+If the repository has been updated and you want to **update your local installation**, first pull the latest changes from GitHub and then run the installer again.
+
+```bash
+git pull
+bash setup_envs.sh
+```
+
+This will:
+
+- download the newest pipeline code
+- update the conda environments if needed
+- reinstall the Python packages so the latest code is used
+
+The installer is safe to run multiple times.
+
+---
+
+## Repair / reinstall environments
+
+If something in the environments becomes corrupted, you can remove the environments and reinstall everything.
+
+Remove the environments:
+
+```bash
+conda remove -n ISS_preprocessing --all
+conda remove -n ISS_decoding --all
+conda remove -n ISS_postprocessing --all
+conda remove -n ISS_CARE --all
+```
+
+Then reinstall them:
+
+```bash
+bash setup_envs.sh
+```
+
+---
+
 ## What the script does
 
 The script automatically:
 
-1. Creates Conda environments from the provided `.yml` files
+1. Creates Conda environments from the provided `.yml` files (or updates them if they already exist)
 2. Activates each environment
 3. Installs the corresponding Python package using:
 
 ```bash
-python setup.py install
+pip install .
 ```
 
 4. Registers the environment as a **Jupyter kernel**
@@ -84,4 +124,3 @@ conda init
 ```
 
 Then restart your terminal and run the setup script again.
-
