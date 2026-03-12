@@ -15,18 +15,24 @@
 # What this does
 # --------------
 # Cellpose:
-# - finds all retiled images in:
-#       {input_dir}/{region}/preprocessing/Cycle1/4_retiled/
-# - expected names:
-#       Cycle1_s0_ch4.tif
-#       Cycle1_s1_ch4.tif
-#       ...
-# - segments every tile for the selected DAPI channel
-# - expands labels
-# - offsets tile labels so IDs stay unique across tiles
-# - stitches tiles into one final full-size segmentation using:
-#       Cycle1_retiled_coords.csv
-# - saves per-tile sparse masks and one final stitched sparse mask
+# - supports two input modes:
+#       1) retiled images in:
+#            {input_dir}/{region}/preprocessing/Cycle1/4_retiled/
+#          with names like:
+#            Cycle1_s0_ch4.tif
+#            Cycle1_s1_ch4.tif
+#            ...
+#       2) stitched image in:
+#            {input_dir}/{region}/preprocessing/Cycle1/3_stitched/Cycle1_ch4.tif
+# - for retiled input:
+#       - segments every tile for the selected DAPI channel
+#       - expands labels
+#       - offsets tile labels so IDs stay unique across tiles
+#       - stitches tiles into one final full-size segmentation using:
+#            Cycle1_retiled_coords.csv
+# - for stitched input:
+#       - segments the stitched image directly
+# - saves outputs as sparse masks
 #
 # StarDist:
 # - kept simple
@@ -35,8 +41,10 @@
 # Notes
 # -----
 # - This keeps the old outcome, but modernizes path handling and stitching.
-# - Final stitched labels are NOT re-labeled as binary connected components,
-#   because that would merge objects and lose per-tile label identities.
+# - Final retiled Cellpose labels are NOT re-labeled as binary connected
+#   components, because that would merge objects and lose per-tile label IDs.
+# - GPU auto-selection is done inside the main segmentation calls, not when
+#   the module is imported.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -108,12 +116,12 @@ def choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20):
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-        RED_BOLD = "\033[1;31m"
-        RED = "\033[31m"
-        RESET = "\033[0m"
+        red_bold = "\033[1;31m"
+        red = "\033[31m"
+        reset = "\033[0m"
 
-        print(f"{RED_BOLD}Selected physical GPU {gpu_id}{RESET}")
-        print(f"{RED}CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}{RESET}")
+        print(f"{red_bold}Selected physical GPU {gpu_id}{reset}")
+        print(f"{red}CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}{reset}")
 
         return gpu_id
 
@@ -123,10 +131,6 @@ def choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20):
     except Exception as e:
         print(f"GPU auto-selection failed: {e}")
         return None
-
-
-# Comment out if your scheduler already sets the GPU
-choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20)
 
 
 # -----------------------------------------------------------------------------
@@ -154,6 +158,17 @@ def mute_fds():
 # -----------------------------------------------------------------------------
 # Path helpers
 # -----------------------------------------------------------------------------
+def validate_input_image_type(input_image_type):
+    """
+    Validate the requested input image mode.
+    """
+    valid = {"retiled", "stitched"}
+    if input_image_type not in valid:
+        raise ValueError(
+            f"input_image_type must be one of {sorted(valid)}, got: {input_image_type}"
+        )
+
+
 def get_retiled_dir(input_dir, region):
     """
     Return:
@@ -162,17 +177,35 @@ def get_retiled_dir(input_dir, region):
     return Path(input_dir) / region / "preprocessing" / "Cycle1" / "4_retiled"
 
 
+def get_stitched_dir(input_dir, region):
+    """
+    Return:
+    {input_dir}/{region}/preprocessing/Cycle1/3_stitched/
+    """
+    return Path(input_dir) / region / "preprocessing" / "Cycle1" / "3_stitched"
+
+
+def get_stitched_image_path(input_dir, region, DAPI_ch=4):
+    """
+    Return the stitched DAPI image path:
+    {input_dir}/{region}/preprocessing/Cycle1/3_stitched/Cycle1_ch{DAPI_ch}.tif
+    """
+    image_path = get_stitched_dir(input_dir, region) / f"Cycle1_ch{int(DAPI_ch)}.tif"
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Stitched image not found: {image_path}")
+    return image_path
+
+
 def get_segmentation_dir(input_dir, region, output_dir_prefix=None):
     """
     Determine where segmentation outputs should be written.
 
-    Default behavior (same as old pipeline):
+    Default behavior:
         {input_dir}/{region}/postprocessing/segmentation/
 
     If output_dir_prefix is provided:
         {output_dir_prefix}/{region}/postprocessing/segmentation/
     """
-
     if output_dir_prefix is not None:
         output_dir = Path(output_dir_prefix) / region / "postprocessing" / "segmentation"
     else:
@@ -180,6 +213,7 @@ def get_segmentation_dir(input_dir, region, output_dir_prefix=None):
 
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
 
 def get_coords_csv(input_dir, region):
     """
@@ -285,14 +319,47 @@ def stardist_segmentation(
     expand_cells=True,
     n_tiles=(4, 4),
     expanded_distance=20,
+    output_dir_prefix=None,
+    input_image_type="retiled",
+    auto_select_gpu=False,
 ):
     """
     Run StarDist on ONE image and save sparse labels / expanded labels.
 
     This keeps the old StarDist behavior: one image per call.
+
+    Parameters
+    ----------
+    image_name : str
+        For retiled input this should be something like:
+            Cycle1_s0_ch4.tif
+        For stitched input this should be:
+            Cycle1_ch4.tif
+        The stitched helper path is still controlled by input_image_type.
     """
-    image_path = get_retiled_dir(input_dir, region) / image_name
-    output_dir = get_segmentation_dir(input_dir, region, output_dir_prefix)
+    validate_input_image_type(input_image_type)
+
+    # --- Output directory prefix handling ---
+    if output_dir_prefix is not None:
+        output_dir_prefix = Path(output_dir_prefix)
+        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
+    else:
+        print("[INFO] Using default output location under each region directory")
+
+    if auto_select_gpu:
+        choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20)
+
+    if input_image_type == "retiled":
+        image_path = get_retiled_dir(input_dir, region) / image_name
+    else:
+        image_path = get_stitched_dir(input_dir, region) / image_name
+
+    output_dir = get_segmentation_dir(
+        input_dir,
+        region,
+        output_dir_prefix=output_dir_prefix,
+    )
 
     print(f"\nProcessing region: {region}")
     print(f"Image: {image_path}")
@@ -332,7 +399,6 @@ def stardist_segmentation(
     labels = measure.label(labels)
 
     stem = image_path.stem
-
     labels_out = output_dir / f"{region}_{stem}_stardist_labels.npz"
     save_npz(labels_out, coo_matrix(labels), compressed=True)
 
@@ -364,7 +430,7 @@ def build_cellpose_model():
 
 def segment_one_tile_with_cellpose(image, model, diameter=None, expanded_distance=20):
     """
-    Segment one tile with Cellpose, then refine with watershed and expand labels.
+    Segment one image with Cellpose, then refine with watershed and expand labels.
 
     This stays very close to the old code behavior.
 
@@ -463,6 +529,91 @@ def stitch_tiles_from_coords(tile_arrays, coords):
     return stitched
 
 
+def stitch_raw_tiles_from_coords(tile_arrays, coords):
+    """
+    Stitch raw image tiles into one canvas using direct (x, y) placement.
+
+    Parameters
+    ----------
+    tile_arrays : list[np.ndarray]
+        Raw image tiles.
+    coords : np.ndarray of shape (N, 2)
+        x,y coordinates for each tile.
+
+    Returns
+    -------
+    stitched : np.ndarray
+        Full stitched raw image.
+    """
+    if len(tile_arrays) != len(coords):
+        raise ValueError(
+            f"Number of tiles ({len(tile_arrays)}) does not match number of coords ({len(coords)})"
+        )
+
+    if len(tile_arrays) == 0:
+        raise ValueError("No tiles to stitch")
+
+    tile_h, tile_w = tile_arrays[0].shape
+
+    xs = coords[:, 0]
+    ys = coords[:, 1]
+
+    canvas_w = int(xs.max() + tile_w)
+    canvas_h = int(ys.max() + tile_h)
+
+    stitched = np.zeros((canvas_h, canvas_w), dtype=tile_arrays[0].dtype)
+
+    for tile, (x, y) in zip(tile_arrays, coords):
+        y0, y1 = int(y), int(y) + tile_h
+        x0, x1 = int(x), int(x) + tile_w
+
+        view = stitched[y0:y1, x0:x1]
+
+        # Only fill currently empty pixels with nonzero signal.
+        mask_new = (tile > 0) & (view == 0)
+        view[mask_new] = tile[mask_new]
+
+    return stitched
+
+
+def load_stitched_dapi_image(input_dir, region, DAPI_ch=4):
+    """
+    Reconstruct the stitched raw DAPI image from retiled tiles.
+    """
+    image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
+    coords = read_retiled_coords(input_dir, region)
+
+    if len(image_paths) != len(coords):
+        raise ValueError(
+            f"Number of images ({len(image_paths)}) does not match coordinate rows ({len(coords)})"
+        )
+
+    tile_arrays = [imread(str(p)) for p in image_paths]
+    stitched = stitch_raw_tiles_from_coords(tile_arrays, coords)
+    return stitched
+
+
+def load_reference_dapi_image(input_dir, region, DAPI_ch=4, input_image_type="stitched"):
+    """
+    Load the raw DAPI image used for QC overlays.
+
+    For stitched mode:
+    - use the stitched image in 3_stitched
+
+    For retiled mode:
+    - reconstruct a stitched image from the retiled tiles
+    """
+    validate_input_image_type(input_image_type)
+
+    if input_image_type == "stitched":
+        stitched_path = get_stitched_image_path(input_dir, region, DAPI_ch=DAPI_ch)
+        print(f"[INFO] Using stitched DAPI image: {stitched_path}")
+        return imread(str(stitched_path))
+
+    print("[INFO] Reconstructing stitched DAPI image from retiled tiles")
+    return load_stitched_dapi_image(input_dir, region, DAPI_ch=DAPI_ch)
+
+
 # -----------------------------------------------------------------------------
 # Main Cellpose batch function
 # -----------------------------------------------------------------------------
@@ -471,14 +622,17 @@ def cell_pose_segmentation_to_coo(
     region,
     output_dir_prefix=None,
     DAPI_ch=4,
+    input_image_type="retiled",
     diameter=None,
     expanded_distance=20,
+    auto_select_gpu=True,
 ):
     """
-    Segment all retiled DAPI images in one region and stitch them into one final
-    segmentation mask.
+    Segment DAPI images with Cellpose.
 
-    This function is the region-level batch equivalent of the old workflow.
+    Supports two input modes:
+    - "retiled": segment all retiled tiles in 4_retiled and stitch them
+    - "stitched": segment a single stitched image in 3_stitched
 
     Parameters
     ----------
@@ -493,96 +647,157 @@ def cell_pose_segmentation_to_coo(
             {input_dir}/{region}/postprocessing/segmentation/
 
         If provided, outputs are written instead to:
-            {output_dir_prefix}/{region}/segmentation/
+            {output_dir_prefix}/{region}/postprocessing/segmentation/
 
         This is useful when you want to write results to a scratch disk,
         temporary workspace, or another output location instead of the
         original region directory.
     DAPI_ch : int, optional
         DAPI channel number, for example 4 for files named like
-        `Cycle1_s0_ch4.tif`.
+        `Cycle1_s0_ch4.tif` or `Cycle1_ch4.tif`.
+    input_image_type : {"retiled", "stitched"}, optional
+        Which input layout to use.
     diameter : int | float | None, optional
         Cellpose diameter parameter. Use None to let Cellpose estimate it.
     expanded_distance : int, optional
         Label expansion distance in pixels after watershed refinement.
+    auto_select_gpu : bool, optional
+        If True, try to select a relatively free GPU before model creation.
 
     Outputs
     -------
     Saves:
-    - one sparse `.npz` per tile:
-        `{image_stem}_cellpose_tile.npz`
-    - one final stitched sparse `.npz`:
-        `{region}_cellpose_expanded.npz`
+    - for retiled input:
+        - one sparse `.npz` per tile:
+            `{image_stem}_cellpose_retiled_tile.npz`
+        - one final stitched sparse `.npz`:
+            `{region}_cellpose_retiled_expanded.npz`
+    - for stitched input:
+        - one final sparse `.npz`:
+            `{region}_cellpose_stitched_expanded.npz`
 
     Returns
     -------
-    stitched : np.ndarray
-        Final stitched label image.
-    stitched_coo : scipy.sparse.coo_matrix
-        Sparse version of the final stitched label image.
+    expanded : np.ndarray
+        Final segmentation label image.
+    expanded_coo : scipy.sparse.coo_matrix
+        Sparse version of the final segmentation.
     """
-    
+    validate_input_image_type(input_image_type)
+
     print(f"\n\033[1mProcessing region: {region}\033[0m")
+    print(f"[INFO] input_image_type = {input_image_type}")
 
-    output_dir = get_segmentation_dir(input_dir, region)
-    image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
-    coords = read_retiled_coords(input_dir, region)
+    # --- Output directory prefix handling ---
+    if output_dir_prefix is not None:
+        output_dir_prefix = Path(output_dir_prefix)
+        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
+    else:
+        print("[INFO] Using default output location under each region directory")
 
-    print(f"Found {len(image_paths)} retiled images for channel ch{int(DAPI_ch)}")
-    print(f"Found {len(coords)} coordinate rows")
+    output_dir = get_segmentation_dir(
+        input_dir,
+        region,
+        output_dir_prefix=output_dir_prefix,
+    )
 
-    if len(image_paths) != len(coords):
-        raise ValueError(
-            f"Number of images ({len(image_paths)}) does not match coordinate rows ({len(coords)})"
-        )
+    if auto_select_gpu:
+        print("[INFO] Attempting automatic GPU selection")
+        choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20)
 
     print("Initializing Cellpose model (nuclei)")
     model = build_cellpose_model()
 
     # -------------------------------------------------------------------------
-    # Step 1: segment each tile and save sparse output
+    # Mode 1: retiled input
     # -------------------------------------------------------------------------
-    tile_arrays = []
-    running_offset = 0
+    if input_image_type == "retiled":
+        image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
+        coords = read_retiled_coords(input_dir, region)
 
-    for image_path in image_paths:
-        print(f"Tile: {image_path.name}")
+        print(f"Found {len(image_paths)} retiled images for channel ch{int(DAPI_ch)}")
+        print(f"Found {len(coords)} coordinate rows")
 
-        image = imread(str(image_path))
-        expanded_labels, tile_coo = segment_one_tile_with_cellpose(
+        if len(image_paths) != len(coords):
+            raise ValueError(
+                f"Number of images ({len(image_paths)}) does not match coordinate rows ({len(coords)})"
+            )
+
+        # Step 1: segment each tile and save sparse output
+        tile_arrays = []
+        running_offset = 0
+
+        for image_path in image_paths:
+            print(f"Tile: {image_path.name}")
+
+            image = imread(str(image_path))
+            expanded_labels, _tile_coo = segment_one_tile_with_cellpose(
+                image=image,
+                model=model,
+                diameter=diameter,
+                expanded_distance=expanded_distance,
+            )
+
+            # Make labels globally unique across tiles before stitching
+            expanded_labels, running_offset = offset_labels(expanded_labels, running_offset)
+            tile_arrays.append(expanded_labels)
+
+            tile_out = output_dir / f"{image_path.stem}_cellpose_retiled_tile.npz"
+            save_npz(tile_out, coo_matrix(expanded_labels), compressed=True)
+
+        # Step 2: stitch tiles into one final full-size label image
+        print("Stitching tiles from coordinate CSV")
+        expanded = stitch_tiles_from_coords(tile_arrays, coords)
+
+        # Step 3: save final stitched segmentation
+        # Important:
+        # We save the stitched labels directly, preserving unique IDs.
+        # We do NOT run measure.label(stitched > 0), because that would merge
+        # touching cells and lose original label identity.
+        expanded_coo = coo_matrix(expanded)
+
+        final_out = output_dir / f"{region}_cellpose_retiled_expanded.npz"
+        save_npz(final_out, expanded_coo, compressed=True)
+
+        print(f"Saved final retiled segmentation to: {final_out}\n")
+        return expanded, expanded_coo
+
+    # -------------------------------------------------------------------------
+    # Mode 2: stitched input
+    # -------------------------------------------------------------------------
+    image_path = get_stitched_image_path(input_dir, region, DAPI_ch=DAPI_ch)
+    print(f"[INFO] Running Cellpose on stitched image")
+    print(f"[INFO] Using stitched image: {image_path}")
+    print("[WARNING] Stitched images can require a lot of GPU memory.")
+    print("[WARNING] If this step crashes with OOM or hangs, rerun with input_image_type='retiled'.")
+
+    image = imread(str(image_path))
+    n_pixels = image.shape[0] * image.shape[1]
+    print(f"[INFO] Stitched image shape: {image.shape} ({n_pixels:,} pixels)")
+
+    if n_pixels > 200_000_000:
+        print("[WARNING] This stitched image is very large and may exceed GPU memory.")
+        print("[WARNING] If Cellpose fails or runs out of memory, use input_image_type='retiled'.")
+
+    try:
+        expanded, expanded_coo = segment_one_tile_with_cellpose(
             image=image,
             model=model,
             diameter=diameter,
             expanded_distance=expanded_distance,
         )
+    except Exception as e:
+        print(f"[ERROR] Cellpose failed on stitched image: {e}")
+        print("[HINT] The stitched image may be too large for available GPU memory.")
+        print("[HINT] Try rerunning with input_image_type='retiled'.")
+        raise
 
-        # Make labels globally unique across tiles before stitching
-        expanded_labels, running_offset = offset_labels(expanded_labels, running_offset)
-        tile_arrays.append(expanded_labels)
+    final_out = output_dir / f"{region}_cellpose_stitched_expanded.npz"
+    save_npz(final_out, expanded_coo, compressed=True)
 
-        tile_out = output_dir / f"{image_path.stem}_cellpose_tile.npz"
-        save_npz(tile_out, coo_matrix(expanded_labels), compressed=True)
-
-    # -------------------------------------------------------------------------
-    # Step 2: stitch tiles into one final full-size label image
-    # -------------------------------------------------------------------------
-    print("Stitching tiles from coordinate CSV")
-    stitched = stitch_tiles_from_coords(tile_arrays, coords)
-
-    # -------------------------------------------------------------------------
-    # Step 3: save final stitched segmentation
-    # -------------------------------------------------------------------------
-    # Important:
-    # We save the stitched labels directly, preserving unique IDs.
-    # We do NOT run measure.label(stitched > 0), because that would merge
-    # touching cells and lose original label identity.
-    stitched_coo = coo_matrix(stitched)
-
-    final_out = output_dir / f"{region}_cellpose_expanded.npz"
-    save_npz(final_out, stitched_coo, compressed=True)
-
-    print(f"Saved final stitched segmentation to: {final_out}\n")
-    return stitched, stitched_coo
+    print(f"Saved stitched segmentation to: {final_out}\n")
+    return expanded, expanded_coo
 
 
 # -----------------------------------------------------------------------------
@@ -667,52 +882,85 @@ def save_contour_mask(segmentation_dir, region, segmentation_method, contour_ima
     print(f"Contour mask saved to: {out_path}")
     return out_path
 
-
-def inspect_stitched_segmentation(
+def inspect_and_work_with_segmentation(
     input_dir,
     region,
-    stitched_mask_name=None,
+    segmentation_method,
+    DAPI_ch=4,
+    input_image_type="stitched",
+    crop_coords=None,
+    output_dir_prefix=None,
 ):
     """
-    Load the final stitched segmentation and export a contour mask.
+    Load a segmentation mask, load the matching raw DAPI image, plot an overlay,
+    and save a contour mask for QC.
 
-    By default, uses:
-        {region}_cellpose_expanded.npz
+    Supports both stitched and retiled segmentation outputs.
+
+    Parameters
+    ----------
+    input_dir : str | Path
+        Root directory containing region folders.
+    region : str
+        Region identifier (e.g. "R1").
+    segmentation_method : str
+        Segmentation method name (e.g. "cellpose", "stardist").
+    DAPI_ch : int
+        DAPI channel number.
+    input_image_type : {"stitched", "retiled"}
+        Determines which segmentation mask and raw image layout to use.
+    crop_coords : tuple | None
+        Optional crop region (y_start, y_end, x_start, x_end) for visualization.
+    output_dir_prefix : str | Path | None
+        Optional alternative output directory root.
     """
-    segmentation_dir = get_segmentation_dir(input_dir, region, output_dir_prefix)
+    validate_input_image_type(input_image_type)
 
-    if stitched_mask_name is None:
-        stitched_mask_name = f"{region}_cellpose_expanded.npz"
+    segmentation_dir = get_segmentation_dir(
+        input_dir,
+        region,
+        output_dir_prefix=output_dir_prefix,
+    )
 
-    mask_file = segmentation_dir / stitched_mask_name
+    # Select correct mask file depending on input mode
+    if input_image_type == "retiled":
+        mask_file = segmentation_dir / f"{region}_{segmentation_method}_retiled_expanded.npz"
+    else:
+        mask_file = segmentation_dir / f"{region}_{segmentation_method}_stitched_expanded.npz"
+
+    if not mask_file.is_file():
+        raise FileNotFoundError(f"Segmentation mask not found: {mask_file}")
+
     labels = load_sparse_mask(mask_file)
 
+    # Load corresponding raw DAPI image
+    image = load_reference_dapi_image(
+        input_dir,
+        region,
+        DAPI_ch=DAPI_ch,
+        input_image_type=input_image_type,
+    )
+
+    # Sanity check
+    if image.shape != labels.shape:
+        raise ValueError(
+            f"Image shape {image.shape} does not match label shape {labels.shape}"
+        )
+
+    # Plot overlay
+    plot_segmentation_overlay(
+        image,
+        labels,
+        crop_coords=crop_coords,
+        title=f"{segmentation_method} ({input_image_type}) segmentation",
+    )
+
+    # Save contour mask
     contour_image = extract_contour_mask(labels, thickness=3)
-    save_contour_mask(segmentation_dir, region, "cellpose", contour_image)
 
-
-# -----------------------------------------------------------------------------
-# Example usage
-# -----------------------------------------------------------------------------
-# regions = ["R1"]
-# input_dir = "/home/sagah/moldia_archive/Agustin/MicroRNA_Result_E1_R3_Deconvolved_V1_USER_Standard_Done/"
-#
-# for region in regions:
-#     cell_pose_segmentation_to_coo(
-#         input_dir,
-#         region,
-#         DAPI_ch=4,
-#         diameter=None,
-#         expanded_distance=20
-#     )
-#
-# Example StarDist on one retiled image:
-# stardist_segmentation(
-#     input_dir=input_dir,
-#     region="R1",
-#     image_name="Cycle1_s0_ch4.tif",
-#     model_name="2D_versatile_fluo",
-#     expand_cells=True,
-#     n_tiles=(4, 4),
-#     expanded_distance=20,
-# )
+    save_contour_mask(
+        segmentation_dir,
+        region,
+        f"{segmentation_method}_{input_image_type}",
+        contour_image,
+    )
