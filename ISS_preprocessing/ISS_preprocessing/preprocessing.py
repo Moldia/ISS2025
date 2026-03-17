@@ -40,6 +40,8 @@ import shutil
 import warnings
 import subprocess
 from pathlib import Path
+from datetime import datetime
+
 from collections import defaultdict
 from typing import Optional, List, Dict, Any, Iterable, Tuple
 
@@ -232,6 +234,139 @@ def deconvolve_image(input_image, psf_image, output_image, iterations, tilesize=
 # ======================================================================================
 # TileScanInfo writer (your “smart” position unit logic)
 # ======================================================================================
+
+def append_run_info_to_tilescan_xml(
+    xml_path: Path,
+    *,
+    timestamp: Optional[str] = None,
+    cycle: Optional[Any] = None,
+    region_number: Optional[int] = None,
+    mode: Optional[str] = None,
+    deconvolution_method: Optional[str] = None,
+    deconvolution_iterations: Optional[int] = None,
+    mip: Optional[bool] = None,
+    processed: Optional[list] = None,
+    skipped: Optional[list] = None,
+    parameters: Optional[dict] = None,
+) -> None:
+    """
+    Append one timestamped run record to an existing TileScanInfo XML.
+
+    A new <Run> entry is added under:
+        Data/Image/Attachment[@Name='TileScanInfo']/RunHistory
+
+    Each run can contain:
+      - metadata attributes (timestamp, cycle, region, mode, etc.)
+      - a <Parameters ... /> element with run-specific settings
+      - <Processed Tile="..." Channel="..."/>
+      - <Skipped Tile="..." Channel="..." Reason="..."/>
+
+    Parameters
+    ----------
+    xml_path : Path
+        Path to an existing TileScanInfo XML file (e.g. R1.xml).
+    timestamp : Optional[str]
+        ISO-like timestamp string. If None, generated automatically.
+    cycle : Optional[Any]
+        Cycle identifier to store on the Run node.
+    region_number : Optional[int]
+        Region number to store on the Run node.
+    mode : Optional[str]
+        Input mode to store on the Run node.
+    deconvolution_method : Optional[str]
+        Deconvolution method used for this run.
+    deconvolution_iterations : Optional[int]
+        Iteration count used for this run.
+    mip : Optional[bool]
+        Whether this run wrote MIPs.
+    processed : Optional[list]
+        List of dicts like {"tile": int, "channel": int}.
+    skipped : Optional[list]
+        List of dicts like {"tile": int, "channel": int, "reason": str}.
+    parameters : Optional[dict]
+        Additional run parameters to store as attributes on a <Parameters> element,
+        e.g. {"pixel_to_um": 0.160402, "chunk_size": None, "input_dir": "..."}.
+    """
+    xml_path = Path(xml_path)
+    if not xml_path.exists():
+        raise FileNotFoundError(f"TileScanInfo XML not found: {xml_path}")
+
+    timestamp = timestamp or datetime.now().isoformat(timespec="seconds")
+    processed = processed or []
+    skipped = skipped or []
+    parameters = parameters or {}
+
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    attachment = root.find("./Image/Attachment[@Name='TileScanInfo']")
+    if attachment is None:
+        raise ValueError(f"No TileScanInfo Attachment found in XML: {xml_path}")
+
+    run_history = attachment.find("RunHistory")
+    if run_history is None:
+        run_history = ET.SubElement(attachment, "RunHistory")
+
+    run_elem = ET.SubElement(run_history, "Run")
+    run_elem.set("Timestamp", str(timestamp))
+
+    if cycle is not None:
+        run_elem.set("Cycle", str(cycle))
+    if region_number is not None:
+        run_elem.set("Region", str(region_number))
+    if mode is not None:
+        run_elem.set("Mode", str(mode))
+    run_elem.set(
+        "DeconvolutionMethod",
+        str(deconvolution_method) if deconvolution_method is not None else "None"
+    )
+    run_elem.set(
+        "DeconvolutionIterations",
+        str(deconvolution_iterations if deconvolution_iterations is not None else 0)
+    )
+    if mip is not None:
+        run_elem.set("MIP", "1" if mip else "0")
+
+    run_elem.set("ProcessedCount", str(len(processed)))
+    run_elem.set("SkippedCount", str(len(skipped)))
+
+    if parameters:
+        params_elem = ET.SubElement(run_elem, "Parameters")
+    
+        for key, value in parameters.items():
+    
+            # Handle lists separately 👇
+            if key == "tiles_processed" and value:
+                tiles_elem = ET.SubElement(run_elem, "TilesProcessed")
+                for t in value:
+                    ET.SubElement(tiles_elem, "Tile", Index=str(int(t)))
+    
+            elif key == "tiles_skipped" and value:
+                tiles_elem = ET.SubElement(run_elem, "TilesSkipped")
+                for t in value:
+                    ET.SubElement(tiles_elem, "Tile", Index=str(int(t)))
+    
+            else:
+                params_elem.set(str(key), "None" if value is None else str(value))
+                
+    if processed:
+        processed_elem = ET.SubElement(run_elem, "ProcessedItems")
+        for item in processed:
+            rec = ET.SubElement(processed_elem, "Processed")
+            rec.set("Tile", str(int(item["tile"])))
+            rec.set("Channel", str(int(item["channel"])))
+
+    if skipped:
+        skipped_elem = ET.SubElement(run_elem, "SkippedItems")
+        for item in skipped:
+            rec = ET.SubElement(skipped_elem, "Skipped")
+            rec.set("Tile", str(int(item["tile"])))
+            rec.set("Channel", str(int(item["channel"])))
+            rec.set("Reason", str(item.get("reason", "unknown")))
+
+    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+    print(f"[INFO] Appended run info to TileScanInfo: {xml_path}")
+    
 def decide_and_write_tilescan(
     *,
     x_raw: np.ndarray,
@@ -390,6 +525,24 @@ def decide_and_write_tilescan(
     ):
     
         # ------------------------------------------------------------------
+        # Preserve existing RunHistory, if present
+        # ------------------------------------------------------------------
+        preserved_run_history = None
+        out_xml_path = Path(out_xml_path)
+    
+        if out_xml_path.exists():
+            try:
+                old_tree = ET.parse(out_xml_path)
+                old_root = old_tree.getroot()
+                old_attachment = old_root.find("./Image/Attachment[@Name='TileScanInfo']")
+                if old_attachment is not None:
+                    old_run_history = old_attachment.find("RunHistory")
+                    if old_run_history is not None:
+                        preserved_run_history = ET.fromstring(ET.tostring(old_run_history))
+            except Exception as e:
+                print(f"{BOLD}[WARN]⚠️ {RESET} Could not preserve existing RunHistory from {out_xml_path}: {e}")
+    
+        # ------------------------------------------------------------------
         # Normalize tiles into records (STRICT: require TileIndex)
         #
         # - tiles_iter MUST be an iterable of STRICT 5-tuples:
@@ -425,29 +578,25 @@ def decide_and_write_tilescan(
     
             recs.append(rec)
     
-
         # ------------------------------------------------------------------
         # Build XML
         # ------------------------------------------------------------------
         out = ET.Element("Data")
         img = ET.SubElement(out, "Image", TextDescription="")
-        
+    
         app = str(app_name).strip().lower()
-        
+    
         att = ET.SubElement(
             img,
             "Attachment",
             Name="TileScanInfo",
             Application=str(app_name),
-        
+    
             # keep your existing NIS special-case
             FlipX="1" if app == "nis-elements" else "0",
-        
-            FlipY="0" ,
-        
+            FlipY="0",
             SwapXY="0",
         )
-
     
         # Global metadata
         att.set("Unit", "micron")
@@ -493,9 +642,16 @@ def decide_and_write_tilescan(
                 PosY=f"{r['py'] * to_um:.10f}",
             )
     
+        # ------------------------------------------------------------------
+        # Restore preserved RunHistory, if any
+        # ------------------------------------------------------------------
+        if preserved_run_history is not None:
+            att.append(preserved_run_history)
+    
         ET.ElementTree(out).write(out_xml_path, encoding="utf-8", xml_declaration=True)
         print(f"[INFO] Wrote TileScanInfo: {out_xml_path} (positions in µm)")
 
+    
     # --- pixel size selection ---
     width_px = image_dimensions[0] if isinstance(image_dimensions, (tuple, list)) else None
     
@@ -1060,23 +1216,22 @@ def tiff_collect_tiles_from_tilescaninfo(root: ET.Element) -> List[Tuple]:
 # ======================================================================================
 # LIF helpers (pixel size + objective magnification) 
 # ======================================================================================
-
 def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     """
-    Extract LIF objective magnification + pixel size (µm/px), using the keys your LifHandler sets.
+    Extract LIF objective magnification + best pixel size (µm/px).
 
-    Expects (from LifHandler.open_region):
-      - ctx["lif_file"] (readlif LifFile)   [optional but preferred]
-      - ctx["lif_xml_root"]                [optional]
-      - ctx["lif_image_dict"]              [optional]
-      - ctx["lif_filepath"]                [optional, only for messaging]
+    LIF metadata can be ambiguous, so we:
+      1) gather multiple pixel-size candidates from multiple metadata sources
+      2) score them against observed mosaic stage-step geometry
+      3) choose the candidate that gives the most plausible tile spacing
 
-    Returns:
-      (objective_mag, pixel_to_um_calc)
+    Returns
+    -------
+    (objective_mag, pixel_to_um_calc)
     """
     lf = ctx.get("lif_file", None)
 
-    # ---------- xml_header as text (best-effort) ----------
+    # ---------- xml_header as text ----------
     xml_text = ""
     try:
         xml_header = getattr(lf, "xml_header", None) if lf is not None else None
@@ -1091,6 +1246,10 @@ def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], O
     root = ctx.get("lif_xml_root", None)
     if root is None and lf is not None:
         root = getattr(lf, "xml_root", None)
+
+    d = ctx.get("lif_image_dict", None)
+    image_dimensions = ctx.get("image_dimensions", None)
+    mosaic = ctx.get("mosaic", None)
 
     def _try_float(x) -> Optional[float]:
         try:
@@ -1110,7 +1269,6 @@ def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], O
                 return None
         except Exception:
             return None
-        # typical objectives ~1..200; allow a bit wider
         return float(v) if (0.25 <= float(v) <= 400.0) else None
 
     def _local(tag: str) -> str:
@@ -1138,7 +1296,6 @@ def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], O
         )
 
         for n in scan_nodes:
-            # 1) attributes on node
             for k in attr_keys:
                 if k in n.attrib:
                     mag = _plausible_mag(_try_float(n.attrib.get(k)))
@@ -1147,7 +1304,6 @@ def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], O
             if mag is not None:
                 break
 
-            # 2) child text nodes
             for child in list(n):
                 lk = _local(child.tag)
                 if lk in attr_keys and (child.text or "").strip():
@@ -1177,43 +1333,65 @@ def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], O
                     break
 
     # =============================================================================
-    # Pixel size (µm/px)
+    # Pixel size candidates (µm/px)
     # =============================================================================
-    pixel_to_um_calc: Optional[float] = None
+    candidates: List[Dict[str, Any]] = []
 
-    # (a) Look for voxel size in xml_header (often meters)
+    def _add_candidate(raw_value: Optional[float], source: str) -> None:
+        raw = _try_float(raw_value)
+        if raw is None or not np.isfinite(raw) or raw <= 0:
+            return
+
+        # Candidate 1: shared helper interpretation
+        um1, prov1 = normalize_pixel_size_to_um(
+            float(raw),
+            source=source,
+        )
+        if um1 is not None and np.isfinite(um1) and um1 > 0:
+            candidates.append(
+                dict(
+                    pixel_um=float(um1),
+                    source=source,
+                    raw=float(raw),
+                    provenance=prov1,
+                    mode="shared-helper",
+                )
+            )
+
+        # Candidate 2: raw already in µm/px
+        candidates.append(
+            dict(
+                pixel_um=float(raw),
+                source=source,
+                raw=float(raw),
+                provenance=f"{source}: forced µm-per-pixel",
+                mode="forced-um",
+            )
+        )
+
+        # Candidate 3: raw in meters/px
+        candidates.append(
+            dict(
+                pixel_um=float(raw) * 1e6,
+                source=source,
+                raw=float(raw),
+                provenance=f"{source}: forced meters-per-pixel (×1e6 → µm)",
+                mode="forced-meters",
+            )
+        )
+
+    # (a) xml_header VoxelSizeX / VoxelSizeY
     if xml_text:
-        voxels = re.findall(r'VoxelSize[XY]\s*=\s*["\']([\deE.+-]+)["\']', xml_text, re.IGNORECASE)
-        if voxels:
-            try:
-                # IMPORTANT:
-                # - LIF xml_header voxel sizes are often meters/px, but not guaranteed.
-                # - We delegate unit normalization to normalize_pixel_size_to_um()
-                #   to keep behavior consistent with TIFF/CZI.
-                vals_um: List[float] = []
-                for i, v in enumerate(voxels[:2]):  # X, Y only
-                    if not v:
-                        continue
-                    raw = _try_float(v)
-                    if raw is None or not np.isfinite(raw) or raw <= 0:
-                        continue
-                    um, _src = normalize_pixel_size_to_um(
-                        float(raw),
-                        source=f"LIF xml_header:VoxelSize{'XY'[i]}",
-                    )
-                    if um is not None:
-                        vals_um.append(float(um))
+        voxel_pairs = re.findall(
+            r'VoxelSize([XY])\s*=\s*["\']([\deE.+-]+)["\']',
+            xml_text,
+            re.IGNORECASE,
+        )
+        for axis, val in voxel_pairs:
+            _add_candidate(val, f"LIF xml_header:VoxelSize{axis.upper()}")
 
-                if vals_um:
-                    pixel_to_um_calc = float(sum(vals_um) / len(vals_um))
-                    return mag, pixel_to_um_calc
-            except Exception:
-                pass
-
-    # (b) Common readlif image_dict keys (varies by version/data)
-    d = ctx.get("lif_image_dict", None)
+    # (b) image_dict keys
     if isinstance(d, dict):
-        # Try a handful of common patterns; accept either meters or microns
         candidate_keys = ("voxel_size", "voxelSize", "pixel_size", "pixelsize", "scale", "scales")
         for key in candidate_keys:
             v = d.get(key, None)
@@ -1223,62 +1401,158 @@ def lif_get_mag_and_pixel_to_um(ctx: Dict[str, Any]) -> Tuple[Optional[float], O
                 if isinstance(v, dict):
                     x = v.get("x") or v.get("X") or v.get("0")
                 else:
-                    x = v[0]  # list/tuple/np array
-
-                raw = _try_float(x)
-                if raw is None or not np.isfinite(raw) or raw <= 0:
-                    continue
-
-                # IMPORTANT:
-                # - readlif sometimes stores meters/px, sometimes µm/px depending on version/data.
-                # - Delegate to shared helper to avoid drifting heuristics.
-                pixel_to_um_calc, _src = normalize_pixel_size_to_um(
-                    float(raw),
-                    source=f"LIF image_dict:{key}",
-                )
-                if pixel_to_um_calc is not None and pixel_to_um_calc > 0:
-                    return mag, float(pixel_to_um_calc)
+                    x = v[0]
+                _add_candidate(x, f"LIF image_dict:{key}")
             except Exception:
                 continue
 
-    # (c) Fallback: xml_root DimensionDescription (Length / Elements) -> meters or microns
+    # (c) xml_root DimensionDescription (Length / Elements)
     def _safe_float(x) -> Optional[float]:
         try:
             return float(x)
         except Exception:
             return None
 
-    def _dim_to_um(el: Optional[ET.Element], axis: str) -> Optional[float]:
-        if el is None:
-            return None
-        N = _safe_float(el.attrib.get("NumberOfElements") or el.attrib.get("Elements"))
-        L = _safe_float(el.attrib.get("Length"))
-        if N is None or L is None or N <= 0 or L <= 0:
-            return None
-
-        raw = L / N  # could be meters/px or already microns/px depending on file
-
-        # IMPORTANT:
-        # - Delegate normalization to shared helper (same logic as TIFF).
-        um, _src = normalize_pixel_size_to_um(
-            float(raw),
-            source=f"LIF xml_root:{axis}:Length/N",
-        )
-        return um
-
     if isinstance(root, ET.Element):
         try:
-            # Leica LIF often uses DimID 1=X and 2=Y, but we keep it defensive
             dim_x = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='1']")
             dim_y = root.find(".//ImageDescription/Dimensions/DimensionDescription[@DimID='2']")
-            vals = [v for v in (_dim_to_um(dim_x, "X"), _dim_to_um(dim_y, "Y")) if v is not None]
-            if vals:
-                pixel_to_um_calc = float(sum(vals) / len(vals))
+            for axis, el in (("X", dim_x), ("Y", dim_y)):
+                if el is None:
+                    continue
+                N = _safe_float(el.attrib.get("NumberOfElements") or el.attrib.get("Elements"))
+                L = _safe_float(el.attrib.get("Length"))
+                if N is None or L is None or N <= 0 or L <= 0:
+                    continue
+                raw = L / N
+                _add_candidate(raw, f"LIF xml_root:{axis}:Length/N")
         except Exception:
-            pixel_to_um_calc = None
+            pass
 
-    return mag, (float(pixel_to_um_calc) if pixel_to_um_calc is not None else None)
+    # Remove duplicate pixel sizes (keep first occurrence)
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for c in candidates:
+        key = round(float(c["pixel_um"]), 12)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(c)
+    candidates = deduped
 
+    if not candidates:
+        return mag, None
+
+    # =============================================================================
+    # Geometry-based scoring
+    # =============================================================================
+    image_width_px: Optional[int] = None
+    if isinstance(image_dimensions, (tuple, list)) and len(image_dimensions) >= 1:
+        try:
+            image_width_px = int(image_dimensions[0])
+        except Exception:
+            image_width_px = None
+
+    def _median_positive_step(vals: np.ndarray) -> Optional[float]:
+        if vals.size < 2:
+            return None
+        u = np.unique(np.round(vals.astype(float), 10))
+        if u.size < 2:
+            return None
+        diffs = np.diff(np.sort(u))
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if diffs.size == 0:
+            return None
+        return float(np.median(diffs))
+
+    step_raw: Optional[float] = None
+    try:
+        if isinstance(mosaic, (list, tuple)) and len(mosaic) > 1:
+            x_raw = np.asarray([float(p[2]) for p in mosaic], dtype=float)
+            y_raw = np.asarray([float(p[3]) for p in mosaic], dtype=float)
+            sx = _median_positive_step(x_raw)
+            sy = _median_positive_step(y_raw)
+            steps = [v for v in (sx, sy) if v is not None and np.isfinite(v) and v > 0]
+            if steps:
+                step_raw = float(np.median(steps))
+    except Exception:
+        step_raw = None
+
+    def _score_candidate(pixel_um: float) -> Tuple[float, Dict[str, Any]]:
+        info: Dict[str, Any] = {}
+        score = 0.0
+
+        if not np.isfinite(pixel_um) or pixel_um <= 0:
+            return -1e18, info
+
+        info["pixel_um"] = float(pixel_um)
+
+        # Basic plausibility for microscope XY pixel size
+        # Broad on purpose; just enough to reject absurd values.
+        if 0.02 <= pixel_um <= 10.0:
+            score += 20.0
+        else:
+            score -= 100.0
+
+        if image_width_px is not None and image_width_px > 0:
+            tile_width_um = float(image_width_px) * float(pixel_um)
+            info["tile_width_um"] = tile_width_um
+
+            # Broad tile-width plausibility
+            if 50.0 <= tile_width_um <= 5000.0:
+                score += 20.0
+            elif 5000.0 < tile_width_um <= 10000.0:
+                score -= 10.0
+            else:
+                score -= 50.0
+
+            if step_raw is not None:
+                # Assume raw stage coordinates are already close to µm-scale.
+                step_um = float(step_raw)
+                frac = step_um / tile_width_um if tile_width_um > 0 else np.nan
+                overlap = 1.0 - frac if np.isfinite(frac) else np.nan
+                info["step_um_assumed"] = step_um
+                info["step_fraction"] = frac
+                info["overlap"] = overlap
+
+                # Prefer plausible overlaps.
+                if 0.6 <= frac <= 1.2:
+                    score += 60.0
+                elif 0.4 <= frac < 0.6:
+                    score += 35.0
+                elif 0.2 <= frac < 0.4:
+                    score += 5.0
+                else:
+                    score -= 80.0
+
+                # Strong penalty for absurdly high overlap
+                if np.isfinite(overlap) and overlap > 0.75:
+                    score -= 100.0
+
+        return score, info
+
+    scored: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+    for c in candidates:
+        score, info = _score_candidate(float(c["pixel_um"]))
+        scored.append((score, info, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_info, best = scored[0]
+
+    # Optional debug prints
+    print("[LIF] Pixel-size candidates:")
+    for score, info, c in scored:
+        msg = (
+            f"  score={score:8.2f} | pixel_um={c['pixel_um']:.9g} | "
+            f"source={c['source']} | mode={c['mode']}"
+        )
+        if "tile_width_um" in info:
+            msg += f" | tile_width_um={info['tile_width_um']:.3f}"
+        if "step_fraction" in info and np.isfinite(info["step_fraction"]):
+            msg += f" | step/tile={info['step_fraction']:.3f}"
+        print(msg)
+
+    return mag, float(best["pixel_um"])
 # ======================================================================================
 # CZI helpers (pixel size + objective magnification + mosaic tile positions + dims normalization)
 # ======================================================================================
@@ -2114,10 +2388,14 @@ class TiffHandler(BaseHandler):
             #       (FieldX, FieldY, PosX, PosY)
             #
             # NOTE:
-            # - tiff_collect_tiles_from_tilescaninfo() already:
-            #     * sorts deterministically (FieldY, FieldX)
-            #     * normalizes types (ints/floats)
-            # - We do NOT assign TileIndex here; that's done later in build_metadata_args().
+            # - tiff_collect_tiles_from_tilescaninfo() normalizes tile records and ensures
+            #   deterministic ordering:
+            #     * If TileIndex exists → tiles are sorted by TileIndex
+            #     * If TileIndex is absent → XML document order is preserved exactly
+            #       (important because Leica often writes tiles in acquisition order,
+            #       commonly serpentine).
+            # - We do NOT assign or remap TileIndex here; that happens later in
+            #   build_metadata_args() once on-disk tile ids (ctx['tiles']) are known.
             tiles_iter = list(tiff_collect_tiles_from_tilescaninfo(root) or [])
             if not tiles_iter:
                 raise ValueError("TileScanInfo contained no tiles (tiles_iter empty).")
@@ -2348,52 +2626,108 @@ class TiffHandler(BaseHandler):
 
     def read_stack(self, ctx: Dict[str, Any], tile: int, channel: int) -> np.ndarray:
         """
-        Read a (Z, Y, X) stack for one tile and one channel.
+        Read a (Z, Y, X) stack for a given tile and channel from TIFF files.
     
-        This is intentionally the *simple, old-style* TIFF reader:
-          - Each Z plane is stored as a separate TIFF file
-          - Files are read sequentially with tifffile.imread
-          - No multiprocessing, no retries, no shape repair
-          - Behavior matches the legacy pipeline exactly
+        This function retrieves all TIFF files corresponding to a specific
+        (tile, channel) pair from the precomputed mapping in `ctx["tile_channel_files"]`,
+        loads each file as a 2D image plane (Y, X), and stacks them along a new
+        Z dimension to form a 3D array (Z, Y, X).
     
-        Assumptions:
-          - ctx["tile_channel_files"] was built by infer_tiles_channels()
-          - Each file contains a single 2D plane (Y, X)
-          - All planes for a given (tile, channel) have identical shape
+        The files are sorted to ensure consistent and deterministic Z ordering.
+        Each plane is expected to be a single-channel 2D image with identical shape.
+        The resulting stack is returned as a NumPy array of dtype uint16.
+    
+        Parameters
+        ----------
+        ctx : Dict[str, Any]
+            Context dictionary containing metadata and file mappings, including
+            "tile_channel_files".
+        tile : int
+            Tile index.
+        channel : int
+            Channel index.
+    
+        Returns
+        -------
+        Optional[np.ndarray]
+            A 3D NumPy array of shape (Z, Y, X) representing the image stack
+            for the specified tile and channel, or None if no valid TIFF planes
+            are available.
+    
+        Raises
+        ------
+        ValueError
+            If the resulting stack does not have three dimensions.
         """
         tile = int(tile)
         channel = int(channel)
     
-        # Look up all TIFF files belonging to this (tile, channel) pair.
-        # This should already represent one full Z stack.
         tile_channel_files = ctx["tile_channel_files"]
         files = tile_channel_files.get((tile, channel), [])
     
         if not files:
-            raise FileNotFoundError(
-                f"No TIFF planes found for tile={tile}, channel={channel}"
+            print(
+                f"\033[91m[WARN] No TIFF planes found (tile={tile}, channel={channel}). "
+                f"Skipping this tile/channel combo; no mipped image will be written for this tile/channel.\033[0m"
             )
-    
-        # Sort filenames to ensure deterministic Z ordering.
-        # This preserves historical behavior and avoids OS-dependent ordering.
+            return None
+            
         files = sorted(files, key=lambda p: str(p))
     
-        # Read each plane and stack into a 3D array: (Z, Y, X)
-        stack = np.stack(
-            [tifffile.imread(str(f)) for f in files],
-            axis=0
-        )
+        arrays = []
+        expected_shape = None
+        bad_files = []
     
-        # Defensive check: each stack must be exactly 3D
+        for f in files:
+            try:
+                arr = tifffile.imread(str(f))
+            except Exception as e:
+                bad_files.append((f, f"read_error: {e}"))
+                continue
+    
+            if arr.ndim != 2 or arr.size == 0:
+                bad_files.append((f, f"invalid_shape: {arr.shape}"))
+                continue
+    
+            if expected_shape is None:
+                expected_shape = arr.shape
+            elif arr.shape != expected_shape:
+                bad_files.append((f, f"shape_mismatch: {arr.shape} vs {expected_shape}"))
+                continue
+    
+            arrays.append(arr)
+    
+        if bad_files:
+            print(
+                f"\033[93m[WARN] Skipping {len(bad_files)} bad TIFF plane(s) "
+                f"(tile={tile}, channel={channel})\033[0m"
+            )
+            for bf, reason in bad_files:
+                print(f"\033[93m   - {bf.name}: {reason}\033[0m")
+    
+        if not arrays:
+            print(
+                f"\033[91m[WARN] No valid TIFF planes found (tile={tile}, channel={channel}). "
+                f"Skipping this tile/channel combo; no mipped image will be written for this tile/channel.\033[0m"
+            )
+            return None
+            
+        if len(arrays) != len(files):
+            print(
+                f"[INFO] Z planes: {len(arrays)}/{len(files)} valid "
+                f"(tile={tile}, channel={channel})"
+            )
+    
+        stack = np.stack(arrays, axis=0)
+    
         if stack.ndim != 3:
             raise ValueError(
                 f"Expected (Z,Y,X) stack, got shape={stack.shape} "
                 f"for tile={tile}, channel={channel}"
             )
     
-        # Ensure uint16 without copying if already correct
         return stack.astype(np.uint16, copy=False)
-
+        
     def build_metadata_args(
         self,
         ctx: Dict[str, Any],
@@ -2835,19 +3169,7 @@ class LifHandler(BaseHandler):
         # optional: expose raw XML header/root if readlif provides it
         ctx["lif_xml_root"] = getattr(lf, "xml_root", None)
 
-        # best-effort: objective mag + pixel size from metadata
-        mag = None
-        pixel_to_um_calc = None
-        try:
-            # If you already wrote this helper, keep using it.
-            # Should return: (objective_mag, pixel_to_um)
-            mag, pixel_to_um_calc = lif_get_mag_and_pixel_to_um(ctx)
-        except Exception:
-            pass
-
-        ctx["objective_mag"] = mag
-        ctx["objective_mag_source"] = "LIF xml_header/xml_root" if mag is not None else None
-        ctx["pixel_to_um_calc"] = pixel_to_um_calc
+        
 
         return ctx
 
@@ -2899,7 +3221,16 @@ class LifHandler(BaseHandler):
             image_dimensions=image_dimensions,
             mosaic=mosaic,
         )
+
+        try:
+            mag, pixel_to_um_calc = lif_get_mag_and_pixel_to_um(ctx)
+        except Exception:
+            mag, pixel_to_um_calc = None, None
         
+        ctx["objective_mag"] = mag
+        ctx["objective_mag_source"] = "LIF xml_header/xml_root" if mag is not None else None
+        ctx["pixel_to_um_calc"] = pixel_to_um_calc
+                
         return {
             "tiles": ctx["tiles"],
             "channels": ctx["channels"],
@@ -2973,7 +3304,7 @@ class LifHandler(BaseHandler):
                 if tile_id < 0 or tile_id >= len(mosaic):
                     # skip tiles that exist on disk but have no mosaic position entry
                     continue
-                p = mosaic[tile_id]  # expected: (FieldX, FieldY, PosX, PosY) with Pos in meters
+                p = mosaic[tile_id]  # expected: (FieldX, FieldY, PosX, PosY); raw units not guaranteed
                 tiles_iter.append((int(tile_id), int(p[0]), int(p[1]), float(p[2]), float(p[3])))
     
             if not tiles_iter:
@@ -2997,7 +3328,7 @@ class LifHandler(BaseHandler):
             image_dimensions=image_dimensions,
             pixel_to_um_manual=pixel_to_um_manual,
             pixel_to_um_calc=ctx.get("pixel_to_um_calc", None),
-            unit_hint_raw="m",  # LIF mosaic positions are meters
+            unit_hint_raw="unknown",  # raw LIF mosaic units unknown
             off_tol=0.25,
             tiles_iter=tiles_iter,
             app_name="LAS AF",
@@ -4436,6 +4767,10 @@ def deconvolve_and_mip(
             # ----- STEP 2: WRITE TileScanInfo via handler -----
             print("\033[96mExtracting metadata\033[0m")
 
+            run_processed = []
+            run_skipped = []
+            run_timestamp = datetime.now().isoformat(timespec="seconds")
+
             ctx = None
             # Open region using TRUE dataset index
             ctx = handler.open_region(
@@ -4675,6 +5010,11 @@ def deconvolve_and_mip(
             
                         # Skip processing if output file already exists
                         if file_exists_and_valid(output_file_path, min_size=1024):
+                            run_skipped.append({
+                                "tile": tile,
+                                "channel": channel,
+                                "reason": "output_already_exists",
+                            })
                             # (optional) keep your message if you want
                             # print(f"Valid output exists: {output_file_path}. Skipping.")
                             continue
@@ -4686,19 +5026,32 @@ def deconvolve_and_mip(
                             msg = str(e)
                             if ("PixelType( Unknown type )" in msg) or ("PylibCZI_PixelTypeException" in msg):
                                 print(f"{BOLD}[WARN]⚠️ {RESET} Skipping tile={tile}, ch={channel}: unsupported CZI pixel type.")
+                                run_skipped.append({
+                                    "tile": tile,
+                                    "channel": channel,
+                                    "reason": "unsupported_czi_pixel_type",
+                                })
                                 continue
                             raise
-
-    
+                        
+                        if stacked_images is None:
+                            run_skipped.append({
+                                "tile": tile,
+                                "channel": channel,
+                                "reason": "no_valid_stack",
+                            })
+                            continue
+                                                
                         if stacked_images.ndim != 3:
                             raise ValueError(
                                 f"Expected (Z,Y,X) stack, got shape {stacked_images.shape} "
                                 f"for mode={mode}, tile={tile}, channel={channel}"
                             )
+                        
                         if stacked_images.dtype != np.uint16:
                             stacked_images = stacked_images.astype(np.uint16, copy=False)
-    
-            
+
+                            
                         # Deconvolution with RedLionFish method
                         if deconvolution_method == "redlionfish":
     
@@ -4716,7 +5069,7 @@ def deconvolve_and_mip(
                                 )
                             tifffile.imwrite(output_file_path, processed_img)
                             print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
-                            
+
             
                         # Deconvolution with Deconwolf method
                         elif deconvolution_method == 'deconwolf':
@@ -4757,6 +5110,13 @@ def deconvolve_and_mip(
                             processed_img = np.max(stacked_images, axis=0).astype('uint16') if mip else stacked_images.astype('uint16')
                             tifffile.imwrite(output_file_path, processed_img)
                             print(f"{'Mipped' if mip else 'Stacked'} images saved in directory: {mipped_directory if mip else stacked_directory}")
+
+
+                        # Common success logging for all cases
+                        run_processed.append({
+                            "tile": tile,
+                            "channel": channel,
+                        })
         
         
                         tile_channel_end = time.time()
@@ -4767,6 +5127,33 @@ def deconvolve_and_mip(
                     shutil.rmtree(stacked_directory)
                     print(f"Deleted stacked directory: {stacked_directory}")
 
+                if run_processed or run_skipped:
+                    tilescan_xml_path = metadata_directory / f"R{region_number}.xml"
+                    if tilescan_xml_path.exists():
+                        append_run_info_to_tilescan_xml(
+                            tilescan_xml_path,
+                            timestamp=run_timestamp,
+                            cycle=cycle,
+                            region_number=region_number,
+                            mode=mode,
+                            deconvolution_method=deconvolution_method,
+                            deconvolution_iterations=num_iterations,
+                            mip=mip,
+                            processed=run_processed,
+                            skipped=run_skipped,
+                            parameters={
+                                "pixel_to_um": pixel_to_um,
+                                "chunk_size": chunk_size,
+                                "input_dir": str(input_dir),
+                                "n_tiles": len(tiles_all),
+                                "n_channels": len(channels),
+                                "tiles_processed": sorted({p["tile"] for p in run_processed}),
+                                "tiles_skipped": sorted({s["tile"] for s in run_skipped}),
+                            }
+                            )
+                    else:
+                        print(f"{BOLD}[WARN]⚠️ {RESET} TileScanInfo XML not found for run logging: {tilescan_xml_path}")
+                        
             finally:
                 # cleanup
                 if ctx is not None:
