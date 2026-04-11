@@ -4744,6 +4744,7 @@ def deconvolve_and_mip(
         # Process each region
         for region_index, region_name, region_number in region_items:
             print(f"\033[1;90mProcessing R{region_number}\033[0m")
+            print(f"Region name: {region_name}")
         
             # IMPORTANT:
             # - region_index → used for opening data
@@ -5824,8 +5825,56 @@ def align_and_stitch(
 
         # Clean up temporary Ashlar directory
         shutil.rmtree(tmp_path, ignore_errors=True)
-   
-    
+
+
+def plot_stitched_preview(region_directories, cycles, channels, downsample=100, cmap="gray"):
+    """
+    Simple QC preview for stitched images after align_and_stitch.
+    Displays heavily downsampled stitched images for requested
+    regions, cycles, and channels.
+
+    Args:
+        region_directories (list): List of region directories.
+        cycles (list): List of cycle numbers.
+        channels (list): List of channel numbers.
+        downsample (int): Keep every Nth pixel in Y and X.
+        cmap (str): Matplotlib colormap.
+    """
+
+    import matplotlib.pyplot as plt
+
+    for region_directory in region_directories:
+        region_directory = Path(region_directory)
+
+        for cycle in cycles:
+            for ch in channels:
+                tif_path = (
+                    region_directory
+                    / "preprocessing"
+                    / f"Cycle{cycle}"
+                    / "3_stitched"
+                    / f"Cycle{cycle}_ch{ch}.tif"
+                )
+
+                if not tif_path.exists():
+                    print(f"Missing: {tif_path}")
+                    continue
+
+                image = tifffile.imread(str(tif_path))
+                preview = image[::downsample, ::downsample]
+
+                vmin, vmax = np.percentile(preview, [1, 99])
+
+                plt.figure(figsize=(8, 8))
+                plt.imshow(preview, cmap=cmap, vmin=vmin, vmax=vmax)
+                plt.title(
+                    f"{region_directory.name} | Cycle {cycle} | ch {ch}\n"
+                    f"preview shape={preview.shape}, downsample={downsample}"
+                )
+                plt.axis("off")
+                plt.tight_layout()
+                plt.show()
+
 def retile_stitched_images(
     region_directories,
     cycles,
