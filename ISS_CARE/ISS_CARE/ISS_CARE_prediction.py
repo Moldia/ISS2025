@@ -109,7 +109,7 @@ def to_uint16_safe(
     return safe.astype(np.uint16)
 
 
-def ISS_CARE(
+def ISS_CARE_predict(
     input_dir,
     model_dir,
     model_name,
