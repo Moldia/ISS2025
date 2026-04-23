@@ -267,6 +267,8 @@ def plot_expression(
     plt.rcParams['figure.facecolor'] = 'white'
 
 
+from pathlib import Path
+
 def filter_reads(
     reads,
     min_quality_mean=False,
@@ -275,13 +277,34 @@ def filter_reads(
     max_radius=False,
     min_radius=False,
     min_intensity=False,
-    max_intensity=False
+    max_intensity=False,
+    *,
+    save_file: bool = False,
+    source_file: str | Path | None = None,
+    overwrite: bool = False
 ):
     """
-    Filter reads by thresholds on various columns.
+    Filter reads and optionally save next to the original decoded CSV.
+
+    Parameters
+    ----------
+    reads : pd.DataFrame
+        Input reads dataframe.
+    save_file : bool
+        If True, save filtered file next to source_file.
+    source_file : str or Path
+        Path to original decoded CSV (required if save_file=True).
+    overwrite : bool
+        Overwrite existing file if True.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered reads
     """
     readsfilt = reads.copy()
 
+    # --- Filtering ---
     if max_distance:
         readsfilt = readsfilt[readsfilt['distance'] < max_distance]
     if min_quality_mean:
@@ -296,5 +319,38 @@ def filter_reads(
         readsfilt = readsfilt[readsfilt['intensity'] > min_intensity]
     if max_intensity:
         readsfilt = readsfilt[readsfilt['intensity'] < max_intensity]
+
+    # --- Saving ---
+    if save_file:
+        if source_file is None:
+            raise ValueError("source_file must be provided when save_file=True")
+
+        source_file = Path(source_file)
+
+        # Build suffix from active filters
+        parts = []
+        if min_quality_mean:
+            parts.append(f"minqmean{min_quality_mean}")
+        if min_quality_minimum:
+            parts.append(f"minqmin{min_quality_minimum}")
+        if max_distance:
+            parts.append(f"maxdist{max_distance}")
+        if max_radius:
+            parts.append(f"maxrad{max_radius}")
+        if min_radius:
+            parts.append(f"minrad{min_radius}")
+        if min_intensity:
+            parts.append(f"minint{min_intensity}")
+        if max_intensity:
+            parts.append(f"maxint{max_intensity}")
+
+        suffix = "__" + "_".join(parts) if parts else "__filtered"
+        out_file = source_file.with_name(f"{source_file.stem}{suffix}.csv")
+
+        if out_file.exists() and not overwrite:
+            print(f"Skipping save (exists): {out_file.name}")
+        else:
+            readsfilt.to_csv(out_file, index=False)
+            print(f"Saved filtered reads: {out_file}")
 
     return readsfilt
