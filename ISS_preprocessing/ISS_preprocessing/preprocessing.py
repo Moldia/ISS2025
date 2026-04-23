@@ -6044,6 +6044,9 @@ def retile_stitched_images(
             # Write coords CSV once (grid coords)
             coords_csv_path = retiled_directory / f"Cycle{cycle}_retiled_coords.csv"
             pd.DataFrame({"x": x_positions, "y": y_positions}).to_csv(coords_csv_path, header=False, index=False)
-            print(f"Tiling complete. Positions saved to {coords_csv_path}")
+            print(
+                f"[INFO] Tiling complete. Retiled coordinate CSV written in PIXELS "
+                f"(upper-left tile corners): {coords_csv_path}"
+            )
 
 
