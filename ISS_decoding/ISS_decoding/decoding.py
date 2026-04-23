@@ -219,45 +219,55 @@ def process_experiment(
     input_dir, 
     regions_to_process=None,
     output_dir_prefix=None,
+    pixel_to_um=1,
     register=False, 
     register_dapi=False,
     masking_radius=15, 
-    normalization_method='MH',  # or other method
+    normalization_method='MH',
     decode_mode='PRMC',
     dense=False,
     spot_detection_mode='starfish',
-    int_threshold=0.002, # starfish threshold
-    sigma_vals=[1, 10, 30],  # min, max and number for starfish
-    prob_threshold=None # spotiflow threshold
-    
-    
+    int_threshold=0.002,
+    sigma_vals=[1, 10, 30],
+    prob_threshold=None
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
     Skips already-processed tiles, saves results as per-tile CSVs, and concatenates region-level CSV.
 
-    Args:
-        input_dir (str or Path): Path to top-level output directory containing regions (e.g., 'R1', 'R2').
-        register (bool): Whether to perform image registration (default True).
-        register_dapi (bool): If True, use nuclei (DAPI) for registration; otherwise, use signal max-projection.
-        masking_radius (int): Radius for WhiteTophat filtering (spot enhancement).
-        threshold (float): Threshold for blob detector in spot finding.
-        sigma_vals (list): [min_sigma, max_sigma, num_sigma] for spot finding.
-        decode_mode (str): Decoding algorithm to use ('PRMC' or 'MD').
-        normalization_method (str): Channel normalization ('MH' for match histograms or 'CPTZ').
-        dense (bool): If True, use dense per-channel decoding.
-
-    Workflow:
-        - For each region directory (matching 'R\\d+'):
-            - Determine which tiles/FOVs are already processed (per-tile CSV exists).
-            - For each unprocessed tile:
-                - Run spot finding & decoding via ISS_pipeline()
-                - Save per-tile decoded CSV
-            - Concatenate all per-tile CSVs to a region-level CSV file.
-
-    Notes:
-        - Robust to partial completion: skips tiles already processed.
-        - Output files are written in a subfolder of each region, named 'decoded' or 'decoded_dense'.
+    Parameters
+    ----------
+    input_dir : str or Path
+        Path to top-level output directory containing region folders (e.g., 'R1', 'R2').
+    regions_to_process : list[int] | None
+        Optional list of 1-based region numbers to process.
+    output_dir_prefix : str | Path | None
+        Optional base directory for outputs.
+    pixel_to_um : float, optional
+        Spatial scaling used in the SpaceTX experiment coordinates.
+        - pixel_to_um = 1   -> decoded coordinates are in pixels
+        - pixel_to_um != 1  -> decoded coordinates are in microns
+        This value is recorded in decoded CSV outputs.
+    register : bool
+        Whether to perform image registration.
+    register_dapi : bool
+        If True, use nuclei (DAPI) for registration.
+    masking_radius : int
+        Radius for WhiteTophat filtering.
+    normalization_method : str
+        Channel normalization mode.
+    decode_mode : str
+        Decoding algorithm to use ('PRMC' or 'MD').
+    dense : bool
+        If True, use dense per-channel decoding.
+    spot_detection_mode : str
+        Spot detection backend.
+    int_threshold : float
+        Threshold for starfish blob detection.
+    sigma_vals : list
+        [min_sigma, max_sigma, num_sigma] for starfish blob detection.
+    prob_threshold : float | None
+        Spotiflow threshold if used.
     """
         
     # --- Step 1: Discover/select region directories ---
@@ -274,10 +284,13 @@ def process_experiment(
     # We NEVER overwrite XMLs: each productive run writes a unique XML.
     # -------------------------------------------------------------------------
     run_id = ET.datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") if hasattr(ET, "datetime") else None
-    # NOTE: xml.etree.ElementTree doesn't provide datetime; keep policy local below.
-    # We'll create run_id using the standard library without changing behavior elsewhere.
     from datetime import datetime as _dt
     run_id = _dt.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+
+    if pixel_to_um == 1:
+        print(f"[INFO] Decoding coordinate units: pixels (pixel_to_um={pixel_to_um})")
+    else:
+        print(f"[INFO] Decoding coordinate units: microns (pixel_to_um={pixel_to_um})")
 
     # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
@@ -305,7 +318,7 @@ def process_experiment(
         if m:
             regions_found.append((int(m.group(1)), r))
     
-    regions_found.sort(key=lambda t: t[0])  # R1, R2, R10 correctly
+    regions_found.sort(key=lambda t: t[0])
     
     if not regions_found:
         raise RuntimeError(f"No regions found in {input_dir} (expected folders like R1, R2, ...)")
@@ -329,14 +342,13 @@ def process_experiment(
                 f"Available regions: {[f'R{n}' for n in available_numbers]}"
             )
     
-        # keep user-requested order
         region_numbers = wanted
         region_directories = [available_map[n] for n in wanted]
     else:
         region_numbers = available_numbers
         region_directories = [available_map[n] for n in available_numbers]
     
-    # --- Logging (mirrors SpaceTx style) ---
+    # --- Logging ---
     all_regions = [f"R{n}" for n in available_numbers]
     selected_regions = [f"R{n}" for n in region_numbers]
     skipped_regions = [r for r in all_regions if r not in selected_regions]
@@ -346,10 +358,9 @@ def process_experiment(
     if skipped_regions:
         print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
     
-        
     # --- Step 2: Load model once (only if detection mode is spotiflow) ---
     SPOTIFLOW_MODEL = None
-    SpotiflowDetector = None  # define the name even if we don't import it
+    SpotiflowDetector = None
     
     if spot_detection_mode == "spotiflow":
         from spotiflow.model import Spotiflow
@@ -357,7 +368,6 @@ def process_experiment(
     
         SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
     
-
     # --- Step 3: Process each region directory ---
     for region_directory in region_directories:
         
@@ -369,20 +379,16 @@ def process_experiment(
         
         decoded_dir.mkdir(parents=True, exist_ok=True)
 
-
         print("=" * 60)
         print(f"\033[1mProcessing region {region_name}\033[0m")
         print(f"Output decoded directory: {decoded_dir}")
 
         # ===== EARLY EXIT CHECK =====
-        # If the region-level CSV exists, we skip the entire region and write NO XML
-        # (because this run did not generate region-level outputs).
         final_csv = decoded_dir / f"{region_name}_decoded.csv"
         if final_csv.exists():
             print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
             print(f"  ✔ {final_csv}")
             continue
-
 
         # --- Step 4: Load SpaceTx experiment metadata ---
         if output_dir_prefix is None:
@@ -404,38 +410,35 @@ def process_experiment(
 
         # --- Step 6: Decode each unprocessed tile ---
         for tile_id in not_done:
-
-                            
             tile = experiment[tile_id]
             print(f"\033[1;90mProcessing tile {tile_id[-3:]} \033[0m")
             df = ISS_pipeline(
-                    tile,
-                    experiment.codebook,
-                    dense=dense,
-                    register=register,
-                    register_dapi=register_dapi,
-                    masking_radius=masking_radius,
-                    int_threshold=int_threshold,
-                    sigma_vals=sigma_vals,
-                    decode_mode=decode_mode,
-                    channel_normalization=normalization_method
+                tile,
+                experiment.codebook,
+                dense=dense,
+                register=register,
+                register_dapi=register_dapi,
+                masking_radius=masking_radius,
+                int_threshold=int_threshold,
+                sigma_vals=sigma_vals,
+                decode_mode=decode_mode,
+                channel_normalization=normalization_method
             )
+
             if df is None or df.empty:
                 continue
+
             df['tile'] = tile_id
-            # save per-tile CSV
+            df['coordinate_units'] = 'pixels' if pixel_to_um == 1 else 'microns'
+            df['coordinate_pixel_to_um'] = pixel_to_um
+
             print(f"Saving per-tile CSV: {decoded_dir / f'{tile_id}.csv'}")
             df.to_csv(decoded_dir / f"{tile_id}.csv", index=False)
-            
 
         # --- Step 7: Write region-level concatenated CSV by reading per-tile files named "fov*.csv" ---
         print(f"\nWriting region-level concatenated CSV for {region_name!r} ...")
 
-        # Track whether this run actually wrote the region-level output CSV.
-        # If False, we do NOT write an XML for this region.
         wrote_region_csv = False
-        
-        # find all per-tile CSVs that start with "fov" (and end in .csv)
         csv_paths = sorted(decoded_dir.glob("fov*.csv"))
         
         if not csv_paths:
@@ -447,26 +450,18 @@ def process_experiment(
                 dfs.append(df)
                 print(f"  • Loaded {p.name} ({len(df)} rows)")
         
-            # concatenate them
             concat = pd.concat(dfs, ignore_index=True)
             concat.insert(0, 'cont. spot ids', np.arange(len(concat), dtype=int))
         
             out_file = decoded_dir / f"{region_name}_decoded.csv"
             concat.to_csv(out_file, index=False)
-            wrote_region_csv = True  # region-level file was generated in this run
+            wrote_region_csv = True
             print(f" → Wrote {len(concat)} total rows to {out_file.name}")
-        
 
-        # --- ADDED: Write an XML manifest in the decoded folder (per region) ---
-        #
-        # Provenance policy requested:
-        #   - Only write XML if this run wrote the region-level CSV.
-        #   - Never overwrite existing XMLs: use a unique filename with run_id.
+        # --- Write XML provenance only if this run wrote the region CSV ---
         if wrote_region_csv:
             xml_path = decoded_dir / f"decoding_run_{run_id}.xml"
             root = ET.Element("ISSDecodingRun", attrib={"region": str(region_name)})
-
-            # Optional: store run_id inside XML too (useful when filenames are moved/copied)
             root.set("run_id", str(run_id))
 
             paths_el = ET.SubElement(root, "Paths")
@@ -486,6 +481,8 @@ def process_experiment(
             ET.SubElement(params_el, "int_threshold").text = str(int_threshold)
             ET.SubElement(params_el, "sigma_vals").text = ",".join([str(x) for x in sigma_vals])
             ET.SubElement(params_el, "prob_threshold").text = "None" if prob_threshold is None else str(prob_threshold)
+            ET.SubElement(params_el, "coordinate_units").text = "pixels" if pixel_to_um == 1 else "microns"
+            ET.SubElement(params_el, "coordinate_pixel_to_um").text = str(pixel_to_um)
 
             tiles_el = ET.SubElement(root, "Tiles")
             ET.SubElement(tiles_el, "tiles_total").text = str(len(tiles))
@@ -494,9 +491,8 @@ def process_experiment(
 
             tree = ET.ElementTree(root)
             try:
-                ET.indent(tree, space="  ", level=0)  # python>=3.9
+                ET.indent(tree, space="  ", level=0)
             except Exception:
                 pass
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             print(f"[{region_name}] Decoding XML written to: {xml_path}")
-        # --- END ADDED XML ---
