@@ -9,104 +9,131 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Sequence
 
+# -----------------------------------------------------------------------------
+# GPU setup
+#
+# Keep this simple and automatic:
+# - select one GPU before importing TensorFlow / CSBDeep
+# - print one short informative line
+# - let TensorFlow see only that GPU
+# -----------------------------------------------------------------------------
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+
+def choose_gpu_for_rl(
+    preferred_max_mem_mb: int = 2000,
+    preferred_max_util: int = 20,
+) -> int | None:
+    """
+    Select one GPU using a simple "prefer free GPU" strategy.
+
+    Priority
+    --------
+    1. Prefer GPUs with:
+         - memory.used <= preferred_max_mem_mb
+         - utilization.gpu <= preferred_max_util
+    2. Otherwise choose the GPU with the lowest memory use.
+    3. Break ties by lower utilization, then lower GPU index.
+
+    Side effects
+    ------------
+    Sets:
+      - CUDA_VISIBLE_DEVICES
+      - PYOPENCL_CTX
+
+    Returns
+    -------
+    int | None
+        Selected physical GPU index, or None if selection failed.
+    """
+    try:
+        result = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,utilization.gpu",
+                "--format=csv,nounits,noheader",
+            ],
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8", errors="replace").strip()
+
+        if not result:
+            print("[WARN] nvidia-smi returned no GPU information.")
+            return None
+
+        rows: list[tuple[int, int, int]] = []
+        for line in result.splitlines():
+            idx, mem, util = [x.strip() for x in line.split(",")]
+            rows.append((int(idx), int(mem), int(util)))
+
+        if not rows:
+            print("[WARN] No GPUs parsed from nvidia-smi output.")
+            return None
+
+        preferred = [
+            row for row in rows
+            if row[1] <= preferred_max_mem_mb and row[2] <= preferred_max_util
+        ]
+
+        candidates = preferred if preferred else rows
+        candidates.sort(key=lambda x: (x[1], x[2], x[0]))
+        gpu_id, mem_mb, util_pct = candidates[0]
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
+
+        print(f"[INFO] Selected GPU {gpu_id} (mem={mem_mb} MiB, util={util_pct}%)")
+        return gpu_id
+
+    except Exception as e:
+        print(f"[WARN] Automatic GPU selection failed: {e}")
+        print("[WARN] Proceeding without forcing CUDA_VISIBLE_DEVICES.")
+        return None
+
+
+# Must run before TensorFlow / CSBDeep imports.
+choose_gpu_for_rl()
+
 import matplotlib.pyplot as plt
 import numpy as np
+import tensorflow as tf
 from csbdeep.io import load_training_data
 from csbdeep.models import CARE, Config
 from csbdeep.utils import axes_dict, plot_history, plot_some
 
-
-def get_free_gpu() -> Optional[int]:
-    """
-    Return the GPU index with the lowest currently used memory.
-
-    Returns
-    -------
-    int or None
-        GPU index if available, otherwise None.
-
-    Notes
-    -----
-    This uses `nvidia-smi` and is meant for shared GPU servers where we want
-    to pick the least busy device automatically.
-    """
-    try:
-        result = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"]
-        )
-        memory_used = [int(x) for x in result.decode("utf-8").strip().split("\n")]
-        if not memory_used:
-            return None
-        return memory_used.index(min(memory_used))
-    except Exception:
-        return None
-
-
-def select_gpu_with_lowest_memory() -> Optional[int]:
-    """
-    Restrict TensorFlow visibility to the GPU with the lowest current memory usage.
-
-    Returns
-    -------
-    int or None
-        Physical GPU index selected from the machine-wide GPU list.
-    """
-    gpu_id = get_free_gpu()
-    if gpu_id is None:
-        print("No GPU selected with nvidia-smi. Training may run on CPU.")
-        return None
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    print(f"Selected physical GPU {gpu_id} via nvidia-smi.")
-
-    import tensorflow as tf
-
-    gpus = tf.config.list_physical_devices("GPU")
-    print(f"TensorFlow sees {len(gpus)} visible GPU(s) after CUDA_VISIBLE_DEVICES masking.")
-    for i, gpu in enumerate(gpus):
-        print(
-            f"  TensorFlow visible GPU {i}: {gpu} "
-            f"(corresponds to physical GPU {gpu_id})"
-        )
-
-    if not gpus:
-        print("WARNING: TensorFlow does not see any GPUs after selection.")
-
-    return gpu_id
-
-
-def configure_tensorflow_memory_growth():
-    """
-    Enable TensorFlow memory growth on all currently visible GPUs.
-
-    Why this helps
-    --------------
-    Without memory growth, TensorFlow often grabs most GPU memory up front.
-    On shared systems this is inconvenient and can cause conflicts.
-
-    Notes
-    -----
-    This function also uses a lazy TensorFlow import. It should be called
-    after `select_gpu_with_lowest_memory()` and before model creation/training.
-    """
-    import tensorflow as tf
-
-    gpus = tf.config.list_physical_devices("GPU")
-
+# Enable TensorFlow memory growth so it does not grab all GPU memory up front.
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"[INFO] TensorFlow sees {len(gpus)} GPU(s)")
     except RuntimeError as e:
-        print(f"WARNING: Could not set memory growth: {e}")
+        print(f"[WARN] Could not set TensorFlow memory growth: {e}")
+else:
+    print("[INFO] TensorFlow sees no GPU. Training will run on CPU.")
 
-    print("TensorFlow:", tf.__version__)
-    print("Visible GPUs:", len(gpus))
 
-    if not gpus:
-        print("WARNING: No GPU detected — training will run on CPU.")
+# -----------------------------------------------------------------------------
+# JSON helper
+# -----------------------------------------------------------------------------
 
-    return gpus
+def to_jsonable(obj):
+    """
+    Recursively convert numpy/scalar/container types into JSON-safe Python types.
+    """
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
 
+
+# -----------------------------------------------------------------------------
+# Patch file helpers
+# -----------------------------------------------------------------------------
 
 def find_patch_dir(
     care_root: Path,
@@ -158,6 +185,49 @@ def resolve_patch_file(
         "Please specify patch_file_name explicitly."
     )
 
+
+def resolve_patch_metadata_file(
+    patch_file: Path,
+    metadata_suffix: str = "__metadata.json",
+) -> Optional[Path]:
+    """
+    Resolve the sidecar metadata file saved next to a patch file.
+
+    Returns None if no sidecar metadata file exists.
+    """
+    metadata_file = patch_file.with_name(f"{patch_file.stem}{metadata_suffix}")
+    if metadata_file.exists():
+        return metadata_file
+    return None
+
+
+def load_json_file(path: Path) -> dict:
+    """
+    Load a JSON file into a dictionary.
+    """
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def build_model_run_name(
+    *,
+    patch_file: Path,
+    prefix: str = "CARE",
+) -> str:
+    """
+    Build a unique model run name using patch file stem + timestamp.
+
+    Example
+    -------
+    CARE__NON_DAPI_train_patches_Leica40X_final__2026-04-15_14-32
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    return f"{prefix}__{patch_file.stem}__{timestamp}"
+
+
+# -----------------------------------------------------------------------------
+# Patch loading / validation
+# -----------------------------------------------------------------------------
 
 def summarize_loaded_patches(X: np.ndarray, Y: np.ndarray, name: str = "training"):
     """
@@ -242,6 +312,25 @@ def load_care_training_data(
     print("Output channels:", n_channel_out)
     print("Validation split:", validation_split)
 
+    patch_metadata_file = resolve_patch_metadata_file(patch_file)
+    if patch_metadata_file is not None:
+        print("Patch metadata file:", patch_metadata_file)
+        try:
+            patch_metadata = load_json_file(patch_metadata_file)
+            if "sample_summary" in patch_metadata:
+                sample_summary = patch_metadata["sample_summary"]
+                if isinstance(sample_summary, dict):
+                    if "patches_per_sample" in sample_summary:
+                        print("Patch counts per sample:")
+                        for k, v in sample_summary["patches_per_sample"].items():
+                            print(f"  {k}: {v}")
+                    elif "n_patches_total" in patch_metadata:
+                        print("Total patches recorded in metadata:", patch_metadata["n_patches_total"])
+        except Exception as e:
+            print(f"WARNING: Could not read patch metadata file: {e}")
+    else:
+        print("Patch metadata file: not found")
+
     summarize_loaded_patches(X, Y, name="training")
     summarize_loaded_patches(X_val, Y_val, name="validation")
 
@@ -250,6 +339,10 @@ def load_care_training_data(
 
     return X, Y, X_val, Y_val, axes, n_channel_in, n_channel_out
 
+
+# -----------------------------------------------------------------------------
+# Optional normalization
+# -----------------------------------------------------------------------------
 
 def normalize_percentile(
     arr: np.ndarray,
@@ -321,6 +414,10 @@ def normalize_patch_dataset(
     return X, Y, X_val, Y_val
 
 
+# -----------------------------------------------------------------------------
+# Plotting helpers
+# -----------------------------------------------------------------------------
+
 def plot_patch_examples(
     X: np.ndarray,
     Y: np.ndarray,
@@ -337,6 +434,26 @@ def plot_patch_examples(
     plt.show()
 
 
+def plot_training_curves(history):
+    """
+    Plot training history from CARE training.
+    """
+    keys = sorted(history.history.keys())
+    print("Available metrics:", keys)
+
+    loss_keys = [k for k in ["loss", "val_loss"] if k in history.history]
+    metric_keys = [k for k in ["mse", "val_mse", "mae", "val_mae"] if k in history.history]
+
+    plt.figure(figsize=(12, 4))
+    plot_history(history, loss_keys, metric_keys)
+    plt.tight_layout()
+    plt.show()
+
+
+# -----------------------------------------------------------------------------
+# CARE model config / training
+# -----------------------------------------------------------------------------
+
 def build_care_config(
     *,
     axes: str,
@@ -346,12 +463,24 @@ def build_care_config(
     train_steps_per_epoch: int,
     train_epochs: int,
     unet_kern_size: int = 3,
+    unet_n_depth: int = 2,
     train_learning_rate: float = 2e-4,
     train_reduce_lr: Optional[dict] = None,
     probabilistic: bool = False,
+    train_loss: Optional[str] = None,
 ):
     """
     Build a csbdeep CARE Config object.
+
+    Parameters
+    ----------
+    train_loss : str or None
+        Optional training loss override, e.g. "mae" or "mse".
+
+    Notes
+    -----
+    Some CARE / CSBDeep versions do not accept `train_loss` directly in the
+    Config constructor, so we set it after creating the config object.
     """
     if train_reduce_lr is None:
         train_reduce_lr = {"factor": 0.5, "patience": 10}
@@ -362,12 +491,39 @@ def build_care_config(
         n_channel_out=n_channel_out,
         probabilistic=probabilistic,
         unet_kern_size=unet_kern_size,
+        unet_n_depth=unet_n_depth,
         train_batch_size=train_batch_size,
         train_steps_per_epoch=train_steps_per_epoch,
         train_epochs=train_epochs,
         train_learning_rate=train_learning_rate,
         train_reduce_lr=train_reduce_lr,
     )
+
+    if train_loss is not None:
+        try:
+            config.train_loss = train_loss
+            print(f"Using training loss: {config.train_loss}")
+        except Exception as e:
+            print(
+                f"WARNING: Could not set train_loss={train_loss!r} on Config. "
+                f"Proceeding with default CARE loss. Error: {e}"
+            )
+
+    print("\nConfig summary:")
+    print(f"  axes: {config.axes}")
+    print(f"  n_channel_in: {config.n_channel_in}")
+    print(f"  n_channel_out: {config.n_channel_out}")
+    print(f"  probabilistic: {config.probabilistic}")
+    print(f"  unet_kern_size: {config.unet_kern_size}")
+    print(f"  unet_n_depth: {config.unet_n_depth}")
+    print(f"  train_batch_size: {config.train_batch_size}")
+    print(f"  train_steps_per_epoch: {config.train_steps_per_epoch}")
+    print(f"  train_epochs: {config.train_epochs}")
+    print(f"  train_learning_rate: {config.train_learning_rate}")
+    print(f"  train_reduce_lr: {config.train_reduce_lr}")
+    if hasattr(config, "train_loss"):
+        print(f"  train_loss: {config.train_loss}")
+
     return config
 
 
@@ -408,6 +564,7 @@ def print_model_save_info(
     print("  - weights_last.h5        (last epoch checkpoint, depending on version/setup)")
     print("  - config.json            (model/config description)")
     print("  - training_metadata.json (run metadata from this script)")
+    print("  - training_history.json  (saved training curves/metrics)")
     print("\nAt the end of training, CARE usually restores the best checkpoint")
     print("when it prints: Loading network weights from 'weights_best.h5'.")
     print("=" * 60 + "\n")
@@ -436,20 +593,46 @@ def train_care_model(
     return history
 
 
-def plot_training_curves(history):
+def save_training_history(
+    history,
+    *,
+    model_dir: Path,
+    model_name: str,
+    filename: str = "training_history.json",
+) -> Path:
     """
-    Plot training history from CARE training.
+    Save Keras/CARE training history as JSON.
+
+    Converts numpy scalar types (e.g. float32) to plain Python floats
+    so the history can be serialized safely.
     """
-    keys = sorted(history.history.keys())
-    print("Available metrics:", keys)
+    out_dir = model_dir / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    loss_keys = [k for k in ["loss", "val_loss"] if k in history.history]
-    metric_keys = [k for k in ["mse", "val_mse", "mae", "val_mae"] if k in history.history]
+    history_clean = to_jsonable(history.history)
 
-    plt.figure(figsize=(12, 4))
-    plot_history(history, loss_keys, metric_keys)
-    plt.tight_layout()
-    plt.show()
+    history_file = out_dir / filename
+    with open(history_file, "w") as f:
+        json.dump(history_clean, f, indent=2)
+
+    print("Saved training history:", history_file)
+    return history_file
+
+
+# -----------------------------------------------------------------------------
+# Validation prediction check
+# -----------------------------------------------------------------------------
+
+def summarize_validation_prediction(
+    Y_true: np.ndarray,
+    Y_pred: np.ndarray,
+) -> dict[str, float]:
+    """
+    Compute simple numeric validation summary statistics.
+    """
+    mae = float(np.mean(np.abs(Y_true - Y_pred)))
+    mse = float(np.mean((Y_true - Y_pred) ** 2))
+    return {"mae": mae, "mse": mse}
 
 
 def predict_on_validation_examples(
@@ -482,8 +665,17 @@ def predict_on_validation_examples(
     )
     plt.show()
 
+    summary = summarize_validation_prediction(Y_example, Y_pred)
+    print("Validation prediction summary:")
+    print(f"  MAE: {summary['mae']:.6g}")
+    print(f"  MSE: {summary['mse']:.6g}")
+
     return X_example, Y_example, Y_pred
 
+
+# -----------------------------------------------------------------------------
+# Metadata
+# -----------------------------------------------------------------------------
 
 def build_training_metadata(
     *,
@@ -497,7 +689,9 @@ def build_training_metadata(
     train_steps_per_epoch: int,
     train_epochs: int,
     unet_kern_size: int,
+    unet_n_depth: int,
     train_learning_rate: float,
+    train_loss: Optional[str],
     probabilistic: bool,
     axes: str,
     X_shape,
@@ -513,12 +707,12 @@ def build_training_metadata(
 ):
     """
     Build metadata dictionary for a CARE training run.
-    """
-    import tensorflow as tf
 
+    This version ensures everything is JSON-serializable.
+    """
     model_output_dir = (model_dir / model_name).resolve()
 
-    return {
+    metadata = {
         "timestamp": datetime.now().isoformat(),
         "user": getpass.getuser(),
         "hostname": socket.gethostname(),
@@ -537,11 +731,6 @@ def build_training_metadata(
             "LAST_WEIGHTS_FILE": str(model_output_dir / "weights_last.h5"),
             "CONFIG_FILE": str(model_output_dir / "config.json"),
             "METADATA_FILE": str(model_output_dir / "training_metadata.json"),
-            "NOTES": (
-                "During/after training, CARE typically uses weights_best.h5 as the "
-                "best validation checkpoint. Depending on version/setup, "
-                "weights_last.h5 may also be present."
-            ),
         },
         "training_parameters": {
             "VALIDATION_SPLIT": validation_split,
@@ -549,20 +738,16 @@ def build_training_metadata(
             "TRAIN_STEPS_PER_EPOCH": train_steps_per_epoch,
             "TRAIN_EPOCHS": train_epochs,
             "UNET_KERN_SIZE": unet_kern_size,
+            "UNET_N_DEPTH": unet_n_depth,
             "TRAIN_LEARNING_RATE": train_learning_rate,
+            "TRAIN_LOSS": train_loss,
             "PROBABILISTIC": probabilistic,
         },
         "normalization": {
             "ENABLED": normalization_enabled,
-            "METHOD": "per-patch percentile normalization" if normalization_enabled else None,
             "PMIN": normalization_pmin,
             "PMAX": normalization_pmax,
             "EPS": normalization_eps,
-            "APPLIED_TO": ["X", "Y", "X_val", "Y_val"] if normalization_enabled else [],
-            "NOTE": (
-                "If normalization is enabled here, inference inputs should be "
-                "normalized the same way before prediction."
-            ),
         },
         "data": {
             "axes": axes,
@@ -575,8 +760,12 @@ def build_training_metadata(
         },
         "environment": {
             "tensorflow_version": tf.__version__,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "pyopencl_ctx": os.environ.get("PYOPENCL_CTX"),
         },
     }
+
+    return to_jsonable(metadata)
 
 
 def save_training_metadata(
@@ -587,14 +776,16 @@ def save_training_metadata(
     filename: str = "training_metadata.json",
 ) -> Path:
     """
-    Save training metadata next to the trained model.
+    Save training metadata next to the trained model (JSON-safe).
     """
     out_dir = model_dir / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    metadata_clean = to_jsonable(metadata)
+
     metadata_file = out_dir / filename
     with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(metadata_clean, f, indent=2)
 
     print("Saved training metadata:", metadata_file)
     return metadata_file

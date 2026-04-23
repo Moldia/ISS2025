@@ -35,8 +35,16 @@
 # - saves outputs as sparse masks
 #
 # StarDist:
-# - kept simple
-# - runs on one image at a time, like the old code
+# - supports the same two input modes as Cellpose:
+#       1) retiled tiles in 4_retiled
+#       2) stitched image in 3_stitched
+# - for retiled input:
+#       - segments each tile individually
+#       - offsets labels so IDs stay unique across tiles
+#       - stitches tiles into one final full-size segmentation
+# - for stitched input:
+#       - segments the stitched image directly
+# - saves outputs as sparse masks
 #
 # Notes
 # -----
@@ -314,30 +322,49 @@ def normalize_percentile(x, pmin=1, pmax=99.8, clip=True):
 def stardist_segmentation(
     input_dir,
     region,
-    image_name,
+    output_dir_prefix=None,
+    DAPI_ch=4,
+    input_image_type="retiled",
     model_name="2D_versatile_fluo",
     expand_cells=True,
     n_tiles=(4, 4),
     expanded_distance=20,
-    output_dir_prefix=None,
-    input_image_type="retiled",
-    auto_select_gpu=False,
+    auto_select_gpu=True,
 ):
     """
-    Run StarDist on ONE image and save sparse labels / expanded labels.
+    Segment DAPI images with StarDist.
 
-    This keeps the old StarDist behavior: one image per call.
+    Supports two input modes:
+    - "retiled": segment all retiled tiles in 4_retiled and stitch them
+    - "stitched": segment a single stitched image in 3_stitched
 
     Parameters
     ----------
-    image_name : str
-        For retiled input this should be something like:
-            Cycle1_s0_ch4.tif
-        For stitched input this should be:
-            Cycle1_ch4.tif
-        The stitched helper path is still controlled by input_image_type.
+    input_dir : str | Path
+        Root folder containing region folders.
+    region : str
+        Region identifier (e.g. "R1").
+    output_dir_prefix : str | Path | None
+        Optional alternative output root.
+    DAPI_ch : int
+        DAPI channel number.
+    input_image_type : {"retiled","stitched"}
+        Which image layout to use.
+    model_name : str
+        StarDist pretrained model name.
+    expand_cells : bool
+        Whether to expand labels before saving.
+    n_tiles : tuple
+        StarDist prediction tiling.
+    expanded_distance : int
+        Label expansion distance.
+    auto_select_gpu : bool
+        Automatically select a free GPU.
     """
     validate_input_image_type(input_image_type)
+
+    print(f"\n\033[1mProcessing region: {region} (StarDist)\033[0m")
+    print(f"[INFO] input_image_type = {input_image_type}")
 
     # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
@@ -347,33 +374,18 @@ def stardist_segmentation(
     else:
         print("[INFO] Using default output location under each region directory")
 
-    if auto_select_gpu:
-        choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20)
-
-    if input_image_type == "retiled":
-        image_path = get_retiled_dir(input_dir, region) / image_name
-    else:
-        image_path = get_stitched_dir(input_dir, region) / image_name
-
     output_dir = get_segmentation_dir(
         input_dir,
         region,
         output_dir_prefix=output_dir_prefix,
     )
 
-    print(f"\nProcessing region: {region}")
-    print(f"Image: {image_path}")
-
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    image = imread(str(image_path))
-    print("Image shape:", image.shape)
-
-    print("Normalizing image")
-    image_norm = normalize_percentile(image, 1, 99.8)
+    if auto_select_gpu:
+        print("[INFO] Attempting automatic GPU selection")
+        choose_gpu(preferred_max_mem_mb=2000, preferred_max_util=20)
 
     print(f"Initializing StarDist model: {model_name}")
+
     with mute_fds():
         import tensorflow as tf
         from stardist.models import StarDist2D
@@ -386,7 +398,83 @@ def stardist_segmentation(
 
         model = StarDist2D.from_pretrained(model_name)
 
-    print("Running StarDist")
+    # -------------------------------------------------------------------------
+    # Mode 1: retiled input
+    # -------------------------------------------------------------------------
+    if input_image_type == "retiled":
+        image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
+        coords = read_retiled_coords(input_dir, region)
+
+        print(f"Found {len(image_paths)} retiled images for channel ch{int(DAPI_ch)}")
+        print(f"Found {len(coords)} coordinate rows")
+
+        if len(image_paths) != len(coords):
+            raise ValueError(
+                f"Number of tiles ({len(image_paths)}) does not match coordinate rows ({len(coords)})"
+            )
+
+        tile_arrays = []
+        running_offset = 0
+
+        for image_path in image_paths:
+            print(f"Tile: {image_path.name}")
+
+            image = imread(str(image_path))
+            image_norm = normalize_percentile(image, 1, 99.8)
+
+            try:
+                labels, details = model.predict_instances(
+                    image_norm,
+                    n_tiles=n_tiles,
+                    show_tile_progress=False,
+                )
+            except TypeError:
+                labels, details = model.predict_instances(image_norm, n_tiles=n_tiles)
+
+            labels = measure.label(labels)
+
+            if expand_cells:
+                expanded = expand_labels(labels, distance=expanded_distance)
+            else:
+                expanded = labels
+
+            expanded = expanded.astype(np.uint32)
+
+            # Keep IDs unique across tiles before stitching
+            expanded, running_offset = offset_labels(expanded, running_offset)
+            tile_arrays.append(expanded)
+
+            tile_out = output_dir / f"{image_path.stem}_stardist_retiled_tile.npz"
+            save_npz(tile_out, coo_matrix(expanded), compressed=True)
+
+        print("Stitching StarDist tiles from coordinate CSV")
+        expanded = stitch_tiles_from_coords(tile_arrays, coords)
+        expanded_coo = coo_matrix(expanded)
+
+        final_out = output_dir / f"{region}_stardist_retiled_expanded.npz"
+        save_npz(final_out, expanded_coo, compressed=True)
+
+        print(f"Saved final retiled segmentation to: {final_out}\n")
+        return expanded, expanded_coo
+
+    # -------------------------------------------------------------------------
+    # Mode 2: stitched input
+    # -------------------------------------------------------------------------
+    image_path = get_stitched_image_path(input_dir, region, DAPI_ch=DAPI_ch)
+    print("[INFO] Running StarDist on stitched image")
+    print(f"[INFO] Using stitched image: {image_path}")
+
+    image = imread(str(image_path))
+    n_pixels = image.shape[0] * image.shape[1]
+    print(f"[INFO] Stitched image shape: {image.shape} ({n_pixels:,} pixels)")
+
+    if n_pixels > 150_000_000:
+        print("[WARNING] Very large stitched image detected.")
+        print("[WARNING] StarDist may be slow or memory-intensive.")
+        print("[WARNING] If needed, rerun with input_image_type='retiled'.")
+
+    image_norm = normalize_percentile(image, 1, 99.8)
+
     try:
         labels, details = model.predict_instances(
             image_norm,
@@ -398,18 +486,20 @@ def stardist_segmentation(
 
     labels = measure.label(labels)
 
-    stem = image_path.stem
-    labels_out = output_dir / f"{region}_{stem}_stardist_labels.npz"
-    save_npz(labels_out, coo_matrix(labels), compressed=True)
-
     if expand_cells:
         expanded = expand_labels(labels, distance=expanded_distance)
-        expanded_out = output_dir / f"{region}_{stem}_stardist_expanded.npz"
-        save_npz(expanded_out, coo_matrix(expanded), compressed=True)
+    else:
+        expanded = labels
 
-    print("Done\n")
+    expanded = expanded.astype(np.uint32)
+    expanded_coo = coo_matrix(expanded)
 
+    final_out = output_dir / f"{region}_stardist_stitched_expanded.npz"
+    save_npz(final_out, expanded_coo, compressed=True)
 
+    print(f"Saved stitched segmentation to: {final_out}\n")
+    return expanded, expanded_coo
+    
 # -----------------------------------------------------------------------------
 # Cellpose helpers
 # -----------------------------------------------------------------------------
@@ -882,14 +972,74 @@ def save_contour_mask(segmentation_dir, region, segmentation_method, contour_ima
     print(f"Contour mask saved to: {out_path}")
     return out_path
 
+
+
+def resolve_segmentation_mask_path(
+    input_dir,
+    region,
+    segmentation_method,
+    input_image_type="stitched",
+    output_dir_prefix=None,
+    segmentation_file=None,
+):
+    """
+    Resolve the segmentation mask path explicitly.
+
+    Priority
+    --------
+    1. If segmentation_file is provided, use it directly.
+    2. Otherwise build the expected path from:
+       - output_dir_prefix, if provided
+       - else the default region output under input_dir
+
+    Notes
+    -----
+    - If segmentation_file is provided, it can be any supported segmentation
+      output (e.g. cellpose, stardist, baysor), as long as it points to a valid
+      sparse .npz segmentation mask.
+    - If segmentation_file is not provided, filename conventions are used and
+      segmentation_method must match the saved mask naming scheme.
+    """
+    validate_input_image_type(input_image_type)
+
+    if segmentation_file is not None:
+        mask_file = Path(segmentation_file)
+        if not mask_file.is_file():
+            raise FileNotFoundError(f"Segmentation mask not found: {mask_file}")
+        print(f"[INFO] Using provided segmentation file: {mask_file}")
+        return mask_file
+
+    segmentation_dir = get_segmentation_dir(
+        input_dir,
+        region,
+        output_dir_prefix=output_dir_prefix,
+    )
+
+    if input_image_type == "retiled":
+        mask_file = segmentation_dir / f"{region}_{segmentation_method}_retiled_expanded.npz"
+    else:
+        mask_file = segmentation_dir / f"{region}_{segmentation_method}_stitched_expanded.npz"
+
+    if not mask_file.is_file():
+        raise FileNotFoundError(
+            f"Segmentation mask not found: {mask_file}\n"
+            f"[HINT] If the mask was written to a non-default output_dir_prefix, "
+            f"pass the same output_dir_prefix here, or pass segmentation_file explicitly."
+        )
+
+    print(f"[INFO] Using resolved segmentation file: {mask_file}")
+    return mask_file
+
+
 def inspect_and_work_with_segmentation(
     input_dir,
     region,
     segmentation_method,
-    DAPI_ch=4,
-    input_image_type="stitched",
-    crop_coords=None,
+    segmentation_file=None,
     output_dir_prefix=None,
+    input_image_type="stitched",
+    DAPI_ch=4,
+    crop_coords=None,
 ):
     """
     Load a segmentation mask, load the matching raw DAPI image, plot an overlay,
@@ -904,32 +1054,51 @@ def inspect_and_work_with_segmentation(
     region : str
         Region identifier (e.g. "R1").
     segmentation_method : str
-        Segmentation method name (e.g. "cellpose", "stardist").
+        Segmentation method name used for default file naming and plot/output
+        labeling (e.g. "cellpose", "stardist", "baysor").
+
+        Note:
+        If segmentation_file is provided, this can be any meaningful label and
+        does not need to match a default filename pattern.
     DAPI_ch : int
         DAPI channel number.
     input_image_type : {"stitched", "retiled"}
-        Determines which segmentation mask and raw image layout to use.
+        Determines which raw image layout to use.
+    output_dir_prefix : str | Path | None
+        Optional alternative output directory root for files created by this
+        function (for example contour masks).
+    segmentation_file : str | Path | None
+        Optional explicit path to a segmentation `.npz` file. If provided,
+        this takes precedence over default path logic and can come from any
+        segmentation method, as long as it is a valid sparse `.npz` mask
+        matching the image shape.
     crop_coords : tuple | None
         Optional crop region (y_start, y_end, x_start, x_end) for visualization.
-    output_dir_prefix : str | Path | None
-        Optional alternative output directory root.
     """
     validate_input_image_type(input_image_type)
 
-    segmentation_dir = get_segmentation_dir(
-        input_dir,
-        region,
+    mask_file = resolve_segmentation_mask_path(
+        input_dir=input_dir,
+        region=region,
+        segmentation_method=segmentation_method,
+        input_image_type=input_image_type,
         output_dir_prefix=output_dir_prefix,
+        segmentation_file=segmentation_file,
     )
 
-    # Select correct mask file depending on input mode
-    if input_image_type == "retiled":
-        mask_file = segmentation_dir / f"{region}_{segmentation_method}_retiled_expanded.npz"
-    else:
-        mask_file = segmentation_dir / f"{region}_{segmentation_method}_stitched_expanded.npz"
+    # ------------------------------------------------------------------
+    # Warn if segmentation_method does not appear to match the provided file
+    # ------------------------------------------------------------------
+    if segmentation_file is not None:
+        fname = Path(mask_file).name.lower()
+        method_lower = str(segmentation_method).lower()
 
-    if not mask_file.is_file():
-        raise FileNotFoundError(f"Segmentation mask not found: {mask_file}")
+        if method_lower not in fname:
+            print(
+                f"[WARN] segmentation_method='{segmentation_method}' does not appear in filename:\n"
+                f"       {Path(mask_file).name}\n"
+                "[WARN] This is OK, but make sure the label matches your segmentation."
+            )
 
     labels = load_sparse_mask(mask_file)
 
@@ -947,19 +1116,29 @@ def inspect_and_work_with_segmentation(
             f"Image shape {image.shape} does not match label shape {labels.shape}"
         )
 
-    # Plot overlay
+    # Plot overlay (smaller figure to fit screen better)
     plot_segmentation_overlay(
         image,
         labels,
         crop_coords=crop_coords,
+        figsize=(6, 6),
+        dpi=150,
+        brightness_factor=3,
         title=f"{segmentation_method} ({input_image_type}) segmentation",
     )
 
     # Save contour mask
     contour_image = extract_contour_mask(labels, thickness=3)
 
+    # Save outputs either in default location or output_dir_prefix if provided
+    contour_dir = get_segmentation_dir(
+        input_dir,
+        region,
+        output_dir_prefix=output_dir_prefix,
+    )
+
     save_contour_mask(
-        segmentation_dir,
+        contour_dir,
         region,
         f"{segmentation_method}_{input_image_type}",
         contour_image,
