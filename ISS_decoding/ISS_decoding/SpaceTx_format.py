@@ -9,8 +9,11 @@ from slicedimage import ImageFormat
 from starfish import Codebook
 from starfish.types import Axes, Coordinates, Features, Number
 from starfish.experiment.builder import FetchedTile, TileFetcher, write_experiment_json
-import xml.etree.ElementTree as ET  # <-- ADDED
-from datetime import datetime  # <-- ADDED (for unique per-run XML filenames; no overwrites)
+import xml.etree.ElementTree as ET  
+from datetime import datetime  # 
+
+def timestamp_for_filename() -> str:
+    return datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # -----------------------------------------------------------------------------
 # XML provenance policy (SpaceTX stage)
@@ -148,7 +151,7 @@ def make_spacetx_format(input_dir,
 
     # Generate one run_id per function invocation.
     # Each region that actually gets written will produce one XML with this run_id.
-    run_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+    run_id = timestamp_for_filename()
 
     # Select which retiled directory to read tiles from.
     # CARE=False -> preprocessing/<cycle>/4_retiled

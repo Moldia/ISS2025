@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Tuple
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 # NOTE (provenance policy):
 #   - We ONLY write a decoding XML if this run actually writes the region-level CSV.
@@ -21,7 +22,9 @@ from starfish.spots import DecodeSpots, FindSpots
 from starfish.types import Axes, TraceBuildingStrategies, Levels
 from starfish.core.spots.DecodeSpots.trace_builders import build_spot_traces_exact_match
 
-
+def timestamp_for_filename() -> str:
+    return datetime.now().strftime("%Y-%m-%d_%H-%M")
+    
 def read_spacetx_coordinate_metadata(SpaceTX_dir):
     """
     Read coordinate unit metadata written during SpaceTX generation.
@@ -263,8 +266,7 @@ def process_experiment(
     input_dir = Path(input_dir)
     print(f"Processing directory: {input_dir}")
 
-    from datetime import datetime as _dt
-    run_id = _dt.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+    run_id = timestamp_for_filename()
 
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
