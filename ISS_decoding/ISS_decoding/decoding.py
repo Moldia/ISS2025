@@ -22,21 +22,63 @@ from starfish.types import Axes, TraceBuildingStrategies, Levels
 from starfish.core.spots.DecodeSpots.trace_builders import build_spot_traces_exact_match
 
 
+def read_spacetx_coordinate_metadata(SpaceTX_dir):
+    """
+    Read coordinate unit metadata written during SpaceTX generation.
+
+    Returns
+    -------
+    tuple[str, float | None]
+        coordinate_units, coordinate_pixel_to_um
+    """
+    SpaceTX_dir = Path(SpaceTX_dir)
+
+    xml_files = sorted(SpaceTX_dir.glob("spacetx_run_*.xml"))
+    if not xml_files:
+        print(
+            f"[WARN] No SpaceTX XML metadata found in {SpaceTX_dir}. "
+            "Coordinate units unknown."
+        )
+        return "unknown", None
+
+    xml_path = xml_files[-1]
+
+    try:
+        root = ET.parse(xml_path).getroot()
+        meta_el = root.find("Metadata")
+
+        if meta_el is None:
+            print(f"[WARN] No <Metadata> section found in {xml_path.name}.")
+            return "unknown", None
+
+        pixel_to_um_text = meta_el.findtext("pixel_to_um")
+        units_text = meta_el.findtext("units")
+
+        coordinate_pixel_to_um = None
+        if pixel_to_um_text not in (None, "", "None"):
+            coordinate_pixel_to_um = float(pixel_to_um_text)
+
+        coordinate_units = units_text or (
+            "pixels" if coordinate_pixel_to_um == 1 else "microns"
+        )
+
+        print(
+            f"[INFO] Decoding coordinate units from SpaceTX metadata: "
+            f"{coordinate_units} "
+            f"(pixel_to_um={coordinate_pixel_to_um}, source={xml_path.name})"
+        )
+
+        return coordinate_units, coordinate_pixel_to_um
+
+    except Exception as e:
+        print(f"[WARN] Could not read SpaceTX coordinate metadata from {xml_path}: {e}")
+        return "unknown", None
+
 
 def QC_score_calc(decoded):
     """
     Compute per-spot quality and second-peak metrics from a DecodedIntensityTable.
-    - Robust: handles NaNs, infs, zero totals, and too-few channels.
-    - Fast: vectorized over rounds/channels.
-    
-    Returns
-    -------
-    pandas.DataFrame
-        decoded.to_features_dataframe() with added columns:
-        ['quality_minimum', 'quality_mean', 'quality_all_bases',
-         'second_peak_ratio_min', 'second_peak_ratio_mean', 'second_peak_ratio_all_bases']
     """
-    # Expect shape (n_spots, n_rounds, n_channels)
     arr = np.array(decoded.values, dtype=float, copy=True)
 
     if arr.ndim != 3:
@@ -44,51 +86,32 @@ def QC_score_calc(decoded):
 
     n_spots, n_rounds, n_channels = arr.shape
 
-    # Replace non-finite with 0 (defensive like the first version)
-    # This prevents NaNs from propagating into mins/means
     np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # ---- Quality = max(channel)/sum(channel) per (spot, round) ----
-    totals = arr.sum(axis=2)                # (n_spots, n_rounds)
-    maxes  = arr.max(axis=2)                # (n_spots, n_rounds)
+    totals = arr.sum(axis=2)
+    maxes = arr.max(axis=2)
 
     quality = np.zeros_like(maxes, dtype=float)
     np.divide(maxes, totals, out=quality, where=totals > 0)
 
-    # ---- Second-peak ratio = second_largest / largest per (spot, round) ----
     spr = np.zeros_like(maxes, dtype=float)
     if n_channels >= 2:
-        # np.partition is O(n); get the top two values along channels
-        part = np.partition(arr, kth=-2, axis=2)  # last two are the largest
+        part = np.partition(arr, kth=-2, axis=2)
         second = part[:, :, -2]
-        top    = part[:, :, -1]
-
-        # Guard against top==0 (all zeros) -> ratio 0
+        top = part[:, :, -1]
         np.divide(second, top, out=spr, where=top > 0)
     else:
-        # Fewer than 2 channels => by definition ratio is 0 (matches first version's intent)
         spr.fill(0.0)
 
-    # ---- Aggregate per spot ----
-    qc_min  = quality.min(axis=1)   # (n_spots,)
-    qc_mean = quality.mean(axis=1)  # (n_spots,)
-    qc_all  = quality.tolist()      # list of per-round qualities
-
-    spr_min  = spr.min(axis=1)
-    spr_mean = spr.mean(axis=1)
-    spr_all  = spr.tolist()
-
-    # ---- Attach to features dataframe ----
     df = decoded.to_features_dataframe()
-    df['quality_minimum']             = qc_min
-    df['quality_mean']                = qc_mean
-    df['quality_all_bases']           = qc_all
-    df['second_peak_ratio_min']       = spr_min
-    df['second_peak_ratio_mean']      = spr_mean
-    df['second_peak_ratio_all_bases'] = spr_all
+    df["quality_minimum"] = quality.min(axis=1)
+    df["quality_mean"] = quality.mean(axis=1)
+    df["quality_all_bases"] = quality.tolist()
+    df["second_peak_ratio_min"] = spr.min(axis=1)
+    df["second_peak_ratio_mean"] = spr.mean(axis=1)
+    df["second_peak_ratio_all_bases"] = spr.tolist()
 
     return df
-
 
 
 def ISS_pipeline(
@@ -100,86 +123,87 @@ def ISS_pipeline(
     masking_radius=15,
     int_threshold=0.002,
     sigma_vals=(1, 10, 30),
-    decode_mode='PRMC',
-    channel_normalization='MH',
-    spot_detection_mode='starfish',
+    decode_mode="PRMC",
+    channel_normalization="MH",
+    spot_detection_mode="starfish",
     spotiflow_model=None,
-    prob_threshold=None
+    prob_threshold=None,
 ):
-     
-    print('Loading image planes')
+    print("Loading image planes")
     primary_image = tile.get_image(FieldOfView.PRIMARY_IMAGES)
-    nuclei = tile.get_image('nuclei')
-    
-    # --- STEP 1: Create registration reference ---
+    nuclei = tile.get_image("nuclei")
+
     dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
-    
-    # --- STEP 2: Registration ---
+
     if register:
         if register_dapi:
             ref_round = 1 if dense else 0
             nuclei_ref = nuclei.sel({Axes.ROUND: ref_round, Axes.CH: 0, Axes.ZPLANE: 0})
-            print(f'Registering images based on nuclei stain (ROUND={ref_round})')
-            learn_translation = LearnTransform.Translation(reference_stack=nuclei_ref, axes=Axes.ROUND, upsampling=1000)
+            print(f"Registering images based on nuclei stain (ROUND={ref_round})")
+            learn_translation = LearnTransform.Translation(
+                reference_stack=nuclei_ref,
+                axes=Axes.ROUND,
+                upsampling=1000,
+            )
             transforms_list = learn_translation.run(nuclei)
         else:
-            print('Creating reference images')
+            print("Creating reference images")
             ref_for_reg = dots if dense else primary_image.reduce({Axes.CH, Axes.ZPLANE}, func="max")
-            print('Registering images')
-            learn_translation = LearnTransform.Translation(reference_stack=ref_for_reg, axes=Axes.ROUND, upsampling=100)
+            print("Registering images")
+            learn_translation = LearnTransform.Translation(
+                reference_stack=ref_for_reg,
+                axes=Axes.ROUND,
+                upsampling=100,
+            )
             run_stack = primary_image.reduce({Axes.CH, Axes.ZPLANE}, func="max")
             transforms_list = learn_translation.run(run_stack)
-    
+
         warp = ApplyTransform.Warp()
         registered = warp.run(primary_image, transforms_list=transforms_list, in_place=False, verbose=True)
-    
-        # --- STEP 3: Masking / Filtering ---
+
         filt = Filter.WhiteTophat(masking_radius, is_volume=False)
         filtered = filt.run(registered, verbose=True, in_place=False)
     else:
-        print('Not registering images, applying filter to raw data')
+        print("Not registering images, applying filter to raw data")
         filt = Filter.WhiteTophat(masking_radius, is_volume=False)
         filtered = filt.run(primary_image, verbose=True, in_place=False)
-    
-    # --- STEP 4: Channel normalization ---
-    print('Normalizing channel intensities')
-    if channel_normalization == 'MH':
+
+    print("Normalizing channel intensities")
+    if channel_normalization == "MH":
         sbp = Filter.MatchHistograms({Axes.CH, Axes.ROUND})
     else:
         sbp = Filter.ClipPercentileToZero(
             p_min=80,
             p_max=99.999,
-            level_method=Levels.SCALE_BY_CHUNK
+            level_method=Levels.SCALE_BY_CHUNK,
         )
+
     scaled = sbp.run(filtered, n_processes=1, in_place=False)
-    
-    # --- STEP 5: Spot detection ---
+
     min_sigma, max_sigma, num_sigma = sigma_vals
     bd = FindSpots.BlobDetector(
         min_sigma=min_sigma,
         max_sigma=max_sigma,
         num_sigma=num_sigma,
         threshold=int_threshold,
-        measurement_type='mean'
+        measurement_type="mean",
     )
 
-    # --- STEP 6: Decoder factory ---
     def make_decoder():
-        if decode_mode == 'PRMC':
+        if decode_mode == "PRMC":
             return DecodeSpots.PerRoundMaxChannel(codebook=codebook)
-        elif decode_mode == 'MD':
+        elif decode_mode == "MD":
             return DecodeSpots.MetricDistance(
                 codebook=codebook,
                 max_distance=1,
                 min_intensity=1,
-                metric='euclidean',
+                metric="euclidean",
                 norm_order=2,
-                trace_building_strategy=TraceBuildingStrategies.EXACT_MATCH
+                trace_building_strategy=TraceBuildingStrategies.EXACT_MATCH,
             )
         else:
             raise ValueError(f"Unknown decode_mode: {decode_mode}")
 
-    # --- STEP 7: Dense mode (per-channel decoding) ---
     if dense:
         channels = list(primary_image.xarray.coords[Axes.CH].values)
         decoder = make_decoder()
@@ -187,27 +211,26 @@ def ISS_pipeline(
 
         for ch in channels:
             channel_ref = primary_image.sel({Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0})
-            print(f'Locating spots for channel {ch}')
+            print(f"Locating spots for channel {ch}")
             spots = bd.run(reference_image=channel_ref, image_stack=scaled)
 
             decoded = decoder.run(spots=spots)
             df_qc = QC_score_calc(decoded)
-            df_qc['channel'] = ch
+            df_qc["channel"] = ch
             per_channel_qc.append(df_qc)
 
             _ = build_spot_traces_exact_match(spots)
 
         return pd.concat(per_channel_qc, ignore_index=True) if per_channel_qc else pd.DataFrame()
 
-    # --- STEP 8: Standard mode (single-pass decoding) ---
     dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
     dots_max = dots.reduce({Axes.ZPLANE}, func="max")
 
-    print('Locating spots in reference image')
+    print("Locating spots in reference image")
     spots = bd.run(reference_image=dots_max, image_stack=scaled)
 
     decoder = make_decoder()
-    print(f'Decoding with {decode_mode}')
+    print(f"Decoding with {decode_mode}")
     decoded = decoder.run(spots=spots)
 
     _ = build_spot_traces_exact_match(spots)
@@ -216,100 +239,49 @@ def ISS_pipeline(
 
 
 def process_experiment(
-    input_dir, 
+    input_dir,
     regions_to_process=None,
     output_dir_prefix=None,
-    pixel_to_um=1,
-    register=False, 
+    register=False,
     register_dapi=False,
-    masking_radius=15, 
-    normalization_method='MH',
-    decode_mode='PRMC',
+    masking_radius=15,
+    normalization_method="MH",
+    decode_mode="PRMC",
     dense=False,
-    spot_detection_mode='starfish',
+    spot_detection_mode="starfish",
     int_threshold=0.002,
     sigma_vals=[1, 10, 30],
-    prob_threshold=None
+    prob_threshold=None,
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
-    Skips already-processed tiles, saves results as per-tile CSVs, and concatenates region-level CSV.
 
-    Parameters
-    ----------
-    input_dir : str or Path
-        Path to top-level output directory containing region folders (e.g., 'R1', 'R2').
-    regions_to_process : list[int] | None
-        Optional list of 1-based region numbers to process.
-    output_dir_prefix : str | Path | None
-        Optional base directory for outputs.
-    pixel_to_um : float, optional
-        Spatial scaling used in the SpaceTX experiment coordinates.
-        - pixel_to_um = 1   -> decoded coordinates are in pixels
-        - pixel_to_um != 1  -> decoded coordinates are in microns
-        This value is recorded in decoded CSV outputs.
-    register : bool
-        Whether to perform image registration.
-    register_dapi : bool
-        If True, use nuclei (DAPI) for registration.
-    masking_radius : int
-        Radius for WhiteTophat filtering.
-    normalization_method : str
-        Channel normalization mode.
-    decode_mode : str
-        Decoding algorithm to use ('PRMC' or 'MD').
-    dense : bool
-        If True, use dense per-channel decoding.
-    spot_detection_mode : str
-        Spot detection backend.
-    int_threshold : float
-        Threshold for starfish blob detection.
-    sigma_vals : list
-        [min_sigma, max_sigma, num_sigma] for starfish blob detection.
-    prob_threshold : float | None
-        Spotiflow threshold if used.
+    Coordinate units are read from the SpaceTX XML metadata written during SpaceTX generation.
+    They are recorded in the decoded CSV and decoding XML.
     """
-        
-    # --- Step 1: Discover/select region directories ---
+
     input_dir = Path(input_dir)
     print(f"Processing directory: {input_dir}")
 
-    # -------------------------------------------------------------------------
-    # XML provenance run id
-    #
-    # One run_id per process_experiment() invocation. We will only emit a decoding
-    # XML for a region if this run actually writes the region-level CSV for that
-    # region (i.e., not skipped, and concatenation happened).
-    #
-    # We NEVER overwrite XMLs: each productive run writes a unique XML.
-    # -------------------------------------------------------------------------
-    run_id = ET.datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ") if hasattr(ET, "datetime") else None
     from datetime import datetime as _dt
     run_id = _dt.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
 
-    if pixel_to_um == 1:
-        print(f"[INFO] Decoding coordinate units: pixels (pixel_to_um={pixel_to_um})")
-    else:
-        print(f"[INFO] Decoding coordinate units: microns (pixel_to_um={pixel_to_um})")
-
-    # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
         output_dir_prefix.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
     else:
         print("[INFO] Using default output location under each region directory")
-    
+
     if dense:
         print("DENSE (per-channel) decoding")
-    
+
     if dense and decode_mode != "PRMC":
         print(f"dense=True → overriding decode_mode='{decode_mode}' to 'PRMC'")
         decode_mode = "PRMC"
-    
+
     region_pattern = re.compile(r"^R(\d+)$")
 
-    # --- Discover all regions on disk (for logging + validation) ---
     regions_found = []
     for r in input_dir.iterdir():
         if not r.is_dir():
@@ -317,101 +289,99 @@ def process_experiment(
         m = region_pattern.match(r.name)
         if m:
             regions_found.append((int(m.group(1)), r))
-    
+
     regions_found.sort(key=lambda t: t[0])
-    
+
     if not regions_found:
         raise RuntimeError(f"No regions found in {input_dir} (expected folders like R1, R2, ...)")
-    
+
     available_numbers = [n for n, _ in regions_found]
     available_map = {n: p for n, p in regions_found}
-    
-    # --- Select regions to process ---
+
     if regions_to_process is not None:
         if not isinstance(regions_to_process, (list, tuple)):
             raise TypeError("regions_to_process must be a list of 1-based ints, e.g. [1, 2].")
-    
+
         wanted = [int(x) for x in regions_to_process]
         if any(x < 1 for x in wanted):
             raise ValueError(f"regions_to_process contains invalid region numbers: {regions_to_process}")
-    
+
         missing = [n for n in wanted if n not in available_map]
         if missing:
             raise FileNotFoundError(
                 f"Requested region(s) not found: {[f'R{n}' for n in missing]}. "
                 f"Available regions: {[f'R{n}' for n in available_numbers]}"
             )
-    
+
         region_numbers = wanted
         region_directories = [available_map[n] for n in wanted]
     else:
         region_numbers = available_numbers
         region_directories = [available_map[n] for n in available_numbers]
-    
-    # --- Logging ---
+
     all_regions = [f"R{n}" for n in available_numbers]
     selected_regions = [f"R{n}" for n in region_numbers]
     skipped_regions = [r for r in all_regions if r not in selected_regions]
-    
+
     print(f"[INFO] Regions found on disk ({len(all_regions)}): {all_regions}")
     print(f"[INFO] Regions selected for decoding ({len(selected_regions)}): {selected_regions}")
     if skipped_regions:
         print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
-    
-    # --- Step 2: Load model once (only if detection mode is spotiflow) ---
+
     SPOTIFLOW_MODEL = None
     SpotiflowDetector = None
-    
+
     if spot_detection_mode == "spotiflow":
         from spotiflow.model import Spotiflow
         from spotiflow.starfish import SpotiflowDetector
-    
+
         SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
-    
-    # --- Step 3: Process each region directory ---
+
     for region_directory in region_directories:
-        
         region_name = region_directory.name
+
         if output_dir_prefix is None:
-            decoded_dir = region_directory / 'decoding' / ('2_decoded_dense' if dense else '2_decoded')
+            decoded_dir = region_directory / "decoding" / ("2_decoded_dense" if dense else "2_decoded")
         else:
-            decoded_dir = output_dir_prefix / region_directory.name / 'decoding' / ('2_decoded_dense' if dense else '2_decoded')
-        
+            decoded_dir = output_dir_prefix / region_directory.name / "decoding" / (
+                "2_decoded_dense" if dense else "2_decoded"
+            )
+
         decoded_dir.mkdir(parents=True, exist_ok=True)
 
         print("=" * 60)
         print(f"\033[1mProcessing region {region_name}\033[0m")
         print(f"Output decoded directory: {decoded_dir}")
 
-        # ===== EARLY EXIT CHECK =====
         final_csv = decoded_dir / f"{region_name}_decoded.csv"
         if final_csv.exists():
             print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
             print(f"  ✔ {final_csv}")
             continue
 
-        # --- Step 4: Load SpaceTx experiment metadata ---
         if output_dir_prefix is None:
-            SpaceTX_dir = (region_directory / 'decoding' / '1_SpaceTX_format').resolve()
+            SpaceTX_dir = (region_directory / "decoding" / "1_SpaceTX_format").resolve()
         else:
-            SpaceTX_dir = (output_dir_prefix / region_directory.name / 'decoding' / '1_SpaceTX_format').resolve()
+            SpaceTX_dir = (
+                output_dir_prefix / region_directory.name / "decoding" / "1_SpaceTX_format"
+            ).resolve()
 
-        experiment = Experiment.from_json(str(SpaceTX_dir / 'experiment.json'))
+        coordinate_units, coordinate_pixel_to_um = read_spacetx_coordinate_metadata(SpaceTX_dir)
 
+        experiment = Experiment.from_json(str(SpaceTX_dir / "experiment.json"))
         tiles = list(experiment.keys())
 
-        # --- Step 5: Find processed tiles ---
         csv_files = sorted(decoded_dir.glob("fov_*.csv"))
         print(f"Found {len(csv_files)} output files")
-        
+
         tiles_done = [f.stem for f in csv_files]
         not_done = sorted(set(tiles) - set(tiles_done))
         print(f"-> {len(not_done)} tiles left to process")
 
-        # --- Step 6: Decode each unprocessed tile ---
         for tile_id in not_done:
             tile = experiment[tile_id]
             print(f"\033[1;90mProcessing tile {tile_id[-3:]} \033[0m")
+
             df = ISS_pipeline(
                 tile,
                 experiment.codebook,
@@ -422,25 +392,24 @@ def process_experiment(
                 int_threshold=int_threshold,
                 sigma_vals=sigma_vals,
                 decode_mode=decode_mode,
-                channel_normalization=normalization_method
+                channel_normalization=normalization_method,
             )
 
             if df is None or df.empty:
                 continue
 
-            df['tile'] = tile_id
-            df['coordinate_units'] = 'pixels' if pixel_to_um == 1 else 'microns'
-            df['coordinate_pixel_to_um'] = pixel_to_um
+            df["tile"] = tile_id
+            df["coordinate_units"] = coordinate_units
+            df["coordinate_pixel_to_um"] = coordinate_pixel_to_um
 
             print(f"Saving per-tile CSV: {decoded_dir / f'{tile_id}.csv'}")
             df.to_csv(decoded_dir / f"{tile_id}.csv", index=False)
 
-        # --- Step 7: Write region-level concatenated CSV by reading per-tile files named "fov*.csv" ---
         print(f"\nWriting region-level concatenated CSV for {region_name!r} ...")
 
         wrote_region_csv = False
         csv_paths = sorted(decoded_dir.glob("fov*.csv"))
-        
+
         if not csv_paths:
             print(f" No tile CSVs matching 'fov*.csv' found in {decoded_dir}; nothing to concatenate.")
         else:
@@ -449,16 +418,15 @@ def process_experiment(
                 df = pd.read_csv(p)
                 dfs.append(df)
                 print(f"  • Loaded {p.name} ({len(df)} rows)")
-        
+
             concat = pd.concat(dfs, ignore_index=True)
-            concat.insert(0, 'cont. spot ids', np.arange(len(concat), dtype=int))
-        
+            concat.insert(0, "cont. spot ids", np.arange(len(concat), dtype=int))
+
             out_file = decoded_dir / f"{region_name}_decoded.csv"
             concat.to_csv(out_file, index=False)
             wrote_region_csv = True
             print(f" → Wrote {len(concat)} total rows to {out_file.name}")
 
-        # --- Write XML provenance only if this run wrote the region CSV ---
         if wrote_region_csv:
             xml_path = decoded_dir / f"decoding_run_{run_id}.xml"
             root = ET.Element("ISSDecodingRun", attrib={"region": str(region_name)})
@@ -480,9 +448,13 @@ def process_experiment(
             ET.SubElement(params_el, "spot_detection_mode").text = str(spot_detection_mode)
             ET.SubElement(params_el, "int_threshold").text = str(int_threshold)
             ET.SubElement(params_el, "sigma_vals").text = ",".join([str(x) for x in sigma_vals])
-            ET.SubElement(params_el, "prob_threshold").text = "None" if prob_threshold is None else str(prob_threshold)
-            ET.SubElement(params_el, "coordinate_units").text = "pixels" if pixel_to_um == 1 else "microns"
-            ET.SubElement(params_el, "coordinate_pixel_to_um").text = str(pixel_to_um)
+            ET.SubElement(params_el, "prob_threshold").text = (
+                "None" if prob_threshold is None else str(prob_threshold)
+            )
+            ET.SubElement(params_el, "coordinate_units").text = str(coordinate_units)
+            ET.SubElement(params_el, "coordinate_pixel_to_um").text = (
+                "None" if coordinate_pixel_to_um is None else str(coordinate_pixel_to_um)
+            )
 
             tiles_el = ET.SubElement(root, "Tiles")
             ET.SubElement(tiles_el, "tiles_total").text = str(len(tiles))
@@ -494,5 +466,6 @@ def process_experiment(
                 ET.indent(tree, space="  ", level=0)
             except Exception:
                 pass
+
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             print(f"[{region_name}] Decoding XML written to: {xml_path}")
