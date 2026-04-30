@@ -2,18 +2,11 @@ from __future__ import annotations
 
 # -----------------------------------------------------------------------------
 # GPU configuration for CARE inference
-#
-# Simple, automatic behavior:
-# - choose one GPU before importing TensorFlow / CSBDeep
-# - print a short informative line
-# - enable TensorFlow memory growth
-#
-# IMPORTANT:
-#   GPU selection must happen BEFORE importing tensorflow or csbdeep.
 # -----------------------------------------------------------------------------
 
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -24,32 +17,70 @@ from xml.etree.ElementTree import Element, ElementTree, SubElement
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 
+# -----------------------------------------------------------------------------
+# Pretty terminal printing
+# -----------------------------------------------------------------------------
+
+USE_COLOR_PRINTS = True
+
+
+class T:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+
+
+def color_text(text: str, color: str = "", bold: bool = False) -> str:
+    if not USE_COLOR_PRINTS:
+        return text
+
+    prefix = ""
+    if bold:
+        prefix += T.BOLD
+    prefix += color
+    return f"{prefix}{text}{T.RESET}"
+
+
+def print_section(title: str, color: str = T.CYAN) -> None:
+    line = "=" * 90
+    print("\n" + color_text(line, color, bold=True))
+    print(color_text(title, color, bold=True))
+    print(color_text(line, color, bold=True))
+
+
+def print_subsection(title: str, color: str = T.BLUE) -> None:
+    line = "-" * 80
+    print("\n" + color_text(line, color, bold=True))
+    print(color_text(title, color, bold=True))
+    print(color_text(line, color, bold=True))
+
+
+def print_info(msg: str) -> None:
+    print(color_text("[INFO] ", T.GREEN, bold=True) + msg)
+
+
+def print_warn(msg: str) -> None:
+    print(color_text("[WARN] ", T.YELLOW, bold=True) + msg)
+
+
+def print_debug(msg: str) -> None:
+    print(color_text("[DEBUG] ", T.MAGENTA, bold=True) + msg)
+
+
+# -----------------------------------------------------------------------------
+# GPU selection
+# -----------------------------------------------------------------------------
+
 def choose_gpu_for_rl(
     preferred_max_mem_mb: int = 2000,
     preferred_max_util: int = 20,
 ) -> int | None:
-    """
-    Select one GPU using a simple "prefer free GPU" strategy.
-
-    Priority
-    --------
-    1. Prefer GPUs with:
-         - memory.used <= preferred_max_mem_mb
-         - utilization.gpu <= preferred_max_util
-    2. Otherwise choose the GPU with the lowest memory use.
-    3. Break ties by lower utilization, then lower GPU index.
-
-    Side effects
-    ------------
-    Sets:
-      - CUDA_VISIBLE_DEVICES
-      - PYOPENCL_CTX
-
-    Returns
-    -------
-    int | None
-        Selected physical GPU index, or None if selection failed.
-    """
     try:
         result = subprocess.check_output(
             [
@@ -61,7 +92,7 @@ def choose_gpu_for_rl(
         ).decode("utf-8", errors="replace").strip()
 
         if not result:
-            print("[WARN] nvidia-smi returned no GPU information.")
+            print_warn("nvidia-smi returned no GPU information.")
             return None
 
         rows: list[tuple[int, int, int]] = []
@@ -70,7 +101,7 @@ def choose_gpu_for_rl(
             rows.append((int(idx), int(mem), int(util)))
 
         if not rows:
-            print("[WARN] No GPUs parsed from nvidia-smi output.")
+            print_warn("No GPUs parsed from nvidia-smi output.")
             return None
 
         preferred = [
@@ -85,17 +116,17 @@ def choose_gpu_for_rl(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
 
-        print(f"[INFO] Selected GPU {gpu_id} (mem={mem_mb} MiB, util={util_pct}%)")
+        print_info(f"Selected GPU {gpu_id} (mem={mem_mb} MiB, util={util_pct}%)")
         return gpu_id
 
     except Exception as e:
-        print(f"[WARN] Automatic GPU selection failed: {e}")
-        print("[WARN] Proceeding without forcing CUDA_VISIBLE_DEVICES.")
+        print_warn(f"Automatic GPU selection failed: {e}")
+        print_warn("Proceeding without forcing CUDA_VISIBLE_DEVICES.")
         return None
 
 
-# Must run before TensorFlow import.
 choose_gpu_for_rl()
+
 
 # -----------------------------------------------------------------------------
 # TensorFlow import and memory configuration
@@ -108,11 +139,12 @@ if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"[INFO] TensorFlow sees {len(gpus)} GPU(s)")
+        print_info(f"TensorFlow sees {len(gpus)} GPU(s)")
     except RuntimeError as e:
-        print(f"[WARN] Could not set TensorFlow memory growth: {e}")
+        print_warn(f"Could not set TensorFlow memory growth: {e}")
 else:
-    print("[INFO] TensorFlow sees no GPU. Inference will run on CPU.")
+    print_info("TensorFlow sees no GPU. Inference will run on CPU.")
+
 
 # -----------------------------------------------------------------------------
 # Remaining imports
@@ -129,7 +161,6 @@ from csbdeep.models import CARE
 # -----------------------------------------------------------------------------
 
 def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
-    """Fast corruption guard for outputs from previous runs."""
     try:
         return path.exists() and path.stat().st_size > int(min_size)
     except Exception:
@@ -137,7 +168,6 @@ def file_exists_and_valid(path: Path, min_size: int = 1024) -> bool:
 
 
 def load_json_file(path: Path | str) -> dict | None:
-    """Load a JSON file safely. Returns None if missing or unreadable."""
     path = Path(path)
     if not path.exists():
         return None
@@ -145,26 +175,22 @@ def load_json_file(path: Path | str) -> dict | None:
         with open(path, "r") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[WARN] Could not read JSON file {path}: {e}")
+        print_warn(f"Could not read JSON file {path}: {e}")
         return None
 
 
 def _print_array_stats(arr: np.ndarray, label: str) -> None:
-    """Print concise debug statistics for an array."""
     arr = np.asarray(arr)
     finite = arr[np.isfinite(arr)]
 
     if finite.size == 0:
-        print(
-            f"[DEBUG] {label}: dtype={arr.dtype}, shape={arr.shape}, "
-            "all values are non-finite"
-        )
+        print_debug(f"{label}: dtype={arr.dtype}, shape={arr.shape}, all values are non-finite")
         return
 
     p1, p50, p99 = np.percentile(finite, [1, 50, 99])
 
-    print(
-        f"[DEBUG] {label}: "
+    print_debug(
+        f"{label}: "
         f"dtype={arr.dtype}, shape={arr.shape}, "
         f"min={float(np.min(finite)):.6g}, "
         f"max={float(np.max(finite)):.6g}, "
@@ -182,37 +208,57 @@ def normalize_percentile(
     pmax: float = 99.8,
     eps: float = 1e-8,
 ) -> np.ndarray:
-    """
-    Percentile-normalize a single image to [0, 1].
-
-    Use this only if the CARE model was trained with the same normalization.
-    """
     arr = np.asarray(arr, dtype=np.float32)
     lo = np.percentile(arr, pmin)
     hi = np.percentile(arr, pmax)
     return np.clip((arr - lo) / (hi - lo + eps), 0, 1)
 
 
-def to_uint16_safe(
-    arr: np.ndarray,
+def rescale_prediction_for_saving(
+    pred: np.ndarray,
     *,
-    context: str = "",
+    raw_input: np.ndarray | None = None,
+    output_rescale_mode: str = "none",
+    output_rescale_pmin: float = 1.0,
+    output_rescale_pmax: float = 99.8,
+    output_rescale_eps: float = 1e-8,
 ) -> np.ndarray:
-    """
-    Safely cast an image array to uint16.
+    pred = np.asarray(pred, dtype=np.float32)
 
-    This function:
-      - detects NaN / Inf values
-      - replaces them safely
-      - clips to uint16 range [0, 65535]
-      - logs only if correction was needed
-    """
+    if output_rescale_mode == "none":
+        return pred
+
+    if output_rescale_mode == "x65535":
+        return pred * 65535.0
+
+    if output_rescale_mode == "percentile":
+        lo = np.percentile(pred, output_rescale_pmin)
+        hi = np.percentile(pred, output_rescale_pmax)
+        pred01 = np.clip((pred - lo) / (hi - lo + output_rescale_eps), 0, 1)
+        return pred01 * 65535.0
+
+    if output_rescale_mode == "match_raw_max":
+        if raw_input is None:
+            raise ValueError("raw_input is required for output_rescale_mode='match_raw_max'")
+        pred_max = float(np.nanmax(pred)) if np.size(pred) else 0.0
+        raw_max = float(np.nanmax(raw_input)) if np.size(raw_input) else 0.0
+        if pred_max <= 0:
+            return np.zeros_like(pred, dtype=np.float32)
+        return pred * (raw_max / pred_max)
+
+    raise ValueError(
+        "output_rescale_mode must be one of: "
+        "'none', 'x65535', 'percentile', 'match_raw_max'"
+    )
+
+
+def to_uint16_safe(arr: np.ndarray, *, context: str = "") -> np.ndarray:
     has_nan = np.isnan(arr).any()
     has_inf = np.isinf(arr).any()
 
     if has_nan or has_inf:
-        print(
-            f"[INFO] to_uint16_safe"
+        print_info(
+            f"to_uint16_safe"
             f"{f' ({context})' if context else ''}: "
             f"nan={has_nan}, inf={has_inf}"
         )
@@ -227,7 +273,11 @@ def to_uint16_safe(
     return safe.astype(np.uint16)
 
 
-def _safe_percentile_pair(arr: np.ndarray, pmin: float = 1.0, pmax: float = 99.8) -> tuple[float, float]:
+def _safe_percentile_pair(
+    arr: np.ndarray,
+    pmin: float = 1.0,
+    pmax: float = 99.8,
+) -> tuple[float, float]:
     arr = np.asarray(arr)
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
@@ -239,7 +289,11 @@ def _safe_percentile_pair(arr: np.ndarray, pmin: float = 1.0, pmax: float = 99.8
     return lo, hi
 
 
-def _display_rescale(arr: np.ndarray, pmin: float = 1.0, pmax: float = 99.8) -> np.ndarray:
+def _display_rescale(
+    arr: np.ndarray,
+    pmin: float = 1.0,
+    pmax: float = 99.8,
+) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
     lo, hi = _safe_percentile_pair(arr, pmin=pmin, pmax=pmax)
     return np.clip((arr - lo) / (hi - lo), 0, 1)
@@ -257,119 +311,52 @@ def _print_scale_checks(
     *,
     raw_input: np.ndarray,
     model_input: np.ndarray,
-    restored_float: np.ndarray,
+    restored_float_raw: np.ndarray,
+    restored_float_saved_scale: np.ndarray,
     restored_u16: np.ndarray,
     context: str,
     normalize_input: bool,
+    output_rescale_mode: str,
 ) -> None:
-    """
-    Print extra debug checks aimed at catching scaling / normalization mistakes.
-    """
     raw_max = float(np.nanmax(raw_input)) if np.size(raw_input) else 0.0
     model_in_max = float(np.nanmax(model_input)) if np.size(model_input) else 0.0
-    pred_max = float(np.nanmax(restored_float)) if np.size(restored_float) else 0.0
-    pred_mean = float(np.nanmean(restored_float)) if np.size(restored_float) else 0.0
+    pred_raw_max = float(np.nanmax(restored_float_raw)) if np.size(restored_float_raw) else 0.0
+    pred_saved_max = float(np.nanmax(restored_float_saved_scale)) if np.size(restored_float_saved_scale) else 0.0
+    pred_saved_mean = float(np.nanmean(restored_float_saved_scale)) if np.size(restored_float_saved_scale) else 0.0
     out_u16_max = int(np.max(restored_u16)) if np.size(restored_u16) else 0
 
-    print(f"[DEBUG] scale_check ({context})")
-    print(f"[DEBUG]   normalize_input={normalize_input}")
-    print(f"[DEBUG]   raw_input_max={raw_max:.6g}")
-    print(f"[DEBUG]   model_input_max={model_in_max:.6g}")
-    print(f"[DEBUG]   prediction_float_max={pred_max:.6g}")
-    print(f"[DEBUG]   prediction_float_mean={pred_mean:.6g}")
-    print(f"[DEBUG]   saved_uint16_max={out_u16_max}")
-    print(
-        f"[DEBUG]   raw_fraction_gt0={_fraction_positive(raw_input):.4f}, "
+    print_debug(f"scale_check ({context})")
+    print_debug(f"  normalize_input={normalize_input}")
+    print_debug(f"  output_rescale_mode={output_rescale_mode}")
+    print_debug(f"  raw_input_max={raw_max:.6g}")
+    print_debug(f"  model_input_max={model_in_max:.6g}")
+    print_debug(f"  prediction_float_raw_max={pred_raw_max:.6g}")
+    print_debug(f"  prediction_float_saved_scale_max={pred_saved_max:.6g}")
+    print_debug(f"  prediction_float_saved_scale_mean={pred_saved_mean:.6g}")
+    print_debug(f"  saved_uint16_max={out_u16_max}")
+    print_debug(
+        f"  raw_fraction_gt0={_fraction_positive(raw_input):.4f}, "
         f"model_input_fraction_gt0={_fraction_positive(model_input):.4f}, "
-        f"prediction_fraction_gt0={_fraction_positive(restored_float):.4f}"
+        f"prediction_fraction_gt0={_fraction_positive(restored_float_saved_scale):.4f}"
     )
 
     if normalize_input and model_in_max > 1.05:
-        print(
-            f"[WARN] {context}: normalized model input has max > 1.05 "
+        print_warn(
+            f"{context}: normalized model input has max > 1.05 "
             f"({model_in_max:.4g}). Check normalization."
         )
 
-    if normalize_input and pred_max < 100:
-        print(
-            f"[WARN] {context}: prediction max is very low after rescaling "
-            f"({pred_max:.4g}). This can indicate a normalization / scale mismatch."
-        )
-
-    if not normalize_input and pred_max <= 1.5:
-        print(
-            f"[WARN] {context}: prediction max is near 0-1 range without normalization "
-            f"({pred_max:.4g}). The model may have been trained with normalized input."
-        )
-
     if out_u16_max < 50:
-        print(
-            f"[WARN] {context}: saved uint16 output max is very low "
+        print_warn(
+            f"{context}: saved uint16 output max is very low "
             f"({out_u16_max}). Output may be severely compressed."
         )
 
-
-def save_debug_visualization(
-    *,
-    raw_input: np.ndarray,
-    model_input: np.ndarray,
-    restored_float: np.ndarray,
-    restored_u16: np.ndarray,
-    vis_path: Path,
-    context: str,
-    normalize_input: bool,
-) -> None:
-    """
-    Save a quick-look debug figure with raw input, model input, prediction, and histogram.
-
-    This is intended to quickly reveal scaling mistakes and overly dim predictions.
-    """
-    vis_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
-
-    axes[0, 0].imshow(_display_rescale(raw_input), cmap="gray")
-    axes[0, 0].set_title("Raw input (display-scaled)")
-    axes[0, 0].axis("off")
-
-    axes[0, 1].imshow(_display_rescale(model_input), cmap="gray")
-    axes[0, 1].set_title("Model input (display-scaled)")
-    axes[0, 1].axis("off")
-
-    axes[0, 2].imshow(_display_rescale(restored_float), cmap="gray")
-    axes[0, 2].set_title("Prediction float (display-scaled)")
-    axes[0, 2].axis("off")
-
-    axes[1, 0].imshow(_display_rescale(restored_u16), cmap="gray")
-    axes[1, 0].set_title("Saved uint16 output")
-    axes[1, 0].axis("off")
-
-    raw_vals = np.asarray(raw_input)[np.isfinite(raw_input)].ravel()
-    pred_vals = np.asarray(restored_float)[np.isfinite(restored_float)].ravel()
-
-    if raw_vals.size > 0:
-        axes[1, 1].hist(raw_vals, bins=100, alpha=0.7, label="raw")
-    if pred_vals.size > 0:
-        axes[1, 1].hist(pred_vals, bins=100, alpha=0.7, label="pred")
-    axes[1, 1].set_title("Raw vs prediction histogram")
-    axes[1, 1].legend()
-
-    text = [
-        context,
-        f"normalize_input={normalize_input}",
-        f"raw max={float(np.nanmax(raw_input)):.6g}",
-        f"model input max={float(np.nanmax(model_input)):.6g}",
-        f"pred float max={float(np.nanmax(restored_float)):.6g}",
-        f"pred u16 max={int(np.max(restored_u16))}",
-    ]
-    axes[1, 2].axis("off")
-    axes[1, 2].text(0.0, 1.0, "\n".join(text), va="top", family="monospace")
-
-    fig.tight_layout()
-    fig.savefig(vis_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-    print(f"[INFO] Debug visualization written: {vis_path}")
+    if out_u16_max >= 65535:
+        print_warn(
+            f"{context}: saved uint16 output is saturated "
+            f"(max={out_u16_max}). Check output scaling."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -377,12 +364,6 @@ def save_debug_visualization(
 # -----------------------------------------------------------------------------
 
 def find_training_metadata_file(model_dir: Path | str, model_name: str) -> Path | None:
-    """
-    Look for training metadata in the model output directory.
-
-    Expected location:
-        <model_dir>/<model_name>/training_metadata.json
-    """
     model_dir = Path(model_dir)
     candidate = model_dir / model_name / "training_metadata.json"
     if candidate.exists():
@@ -399,18 +380,6 @@ def resolve_inference_normalization_settings(
     normalization_pmax: float | None,
     normalization_eps: float | None,
 ) -> tuple[bool, float, float, float, Path | None, dict | None]:
-    """
-    Resolve inference normalization settings.
-
-    Priority
-    --------
-    1. If normalize_input is explicitly True/False, keep that choice.
-    2. If normalize_input is None, try to infer from training_metadata.json.
-    3. If metadata is unavailable, default to False.
-
-    If normalization params are None, try to load them from training metadata.
-    Otherwise use standard defaults.
-    """
     metadata_file = find_training_metadata_file(model_dir, model_name)
     metadata = load_json_file(metadata_file) if metadata_file is not None else None
 
@@ -456,7 +425,6 @@ def resolve_inference_normalization_settings(
 # -----------------------------------------------------------------------------
 
 def discover_regions(input_dir: Path) -> tuple[list[int], dict[int, Path]]:
-    """Find region folders named R1, R2, ..."""
     region_pattern = re.compile(r"^R(\d+)$")
     regions_found: list[tuple[int, Path]] = []
 
@@ -482,7 +450,6 @@ def select_region_directories(
     available_map: dict[int, Path],
     regions_to_process,
 ) -> tuple[list[int], list[Path]]:
-    """Resolve requested region numbers into directories."""
     if regions_to_process is None:
         region_numbers = available_numbers
     else:
@@ -507,7 +474,6 @@ def select_region_directories(
 
 
 def discover_cycles(preprocessing_root: Path) -> list[tuple[int, Path]]:
-    """Find cycle folders named Cycle1, Cycle2, ..."""
     cycle_pattern = re.compile(r"^Cycle(\d+)$")
     cycles_found: list[tuple[int, Path]] = []
 
@@ -523,11 +489,6 @@ def discover_cycles(preprocessing_root: Path) -> list[tuple[int, Path]]:
 
 
 def choose_n_tiles_yx(shape_yx: tuple[int, int]) -> tuple[int, int]:
-    """
-    Heuristic tiling selection for 2D CARE inference (axes='YX').
-
-    More tiles reduce peak GPU memory at the cost of some overhead.
-    """
     y, x = shape_yx
     m = max(y, x)
 
@@ -538,6 +499,118 @@ def choose_n_tiles_yx(shape_yx: tuple[int, int]) -> tuple[int, int]:
     if m <= 6144:
         return (2, 2)
     return (2, 4)
+
+
+# -----------------------------------------------------------------------------
+# Manual visualization after prediction
+# -----------------------------------------------------------------------------
+
+def visualize_random_care_predictions(
+    *,
+    input_dir: Path | str,
+    output_dir_prefix: Path | str | None = None,
+    regions_to_process: list[int] | None = None,
+    n_pairs: int = 5,
+    dapi_ch: int = 4,
+    random_seed: int | None = 42,
+    pmin: float = 1.0,
+    pmax: float = 99.8,
+    bins: int = 100,
+) -> list[tuple[Path, Path]]:
+    input_dir = Path(input_dir)
+    output_dir_prefix = Path(output_dir_prefix) if output_dir_prefix is not None else None
+
+    available_numbers, available_map = discover_regions(input_dir)
+    region_numbers, region_dirs = select_region_directories(
+        available_numbers=available_numbers,
+        available_map=available_map,
+        regions_to_process=regions_to_process,
+    )
+
+    dapi_suffix_re = re.compile(
+        rf"_ch0*{int(dapi_ch)}\.(tif|tiff)$",
+        re.IGNORECASE,
+    )
+
+    pairs: list[tuple[Path, Path]] = []
+
+    for region_number, region_dir in zip(region_numbers, region_dirs):
+        region_name = f"R{region_number}"
+        preprocessing_root = region_dir / "preprocessing"
+
+        if not preprocessing_root.exists():
+            continue
+
+        for _, cycle_dir in discover_cycles(preprocessing_root):
+            raw_dir = cycle_dir / "4_retiled"
+
+            if output_dir_prefix is None:
+                pred_dir = cycle_dir / "4_retiled" / "CARE"
+            else:
+                pred_dir = (
+                    output_dir_prefix
+                    / region_name
+                    / "preprocessing"
+                    / cycle_dir.name
+                    / "4_retiled"
+                    / "CARE"
+                )
+
+            if not raw_dir.exists() or not pred_dir.exists():
+                continue
+
+            for raw_path in sorted(raw_dir.glob("*.tif")):
+                if dapi_suffix_re.search(raw_path.name):
+                    continue
+
+                pred_path = pred_dir / raw_path.name
+                if pred_path.exists():
+                    pairs.append((raw_path, pred_path))
+
+    if not pairs:
+        print_warn("No raw/prediction TIFF pairs found.")
+        return []
+
+    rng = random.Random(random_seed)
+    selected = rng.sample(pairs, k=min(n_pairs, len(pairs)))
+
+    for i, (raw_path, pred_path) in enumerate(selected, start=1):
+        raw = tifffile.imread(str(raw_path)).astype(np.float32)
+        pred = tifffile.imread(str(pred_path)).astype(np.float32)
+
+        print_subsection(f"Visualization {i}/{len(selected)}", color=T.MAGENTA)
+        print_info(f"Raw : {raw_path}")
+        print_info(f"Pred: {pred_path}")
+
+        _print_array_stats(raw, "raw")
+        _print_array_stats(pred, "prediction")
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+        axes[0].imshow(_display_rescale(raw, pmin=pmin, pmax=pmax), cmap="gray")
+        axes[0].set_title("Raw input")
+        axes[0].axis("off")
+
+        axes[1].imshow(_display_rescale(pred, pmin=pmin, pmax=pmax), cmap="gray")
+        axes[1].set_title("CARE prediction")
+        axes[1].axis("off")
+
+        raw_vals = raw[np.isfinite(raw)].ravel()
+        pred_vals = pred[np.isfinite(pred)].ravel()
+
+        if raw_vals.size:
+            axes[2].hist(raw_vals, bins=bins, alpha=0.6, label="raw")
+        if pred_vals.size:
+            axes[2].hist(pred_vals, bins=bins, alpha=0.6, label="prediction")
+
+        axes[2].set_title("Intensity histogram")
+        axes[2].legend()
+
+        fig.suptitle(f"{raw_path.parent.parent.name} / {raw_path.name}")
+        fig.tight_layout()
+        plt.show()
+
+    return selected
 
 
 # -----------------------------------------------------------------------------
@@ -564,9 +637,12 @@ def write_care_xml(
     normalization_pmin: float,
     normalization_pmax: float,
     normalization_eps: float,
+    output_rescale_mode: str,
+    output_rescale_pmin: float,
+    output_rescale_pmax: float,
+    output_rescale_eps: float,
     debug_prints: bool,
     debug_print_limit: int,
-    visualize_debug_predictions: bool,
     overwrite: bool,
     n_pred: int,
     n_copy: int,
@@ -574,7 +650,6 @@ def write_care_xml(
     probe_shape: tuple[int, int],
     model: CARE,
 ) -> None:
-    """Write a compact provenance XML for one productive cycle run."""
     root = Element("care_run")
 
     SubElement(root, "timestamp_utc").text = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -599,10 +674,12 @@ def write_care_xml(
     SubElement(params, "normalization_pmin").text = str(normalization_pmin)
     SubElement(params, "normalization_pmax").text = str(normalization_pmax)
     SubElement(params, "normalization_eps").text = str(normalization_eps)
-    SubElement(params, "rescale_prediction_by_65535").text = str(bool(normalize_input))
+    SubElement(params, "output_rescale_mode").text = str(output_rescale_mode)
+    SubElement(params, "output_rescale_pmin").text = str(output_rescale_pmin)
+    SubElement(params, "output_rescale_pmax").text = str(output_rescale_pmax)
+    SubElement(params, "output_rescale_eps").text = str(output_rescale_eps)
     SubElement(params, "debug_prints").text = str(bool(debug_prints))
     SubElement(params, "debug_print_limit").text = str(int(debug_print_limit))
-    SubElement(params, "visualize_debug_predictions").text = str(bool(visualize_debug_predictions))
     SubElement(params, "overwrite").text = str(bool(overwrite))
     SubElement(params, "normalization_inferred_from_metadata").text = str(training_metadata_file is not None)
 
@@ -631,7 +708,7 @@ def write_care_xml(
 
     xml_path.parent.mkdir(parents=True, exist_ok=True)
     ElementTree(root).write(str(xml_path), encoding="utf-8", xml_declaration=True)
-    print(f"[INFO] XML written: {xml_path}")
+    print_info(f"XML written: {xml_path}")
 
 
 # -----------------------------------------------------------------------------
@@ -649,11 +726,13 @@ def predict_one_image(
     normalization_pmin: float,
     normalization_pmax: float,
     normalization_eps: float,
+    output_rescale_mode: str,
+    output_rescale_pmin: float,
+    output_rescale_pmax: float,
+    output_rescale_eps: float,
     debug_this_file: bool,
     debug_context: str,
-    debug_vis_path: Path | None = None,
 ) -> None:
-    """Load one image, optionally normalize, run CARE, and save uint16 output."""
     x_in = tifffile.imread(str(tif_path)).astype(np.float32)
 
     if normalize_input:
@@ -666,57 +745,46 @@ def predict_one_image(
     else:
         x_in_model = x_in
 
-    restored = model.predict(x_in_model, axes=axes, n_tiles=n_tiles)
+    restored_raw = model.predict(x_in_model, axes=axes, n_tiles=n_tiles)
 
-    # If normalized inference is used, restore back to uint16-like range.
-    if normalize_input:
-        restored = restored * 65535.0
+    restored_saved_scale = rescale_prediction_for_saving(
+        restored_raw,
+        raw_input=x_in,
+        output_rescale_mode=output_rescale_mode,
+        output_rescale_pmin=output_rescale_pmin,
+        output_rescale_pmax=output_rescale_pmax,
+        output_rescale_eps=output_rescale_eps,
+    )
 
     if debug_this_file:
-        print(f"[DEBUG] {debug_context}")
+        print_debug(debug_context)
         _print_array_stats(x_in, "raw_input")
         if normalize_input:
             _print_array_stats(x_in_model, "normalized_input")
         else:
             _print_array_stats(x_in_model, "model_input_raw")
-        _print_array_stats(restored, "prediction_before_uint16")
+        _print_array_stats(restored_raw, "prediction_before_rescale")
+        _print_array_stats(restored_saved_scale, "prediction_before_uint16")
 
-    restored_u16 = to_uint16_safe(restored, context=debug_context)
+    restored_u16 = to_uint16_safe(restored_saved_scale, context=debug_context)
 
     if debug_this_file:
         _print_array_stats(restored_u16, "saved_uint16_output")
         _print_scale_checks(
             raw_input=x_in,
             model_input=x_in_model,
-            restored_float=restored,
+            restored_float_raw=restored_raw,
+            restored_float_saved_scale=restored_saved_scale,
             restored_u16=restored_u16,
             context=debug_context,
             normalize_input=normalize_input,
+            output_rescale_mode=output_rescale_mode,
         )
-
-        if debug_vis_path is not None:
-            save_debug_visualization(
-                raw_input=x_in,
-                model_input=x_in_model,
-                restored_float=restored,
-                restored_u16=restored_u16,
-                vis_path=debug_vis_path,
-                context=debug_context,
-                normalize_input=normalize_input,
-            )
 
     tifffile.imwrite(str(out_path), restored_u16)
 
 
 def copy_cycle_csvs(in_tile_dir: Path, out_tile_dir: Path, *, overwrite: bool) -> int:
-    """
-    Copy CSV sidecar files.
-
-    overwrite=False:
-        copy only when destination is missing or invalid
-    overwrite=True:
-        always replace destination CSVs
-    """
     n_csv_copied = 0
     for csv_path in in_tile_dir.glob("*.csv"):
         dst_csv = out_tile_dir / csv_path.name
@@ -728,7 +796,7 @@ def copy_cycle_csvs(in_tile_dir: Path, out_tile_dir: Path, *, overwrite: bool) -
             shutil.copyfile(csv_path, dst_csv)
             n_csv_copied += 1
         except Exception as e:
-            print(f"[WARN] Failed to copy {csv_path.name}: {e}")
+            print_warn(f"Failed to copy {csv_path.name}: {e}")
     return n_csv_copied
 
 
@@ -747,9 +815,12 @@ def process_one_cycle(
     normalization_pmin: float,
     normalization_pmax: float,
     normalization_eps: float,
+    output_rescale_mode: str,
+    output_rescale_pmin: float,
+    output_rescale_pmax: float,
+    output_rescale_eps: float,
     debug_prints: bool,
     debug_print_limit: int,
-    visualize_debug_predictions: bool,
     overwrite: bool,
     run_id: str,
     preprocessing_relpath: str,
@@ -757,20 +828,15 @@ def process_one_cycle(
     axes: str,
     out_dtype: str,
 ) -> None:
-    """Process one Cycle folder end-to-end."""
-    del preprocessing_relpath  # kept for signature clarity if later extended
+    del preprocessing_relpath
 
     in_tile_dir = cycle_dir / tiles_subpath
     if not in_tile_dir.exists():
-        print(f"[WARN] {region_name}/{cycle_name}: missing tile folder, skipping: {in_tile_dir}")
+        print_warn(f"{region_name}/{cycle_name}: missing tile folder, skipping: {in_tile_dir}")
         return
 
     out_tile_dir = out_cycle_dir / tiles_subpath / "CARE"
     out_tile_dir.mkdir(parents=True, exist_ok=True)
-
-    debug_vis_dir = out_tile_dir / "_debug_vis"
-    if visualize_debug_predictions:
-        debug_vis_dir.mkdir(parents=True, exist_ok=True)
 
     in_tifs = sorted(
         [p for p in in_tile_dir.iterdir() if p.is_file() and p.suffix.lower() in (".tif", ".tiff")],
@@ -778,10 +844,10 @@ def process_one_cycle(
     )
 
     if not in_tifs:
-        print(f"[WARN] {region_name}/{cycle_name}: no TIFFs found, skipping.")
+        print_warn(f"{region_name}/{cycle_name}: no TIFFs found, skipping.")
         return
 
-    print(f"[INFO] {region_name}/{cycle_name}: {len(in_tifs)} TIFF(s) found")
+    print_info(f"{region_name}/{cycle_name}: {len(in_tifs)} TIFF(s) found")
 
     dapi_suffix_re = re.compile(
         rf"_ch0*{int(dapi_ch)}\.(tif|tiff)$",
@@ -789,11 +855,10 @@ def process_one_cycle(
     )
 
     expected_out_paths = [out_tile_dir / p.name for p in in_tifs]
-
-    # Skip whole cycle only when overwrite is False and every output already looks valid.
     all_outputs_valid = all(file_exists_and_valid(p) for p in expected_out_paths)
+
     if not overwrite and all_outputs_valid:
-        print(f"[INFO] {region_name}/{cycle_name}: all outputs already exist and look valid, skipping.")
+        print_info(f"{region_name}/{cycle_name}: all outputs already exist and look valid, skipping.")
         return
 
     probe_path = next((p for p in in_tifs if not dapi_suffix_re.search(p.name)), in_tifs[0])
@@ -802,15 +867,11 @@ def process_one_cycle(
 
     y, x = probe_img.shape
     ty, tx = n_tiles
-    print(
-        f"[INFO] {region_name}/{cycle_name}: tiling {ty}x{tx} "
-        f"for image {y}x{x} (YxX)"
-    )
 
-    print(f"[INFO] {region_name}/{cycle_name}: input  -> {in_tile_dir}")
-    print(f"[INFO] {region_name}/{cycle_name}: output -> {out_tile_dir}")
-    print(f"[INFO] {region_name}/{cycle_name}: overwrite={overwrite}")
-    print(f"[INFO] {region_name}/{cycle_name}: visualize_debug_predictions={visualize_debug_predictions}")
+    print_info(f"Tiling: {ty}x{tx} for image {y}x{x} (YxX)")
+    print_info(f"Input : {in_tile_dir}")
+    print_info(f"Output: {out_tile_dir}")
+    print_info(f"Overwrite: {overwrite}")
 
     wrote_anything = False
     n_pred = 0
@@ -833,10 +894,6 @@ def process_one_cycle(
 
         debug_this_file = debug_prints and (n_debug_printed < debug_print_limit)
 
-        debug_vis_path = None
-        if debug_this_file and visualize_debug_predictions:
-            debug_vis_path = debug_vis_dir / f"{tif_path.stem}__debug.png"
-
         predict_one_image(
             tif_path=tif_path,
             out_path=out_path,
@@ -847,9 +904,12 @@ def process_one_cycle(
             normalization_pmin=normalization_pmin,
             normalization_pmax=normalization_pmax,
             normalization_eps=normalization_eps,
+            output_rescale_mode=output_rescale_mode,
+            output_rescale_pmin=output_rescale_pmin,
+            output_rescale_pmax=output_rescale_pmax,
+            output_rescale_eps=output_rescale_eps,
             debug_this_file=debug_this_file,
             debug_context=f"{region_name}/{cycle_name}/{tif_path.name}",
-            debug_vis_path=debug_vis_path,
         )
 
         if debug_this_file:
@@ -866,9 +926,9 @@ def process_one_cycle(
     if n_csv_copied > 0:
         wrote_anything = True
 
-    print(
-        f"[INFO] {region_name}/{cycle_name}: "
-        f"predicted={n_pred}, copied_dapi={n_copy}, skipped_existing={n_skip}, copied_csv={n_csv_copied}"
+    print_info(
+        f"Cycle summary: predicted={n_pred}, copied_dapi={n_copy}, "
+        f"skipped_existing={n_skip}, copied_csv={n_csv_copied}"
     )
 
     if wrote_anything:
@@ -892,9 +952,12 @@ def process_one_cycle(
             normalization_pmin=normalization_pmin,
             normalization_pmax=normalization_pmax,
             normalization_eps=normalization_eps,
+            output_rescale_mode=output_rescale_mode,
+            output_rescale_pmin=output_rescale_pmin,
+            output_rescale_pmax=output_rescale_pmax,
+            output_rescale_eps=output_rescale_eps,
             debug_prints=debug_prints,
             debug_print_limit=debug_print_limit,
-            visualize_debug_predictions=visualize_debug_predictions,
             overwrite=overwrite,
             n_pred=n_pred,
             n_copy=n_copy,
@@ -919,90 +982,29 @@ def ISS_CARE_predict(
     normalization_pmin: float | None = None,
     normalization_pmax: float | None = None,
     normalization_eps: float | None = None,
+    output_rescale_mode: str = "none",
+    output_rescale_pmin: float = 1.0,
+    output_rescale_pmax: float = 99.8,
+    output_rescale_eps: float = 1e-8,
     debug_prints: bool = True,
     debug_print_limit: int = 3,
-    visualize_debug_predictions: bool = True,
     overwrite: bool = False,
 ):
-    """
-    Apply a pretrained CARE model to ISS images stored as channel-coded TIFF files.
-
-    Notebook-friendly usage
-    -----------------------
-    ISS_CARE_predict(
-        input_dir=input_dir,
-        model_dir=model_dir,
-        model_name=model_name,
-        dapi_ch=4,
-        regions_to_process=None,
-        output_dir_prefix=None,
-        normalize_input=None,   # auto-detect from training metadata
-        normalization_pmin=None,
-        normalization_pmax=None,
-        normalization_eps=None,
-        debug_prints=True,
-        debug_print_limit=3,
-        visualize_debug_predictions=True,
-        overwrite=False,
-    )
-
-    Args
-    ----
-    input_dir : str or Path
-        Top-level experiment directory containing region folders (e.g. R1, R2).
-    model_dir : str or Path
-        Path to the folder containing pretrained CSBDeep/CARE models.
-    model_name : str
-        Name of the model to load.
-    dapi_ch : int
-        0-based channel index for DAPI. DAPI TIFFs matching `_ch{dapi_ch}.tif`
-        or `_ch0*{dapi_ch}.tif` are copied unchanged.
-    regions_to_process : list[int] or None
-        1-based region numbers to process, e.g. [1, 2]. None means all.
-    output_dir_prefix : str or Path or None
-        If set, write outputs under this prefix while mirroring region names.
-    normalize_input : bool or None
-        If True, percentile-normalize non-DAPI images before CARE prediction.
-        If False, use raw intensities.
-        If None, infer from training_metadata.json when possible.
-    normalization_pmin, normalization_pmax, normalization_eps : float or None
-        Optional normalization settings. If None, try metadata first, then defaults.
-    debug_prints : bool
-        If True, print debug stats for the first few predicted images per cycle.
-    debug_print_limit : int
-        Number of non-DAPI predicted images per cycle to print debug stats for.
-    visualize_debug_predictions : bool
-        If True, save debug PNG summaries for the first few predicted images per cycle.
-    overwrite : bool
-        If False, keep valid existing outputs and skip them.
-        If True, recompute predictions and replace existing TIFF/CSV outputs.
-
-    Behavior
-    --------
-    - Discovers region directories matching R\\d+.
-    - For each region, finds Cycle* folders under <region>/preprocessing/.
-    - Reads TIFFs from <region>/preprocessing/CycleX/4_retiled/
-    - Writes outputs to <region>/preprocessing/CycleX/4_retiled/CARE/
-      or to output_dir_prefix mirroring region names.
-    - Applies CARE to all TIFFs except DAPI.
-    - Copies DAPI TIFFs unchanged.
-    - Copies any CSV metadata alongside outputs.
-    - overwrite=False: never overwrites valid existing outputs.
-    - overwrite=True: replaces existing outputs.
-    - Writes one provenance XML only if this run actually produced output.
-    """
+    
     preprocessing_relpath = "preprocessing"
     tiles_subpath = "4_retiled"
     axes = "YX"
     out_dtype = "uint16"
-
+    
     input_dir = Path(input_dir)
     model_dir = Path(model_dir)
-
-    print(f"[INFO] Processing directory: {input_dir.resolve()}")
-    print(f"[INFO] Model base directory: {model_dir.resolve()}")
-    print(f"[INFO] Model name: {model_name}")
-
+    
+    print_section("CARE prediction setup")
+    
+    print_info(f"Processing directory: {input_dir.resolve()}")
+    print_info(f"Model base directory: {model_dir.resolve()}")
+    print_info(f"Model name: {model_name}")
+    
     (
         normalize_input,
         normalization_pmin,
@@ -1018,73 +1020,97 @@ def ISS_CARE_predict(
         normalization_pmax=normalization_pmax,
         normalization_eps=normalization_eps,
     )
-
-    del training_metadata  # loaded for possible future use; not needed below
-
-    print(f"[INFO] Training metadata file: {training_metadata_file}")
-    print(f"[INFO] normalize_input (resolved): {normalize_input}")
+    
+    del training_metadata
+    
+    print_info(f"Training metadata file: {training_metadata_file}")
+    
+    print_subsection("Input preprocessing")
+    print_info(f"normalize_input resolved: {normalize_input}")
+    
     if normalize_input:
-        print(
-            f"[INFO] Normalization: pmin={normalization_pmin}, "
-            f"pmax={normalization_pmax}, eps={normalization_eps}"
+        print_info(
+            f"Input normalization ON: percentile scaling before prediction "
+            f"(pmin={normalization_pmin}, pmax={normalization_pmax}, eps={normalization_eps})"
         )
-        print("[INFO] Prediction output will be rescaled by 65535 before uint16 saving.")
     else:
-        print("[INFO] Using raw input intensities for prediction.")
-
-    print(f"[INFO] debug_prints: {debug_prints}")
-    print(f"[INFO] debug_print_limit: {debug_print_limit}")
-    print(f"[INFO] visualize_debug_predictions: {visualize_debug_predictions}")
-    print(f"[INFO] overwrite: {overwrite}")
-
+        print_info("Input normalization OFF: raw input intensities are passed to CARE.")
+    
+    print_subsection("Output saving")
+    print_info(f"Saved output dtype: {out_dtype}")
+    print_info(f"Output rescale mode: {output_rescale_mode}")
+    
+    if output_rescale_mode == "none":
+        print_info("Output rescale OFF: CARE prediction values are saved directly, then clipped to uint16.")
+    elif output_rescale_mode == "x65535":
+        print_info("Output rescale ON: prediction is multiplied by 65535 before saving.")
+    elif output_rescale_mode == "percentile":
+        print_info(
+            f"Output rescale ON: prediction is percentile-scaled before saving "
+            f"(pmin={output_rescale_pmin}, pmax={output_rescale_pmax}, eps={output_rescale_eps})"
+        )
+    elif output_rescale_mode == "match_raw_max":
+        print_info("Output rescale ON: prediction max is matched to raw input max before saving.")
+    else:
+        print_warn(f"Unknown output_rescale_mode: {output_rescale_mode}")
+    
+    print_subsection("Run options")
+    print_info(f"debug_prints: {debug_prints}")
+    print_info(f"debug_print_limit: {debug_print_limit}")
+    print_info(f"overwrite: {overwrite}")
+    
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
         output_dir_prefix.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
+        print_info(f"Output location: {output_dir_prefix.resolve()}")
     else:
-        print("[INFO] Using default output location under each region directory")
-
+        print_info("Output location: default CARE folder inside each cycle directory")
+    
     run_id = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
-
+    print_info(f"Run ID: {run_id}")
+    
+    print_subsection("Region discovery")
+    
     available_numbers, available_map = discover_regions(input_dir)
     all_regions = [f"R{n}" for n in available_numbers]
-    print(f"[INFO] Regions found on disk ({len(all_regions)}): {all_regions}")
-
+    print_info(f"Regions found on disk ({len(all_regions)}): {all_regions}")
+    
     region_numbers, region_directories = select_region_directories(
         available_numbers=available_numbers,
         available_map=available_map,
         regions_to_process=regions_to_process,
     )
-
+    
     selected_regions = [f"R{n}" for n in region_numbers]
     skipped_regions = [r for r in all_regions if r not in selected_regions]
-
-    print(f"[INFO] Regions selected ({len(selected_regions)}): {selected_regions}")
+    
+    print_info(f"Regions selected ({len(selected_regions)}): {selected_regions}")
     if skipped_regions:
-        print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
-
+        print_info(f"Regions skipped ({len(skipped_regions)}): {skipped_regions}")
+    
+    print_subsection("Model loading")
     model = CARE(config=None, name=model_name, basedir=str(model_dir))
-    print(f"[INFO] Loaded CARE model: {model.name}")
+    print_info(f"Loaded CARE model: {model.name}")
 
     for region_directory in region_directories:
         region_name = region_directory.name
-        print("=" * 80)
-        print(f"[INFO] Processing region: {region_name}")
+        print_section(f"Region: {region_name}", color=T.CYAN)
 
         preprocessing_root = region_directory / preprocessing_relpath
         if not preprocessing_root.exists():
-            print(f"[WARN] {region_name}: missing preprocessing folder, skipping: {preprocessing_root}")
+            print_warn(f"{region_name}: missing preprocessing folder, skipping: {preprocessing_root}")
             continue
 
         cycles_found = discover_cycles(preprocessing_root)
         if not cycles_found:
-            print(f"[WARN] {region_name}: no Cycle* folders found under: {preprocessing_root}")
+            print_warn(f"{region_name}: no Cycle* folders found under: {preprocessing_root}")
             continue
 
-        print(f"[INFO] {region_name}: cycles found -> {[c.name for _, c in cycles_found]}")
+        print_info(f"{region_name}: cycles found -> {[c.name for _, c in cycles_found]}")
 
         for _, cycle_dir in cycles_found:
             cycle_name = cycle_dir.name
+            print_subsection(f"{region_name} / {cycle_name}", color=T.BLUE)
 
             if output_dir_prefix is None:
                 out_cycle_dir = cycle_dir
@@ -1110,9 +1136,12 @@ def ISS_CARE_predict(
                 normalization_pmin=normalization_pmin,
                 normalization_pmax=normalization_pmax,
                 normalization_eps=normalization_eps,
+                output_rescale_mode=output_rescale_mode,
+                output_rescale_pmin=output_rescale_pmin,
+                output_rescale_pmax=output_rescale_pmax,
+                output_rescale_eps=output_rescale_eps,
                 debug_prints=debug_prints,
                 debug_print_limit=debug_print_limit,
-                visualize_debug_predictions=visualize_debug_predictions,
                 overwrite=overwrite,
                 run_id=run_id,
                 preprocessing_relpath=preprocessing_relpath,
@@ -1120,3 +1149,5 @@ def ISS_CARE_predict(
                 axes=axes,
                 out_dtype=out_dtype,
             )
+
+    print_section("CARE prediction complete", color=T.GREEN)
