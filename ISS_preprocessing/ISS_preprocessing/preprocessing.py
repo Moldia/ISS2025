@@ -4551,6 +4551,18 @@ def preprocessing_main(input_dirs,
    
     script_start_time = time.time()
 
+    mode = str(mode).lower()
+
+    # --- SAFETY CHECK FOR LIF ---
+    if mode == "lif" and pixel_to_um is None:
+        raise ValueError(
+            "\n[ERROR] LIF metadata pixel size extraction is not considered reliable.\n"
+            "Please provide a manual value for 'pixel_to_um' (µm per pixel).\n\n"
+            "Examples:\n"
+            "  pixel_to_um = 0.1625  # 40x Leica objective\n"
+            "  pixel_to_um = 0.325   # 20x Leica objective\n"
+        )
+
     valid_modes = {'tif_autosaved', 'tif_exported', 'lif', 'nd2', 'czi'}
     if mode not in valid_modes:
         raise ValueError(f"Unsupported mode: {mode}. Choose from {valid_modes}.")
@@ -6032,6 +6044,9 @@ def retile_stitched_images(
             # Write coords CSV once (grid coords)
             coords_csv_path = retiled_directory / f"Cycle{cycle}_retiled_coords.csv"
             pd.DataFrame({"x": x_positions, "y": y_positions}).to_csv(coords_csv_path, header=False, index=False)
-            print(f"Tiling complete. Positions saved to {coords_csv_path}")
+            print(
+                f"[INFO] Tiling complete. Retiled coordinate CSV written in PIXELS "
+                f"(upper-left tile corners): {coords_csv_path}"
+            )
 
 

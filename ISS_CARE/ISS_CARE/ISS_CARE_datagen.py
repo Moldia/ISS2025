@@ -20,6 +20,66 @@ CH_RE = re.compile(r"_ch(\d+)\.tif+$", re.IGNORECASE)
 
 
 # -----------------------------------------------------------------------------
+# Pretty terminal printing
+# -----------------------------------------------------------------------------
+
+USE_COLOR_PRINTS = True
+
+
+class T:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+
+
+def color_text(text: str, color: str = "", bold: bool = False) -> str:
+    if not USE_COLOR_PRINTS:
+        return text
+
+    prefix = ""
+    if bold:
+        prefix += T.BOLD
+    prefix += color
+    return f"{prefix}{text}{T.RESET}"
+
+
+def print_section(title: str, color: str = T.CYAN) -> None:
+    line = "=" * 90
+    print("\n" + color_text(line, color, bold=True))
+    print(color_text(title, color, bold=True))
+    print(color_text(line, color, bold=True))
+
+
+def print_subsection(title: str, color: str = T.BLUE) -> None:
+    line = "-" * 80
+    print("\n" + color_text(line, color, bold=True))
+    print(color_text(title, color, bold=True))
+    print(color_text(line, color, bold=True))
+
+
+def print_info(msg: str) -> None:
+    print(color_text("[INFO] ", T.GREEN, bold=True) + msg)
+
+
+def print_warn(msg: str) -> None:
+    print(color_text("[WARN] ", T.YELLOW, bold=True) + msg)
+
+
+def print_error(msg: str) -> None:
+    print(color_text("[ERROR] ", T.RED, bold=True) + msg)
+
+
+def print_success(msg: str) -> None:
+    print(color_text("[DONE] ", T.GREEN, bold=True) + msg)
+
+
+# -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
 
@@ -62,8 +122,16 @@ def image_is_usable(
     if arr.size == 0:
         return False, "empty array"
 
+    if arr.dtype == np.object_:
+        return False, "object dtype"
+
     if not np.all(np.isfinite(arr)):
         return False, "contains NaN/Inf"
+
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if not np.all(np.isfinite(arr)):
+        return False, "contains NaN/Inf after float32 conversion"
 
     absmax = float(np.max(np.abs(arr)))
     if absmax > extreme_value_cutoff:
@@ -128,12 +196,7 @@ def has_suspicious_half_plane_artifact(
     top = arr[..., : h // 2, :]
     bottom = arr[..., h // 2 :, :]
 
-    halves = {
-        "left": left,
-        "right": right,
-        "top": top,
-        "bottom": bottom,
-    }
+    halves = {"left": left, "right": right, "top": top, "bottom": bottom}
     stats = {name: robust_stats(half) for name, half in halves.items()}
 
     dark_cutoff = global_stats["min"] + 0.05 * max(global_rng, near_zero_std)
@@ -173,8 +236,8 @@ def pair_has_signal_mismatch(
     signal_max_threshold: float = 0.0,
     empty_max_threshold: float = 0.0,
 ) -> tuple[bool, str]:
-    x = np.asarray(x)
-    y = np.asarray(y)
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
 
     x_std = float(np.std(x))
     y_std = float(np.std(y))
@@ -244,11 +307,7 @@ def pair_is_usable(
     min_target_to_source_robust_range_ratio: float,
     min_target_to_source_std_ratio: float,
 ) -> tuple[bool, dict]:
-    info = {
-        "source_reason": None,
-        "target_reason": None,
-        "pair_reason": None,
-    }
+    info = {"source_reason": None, "target_reason": None, "pair_reason": None}
 
     x_ok, x_reason = image_is_usable(
         x,
@@ -328,11 +387,11 @@ def find_all_samples(
     sample_dirs: list[Path] = []
 
     def _onerror(err):
-        print(f"WARNING: Could not access {err.filename}: {err}")
+        print_warn(f"Could not access {err.filename}: {err}")
 
     for base in search_roots:
         if not base.exists():
-            print(f"WARNING: {base} does not exist, skipping.")
+            print_warn(f"{base} does not exist, skipping.")
             continue
 
         for dirpath, dirnames, _ in os.walk(base, topdown=True, onerror=_onerror):
@@ -422,22 +481,70 @@ def split_pairs_excluding_dapi(
     return non_dapi, dapi, excluded
 
 
+# -----------------------------------------------------------------------------
+# Read + validate pairs first
+# -----------------------------------------------------------------------------
+
+def read_image_as_float32(
+    path: Path,
+    *,
+    extreme_value_cutoff: float = 1e6,
+) -> np.ndarray:
+    arr = imread(path)
+    arr = np.asarray(arr)
+
+    if arr.size == 0:
+        raise ValueError("empty array")
+    if arr.dtype == np.object_:
+        raise ValueError("object dtype")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("contains NaN/Inf before float32 conversion")
+
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("contains NaN/Inf after float32 conversion")
+
+    absmax = float(np.max(np.abs(arr)))
+    if absmax > extreme_value_cutoff:
+        raise ValueError(
+            f"extreme image values after float32 conversion: "
+            f"absmax={absmax:.6g} > cutoff={extreme_value_cutoff:.6g}"
+        )
+
+    return arr
+
+
 def filter_pairs_with_usable_images(
     file_pairs: list[tuple[Path, Path]],
     *,
     filter_settings: dict,
-) -> tuple[list[tuple[Path, Path]], list[dict]]:
-    kept_pairs: list[tuple[Path, Path]] = []
+) -> tuple[list[tuple[Path, Path, np.ndarray, np.ndarray]], list[dict]]:
+    kept_pairs: list[tuple[Path, Path, np.ndarray, np.ndarray]] = []
     removed_info: list[dict] = []
 
+    extreme_value_cutoff = filter_settings["extreme_value_cutoff"]
+
     for src, tgt in file_pairs:
-        x = imread(src)
-        y = imread(tgt)
+        try:
+            x = read_image_as_float32(src, extreme_value_cutoff=extreme_value_cutoff)
+            y = read_image_as_float32(tgt, extreme_value_cutoff=extreme_value_cutoff)
+        except Exception as e:
+            removed_info.append(
+                {
+                    "source": str(src),
+                    "target": str(tgt),
+                    "source_reason": None,
+                    "target_reason": None,
+                    "pair_reason": f"read/image-level validation error: {e}",
+                }
+            )
+            continue
 
         ok, info = pair_is_usable(x, y, **filter_settings)
 
         if ok:
-            kept_pairs.append((src, tgt))
+            kept_pairs.append((src, tgt, x, y))
         else:
             removed_info.append(
                 {
@@ -450,172 +557,6 @@ def filter_pairs_with_usable_images(
             )
 
     return kept_pairs, removed_info
-
-
-def rawdata_from_pairs(source_target_pairs: list[tuple[Path, Path]], axes: str) -> RawData:
-    def gen():
-        for source_path, target_path in source_target_pairs:
-            yield imread(source_path), imread(target_path), axes, None
-
-    return RawData(generator=gen, size=len(source_target_pairs), description="paired_generator")
-
-
-# -----------------------------------------------------------------------------
-# Signal-biased pair weighting
-# -----------------------------------------------------------------------------
-
-def foreground_fraction(
-    arr: np.ndarray,
-    *,
-    pmin: float = 1.0,
-    pmax: float = 99.0,
-    signal_fraction: float = 0.10,
-    eps: float = 1e-8,
-) -> float:
-    arr = np.asarray(arr, dtype=np.float32)
-    lo, hi = np.percentile(arr, [pmin, pmax])
-    thr = lo + signal_fraction * max(hi - lo, eps)
-    return float(np.mean(arr > thr))
-
-
-def compute_pair_signal_metrics(
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    use_target: bool = True,
-    pmin: float = 1.0,
-    pmax: float = 99.0,
-    signal_foreground_fraction: float = 0.10,
-) -> dict:
-    arr = np.asarray(y if use_target else x, dtype=np.float32)
-    st = robust_stats(arr, pmin=pmin, pmax=pmax)
-
-    return {
-        "std": st["std"],
-        "max": st["max"],
-        "robust_range": st["robust_range"],
-        "foreground_fraction": foreground_fraction(
-            arr,
-            pmin=pmin,
-            pmax=pmax,
-            signal_fraction=signal_foreground_fraction,
-        ),
-    }
-
-
-def compute_pair_signal_score(
-    metrics: dict,
-    *,
-    weight_std: float = 1.5,
-    weight_robust_range: float = 1.5,
-    weight_foreground: float = 3.0,
-    weight_max: float = 0.25,
-) -> float:
-    return float(
-        weight_std * np.log1p(metrics["std"])
-        + weight_robust_range * np.log1p(metrics["robust_range"])
-        + weight_foreground * metrics["foreground_fraction"]
-        + weight_max * np.log1p(metrics["max"])
-    )
-
-
-def apply_signal_bias_to_pairs(
-    pairs: list[tuple[Path, Path]],
-    *,
-    pair_selection_mode: str = "signal_biased",
-    signal_score_use_target: bool = True,
-    max_pair_repeats: int = 3,
-    drop_low_score_fraction: float = 0.20,
-    min_pairs_to_keep_after_signal_bias: int = 8,
-    signal_score_pmin: float = 1.0,
-    signal_score_pmax: float = 99.0,
-    signal_foreground_fraction: float = 0.10,
-    signal_weight_std: float = 1.5,
-    signal_weight_robust_range: float = 1.5,
-    signal_weight_foreground: float = 3.0,
-    signal_weight_max: float = 0.25,
-) -> tuple[list[tuple[Path, Path]], dict]:
-    if not pairs:
-        return [], {
-            "mode": pair_selection_mode,
-            "n_input_pairs": 0,
-            "n_kept_pairs": 0,
-            "n_expanded_pairs": 0,
-            "score_min": None,
-            "score_median": None,
-            "score_max": None,
-        }
-
-    if pair_selection_mode not in {"uniform", "signal_biased"}:
-        raise ValueError("pair_selection_mode must be 'uniform' or 'signal_biased'")
-
-    if pair_selection_mode == "uniform":
-        return pairs, {
-            "mode": pair_selection_mode,
-            "n_input_pairs": len(pairs),
-            "n_kept_pairs": len(pairs),
-            "n_expanded_pairs": len(pairs),
-            "score_min": None,
-            "score_median": None,
-            "score_max": None,
-        }
-
-    annotated = []
-    for src, tgt in pairs:
-        x = imread(src)
-        y = imread(tgt)
-        metrics = compute_pair_signal_metrics(
-            x,
-            y,
-            use_target=signal_score_use_target,
-            pmin=signal_score_pmin,
-            pmax=signal_score_pmax,
-            signal_foreground_fraction=signal_foreground_fraction,
-        )
-        score = compute_pair_signal_score(
-            metrics,
-            weight_std=signal_weight_std,
-            weight_robust_range=signal_weight_robust_range,
-            weight_foreground=signal_weight_foreground,
-            weight_max=signal_weight_max,
-        )
-        annotated.append({"source": src, "target": tgt, "score": float(score)})
-
-    annotated = sorted(annotated, key=lambda d: d["score"])
-    n_input = len(annotated)
-
-    n_drop = int(np.floor(n_input * drop_low_score_fraction)) if drop_low_score_fraction > 0 else 0
-    max_drop_allowed = max(0, n_input - min_pairs_to_keep_after_signal_bias)
-    n_drop = min(n_drop, max_drop_allowed)
-
-    kept = annotated[n_drop:] if n_drop > 0 else annotated
-
-    scores = np.array([d["score"] for d in kept], dtype=np.float32)
-    s_min = float(np.min(scores))
-    s_max = float(np.max(scores))
-    s_med = float(np.median(scores))
-
-    expanded_pairs: list[tuple[Path, Path]] = []
-    for item in kept:
-        if max_pair_repeats == 1 or s_max <= s_min:
-            repeats = 1
-        else:
-            norm = (item["score"] - s_min) / (s_max - s_min + 1e-8)
-            repeats = 1 + int(round(norm * (max_pair_repeats - 1)))
-        expanded_pairs.extend([(item["source"], item["target"])] * repeats)
-
-    summary = {
-        "mode": pair_selection_mode,
-        "n_input_pairs": n_input,
-        "n_dropped_pairs": int(n_drop),
-        "n_kept_pairs": len(kept),
-        "n_expanded_pairs": len(expanded_pairs),
-        "score_min": s_min,
-        "score_median": s_med,
-        "score_max": s_max,
-    }
-
-    return expanded_pairs, summary
 
 
 # -----------------------------------------------------------------------------
@@ -679,18 +620,20 @@ def save_patch_metadata(
         "summary": extra_summary,
     }
 
-    metadata_file = patch_file.with_name(f"{patch_file.stem}__metadata.json")
+    metadata_file = patch_file.with_suffix(".json")
+
     with open(metadata_file, "w") as f:
         json.dump(to_jsonable(metadata), f, indent=2)
 
-    print("Saved patch metadata:", metadata_file)
+    print_info(f"Saved patch metadata: {metadata_file}")
     return metadata_file
 
 
 def make_patches_for_variant(
     *,
-    raw_data: RawData,
+    pairs: list[tuple[Path, Path, np.ndarray, np.ndarray]],
     out_file: Path,
+    axes: str,
     patch_size,
     n_patches_per_image,
     patch_axes,
@@ -703,34 +646,106 @@ def make_patches_for_variant(
 
     patch_filter = patch_filter_from_threshold(patch_filter_threshold)
 
-    X, Y, XY_axes = create_patches(
-        raw_data=raw_data,
-        patch_size=patch_size,
-        n_patches_per_image=n_patches_per_image,
-        patch_axes=patch_axes,
-        patch_filter=patch_filter,
-        save_file=str(out_file),
-        verbose=True,
-    )
+    X_parts: list[np.ndarray] = []
+    Y_parts: list[np.ndarray] = []
+    dropped_pairs: list[dict] = []
+    XY_axes_ref = None
+
+    print_subsection(f"{variant_name}: patch creation", color=T.MAGENTA)
+    print_info(f"Input image pairs: {len(pairs)}")
+    print_info(f"Patch size: {patch_size}")
+    print_info(f"Patches per image: {n_patches_per_image}")
+    print_info(f"Patch filter threshold: {patch_filter_threshold}")
+
+    for pair_idx, (src, tgt, x, y) in enumerate(pairs, start=1):
+        def gen():
+            yield x, y, axes, None
+
+        raw_data_single = RawData(
+            generator=gen,
+            size=1,
+            description="single_pair_generator",
+        )
+
+        try:
+            X_i, Y_i, XY_axes = create_patches(
+                raw_data=raw_data_single,
+                patch_size=patch_size,
+                n_patches_per_image=n_patches_per_image,
+                patch_axes=patch_axes,
+                patch_filter=patch_filter,
+                save_file=None,
+                verbose=False,
+            )
+
+            validate_patch_array(
+                X_i,
+                "single-pair X patches",
+                extreme_value_cutoff=extreme_value_cutoff,
+            )
+            validate_patch_array(
+                Y_i,
+                "single-pair Y patches",
+                extreme_value_cutoff=extreme_value_cutoff,
+            )
+
+        except Exception as e:
+            dropped_pairs.append(
+                {
+                    "source": str(src),
+                    "target": str(tgt),
+                    "reason": str(e),
+                }
+            )
+            print_warn(f"Dropping bad {variant_name} image pair {pair_idx}/{len(pairs)}")
+            print_warn(f"  source: {src}")
+            print_warn(f"  target: {tgt}")
+            print_warn(f"  reason: {e}")
+            continue
+
+        X_parts.append(X_i)
+        Y_parts.append(Y_i)
+
+        if XY_axes_ref is None:
+            XY_axes_ref = XY_axes
+
+    if not X_parts:
+        raise RuntimeError(f"{variant_name}: no valid image pairs left after patch creation.")
+
+    X = np.concatenate(X_parts, axis=0)
+    Y = np.concatenate(Y_parts, axis=0)
 
     validate_patch_array(X, "X patches", extreme_value_cutoff=extreme_value_cutoff)
     validate_patch_array(Y, "Y patches", extreme_value_cutoff=extreme_value_cutoff)
 
+    np.savez_compressed(out_file, X=X, Y=Y, axes=XY_axes_ref)
+
+    summary = dict(extra_summary or {})
+    summary["n_pairs_before_patch_creation"] = len(pairs)
+    summary["n_pairs_used_after_patch_creation"] = len(X_parts)
+    summary["n_pairs_dropped_during_patch_creation"] = len(dropped_pairs)
+    summary["dropped_pairs_during_patch_creation"] = dropped_pairs[:50]
+
     save_patch_metadata(
         patch_file=out_file,
         variant_name=variant_name,
-        axes=XY_axes,
+        axes=XY_axes_ref,
         X_shape=X.shape,
         Y_shape=Y.shape,
-        n_pairs_used=len(raw_data),
+        n_pairs_used=len(X_parts),
         n_patches_total=len(X),
         patch_size=patch_size,
         n_patches_per_image=n_patches_per_image,
         patch_filter_threshold=patch_filter_threshold,
-        extra_summary=extra_summary or {},
+        extra_summary=summary,
     )
 
-    return X, Y, XY_axes
+    print_success(f"{variant_name} patch file saved: {out_file}")
+    print_info(f"{variant_name} patches created: {len(X)}")
+    print_info(f"{variant_name} image pairs used: {len(X_parts)}")
+    print_info(f"{variant_name} image pairs dropped during patch creation: {len(dropped_pairs)}")
+
+    return X, Y, XY_axes_ref, dropped_pairs
 
 
 # -----------------------------------------------------------------------------
@@ -754,6 +769,7 @@ def normalize_pairs_jointly(
         pair_vals = np.concatenate([x_batch[i].ravel(), y_batch[i].ravel()])
         lo = np.percentile(pair_vals, pmin)
         hi = np.percentile(pair_vals, pmax)
+
         x_norm[i] = np.clip((x_batch[i] - lo) / (hi - lo + eps), 0, 1)
         y_norm[i] = np.clip((y_batch[i] - lo) / (hi - lo + eps), 0, 1)
 
@@ -770,8 +786,10 @@ def visualize_patch_pairs(
     title: Optional[str] = None,
     figsize=(12, 5),
 ):
-    if len(X) == 0 or len(Y) == 0:
-        raise ValueError("Nothing to visualize.")
+    if len(X) == 0:
+        raise ValueError("X is empty; nothing to visualize.")
+    if len(Y) == 0:
+        raise ValueError("Y is empty; nothing to visualize.")
 
     n_show = min(n_show, len(X))
     rng = np.random.default_rng(random_seed)
@@ -785,8 +803,53 @@ def visualize_patch_pairs(
 
     plt.figure(figsize=figsize)
     plot_some(X_show, Y_show)
-    plt.suptitle(title or f"{n_show} random patch pairs")
+
+    if title is None:
+        title = f"{n_show} random patch pairs"
+
+    if normalize:
+        title = f"{title}\n(top: input, bottom: target; jointly normalized per pair)"
+    else:
+        title = f"{title}\n(top: input, bottom: target)"
+
+    plt.suptitle(title)
     plt.show()
+
+
+def visualize_saved_patches_across_samples(
+    patch_files: Sequence[Path | str],
+    *,
+    n_show_per_sample: int = 3,
+    variant_name: str = "NON_DAPI",
+    random_seed: Optional[int] = None,
+    normalize: bool = True,
+    figsize=(12, 5),
+):
+    patch_files = [Path(p) for p in patch_files]
+
+    if not patch_files:
+        print_warn(f"No patch files found for {variant_name}.")
+        return
+
+    base_rng = np.random.default_rng(random_seed)
+
+    for patch_file in patch_files:
+        data = np.load(patch_file)
+        X = data["X"]
+        Y = data["Y"]
+
+        sample_title = patch_file.stem
+        seed_i = int(base_rng.integers(0, 2**32 - 1)) if random_seed is not None else None
+
+        visualize_patch_pairs(
+            X,
+            Y,
+            n_show=n_show_per_sample,
+            random_seed=seed_i,
+            normalize=normalize,
+            title=f"{variant_name}: {sample_title}",
+            figsize=figsize,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -828,18 +891,6 @@ def run_patch_generation(
     target_robust_range_floor: float = 1e-3,
     min_target_to_source_robust_range_ratio: float = 0.12,
     min_target_to_source_std_ratio: float = 0.15,
-    pair_selection_mode: str = "signal_biased",
-    signal_score_use_target: bool = True,
-    max_pair_repeats: int = 3,
-    drop_low_score_fraction: float = 0.20,
-    min_pairs_to_keep_after_signal_bias: int = 8,
-    signal_score_pmin: float = 1.0,
-    signal_score_pmax: float = 99.0,
-    signal_foreground_fraction: float = 0.10,
-    signal_weight_std: float = 1.5,
-    signal_weight_robust_range: float = 1.5,
-    signal_weight_foreground: float = 3.0,
-    signal_weight_max: float = 0.25,
 ):
     filter_settings = {
         "min_source_max": min_source_max,
@@ -860,17 +911,86 @@ def run_patch_generation(
     }
 
     sample_dirs = find_all_samples(
-        care_root,
-        care_subdirs,
-        source_dirname,
-        target_dirname,
+    care_root,
+    care_subdirs,
+    source_dirname,
+    target_dirname,
     )
-
-    print("=" * 90)
-    print("Starting CARE patch generation")
-    print("=" * 90)
-    print("Samples detected:", len(sample_dirs))
-
+    
+    search_roots = [care_root / d for d in care_subdirs] if care_subdirs else [care_root]
+    
+    print_section("CARE patch generation setup")
+    print_info(f"CARE root: {care_root}")
+    print_info(f"Subdirs: {list(care_subdirs) if care_subdirs else 'ALL'}")
+    print_info(f"Source dir name: {source_dirname}")
+    print_info(f"Target dir name: {target_dirname}")
+    print_info(f"Pattern: {pattern}")
+    print_info(f"DAPI channel index: {dapi_channel_index}")
+    print_info(f"Samples detected: {len(sample_dirs)}")
+    
+    print_subsection("Search roots")
+    for i, root_dir in enumerate(search_roots, start=1):
+        status = "exists" if root_dir.exists() else "missing"
+        print_info(f"{i:03d}: {root_dir} ({status})")
+    
+    print_subsection("Detected sample directories")
+    if not sample_dirs:
+        print_warn(
+            "No valid samples found. A valid sample folder must contain both "
+            f"'{source_dirname}' and '{target_dirname}'."
+        )
+    else:
+        for i, sample_dir in enumerate(sample_dirs, start=1):
+            try:
+                rel_sample = sample_dir.relative_to(care_root)
+            except ValueError:
+                rel_sample = sample_dir
+    
+            print_info(f"{i:03d}: {rel_sample}")
+    
+            src_root = sample_dir / source_dirname
+            tgt_root = sample_dir / target_dirname
+    
+            if not src_root.exists() or not tgt_root.exists():
+                print_warn("     source or target folder missing")
+                continue
+    
+            src_files = list(src_root.glob(pattern))
+            tgt_files = list(tgt_root.glob(pattern))
+    
+            src_rel_dirs = {f.relative_to(src_root).parent for f in src_files}
+            tgt_rel_dirs = {f.relative_to(tgt_root).parent for f in tgt_files}
+    
+            valid_subdirs = sorted(src_rel_dirs & tgt_rel_dirs)
+    
+            if not valid_subdirs:
+                print_warn("     no matching source/target subdirectories found")
+            else:
+                print_info(f"     matching data subdirectories: {len(valid_subdirs)}")
+                for subdir in valid_subdirs[:10]:
+                    print_info(f"       - {subdir}")
+    
+                if len(valid_subdirs) > 10:
+                    print_info(f"       ... plus {len(valid_subdirs) - 10} more")
+        
+    print_subsection("Patch settings")
+    print_info(f"Axes: {axes}")
+    print_info(f"Patch axes: {patch_axes}")
+    print_info(f"Patch size: {patch_size}")
+    print_info(f"Patches per image: {n_patches_per_image}")
+    print_info(f"Patch filter threshold: {patch_filter_threshold}")
+    
+    print_subsection("Sampling settings")
+    print_info(f"Max images per sample: {max_images_per_sample}")
+    print_info(f"Fraction images per sample: {fraction_images_per_sample}")
+    print_info(f"Sampling seed: {sampling_seed}")
+    
+    print_subsection("Output settings")
+    print_info(f"Patch directory name: {patch_dirname}")
+    print_info(f"Merge all samples: {merge_all_samples}")
+    print_info(f"Merged NON_DAPI name: {merged_non_dapi_name}")
+    print_info(f"Merged DAPI name: {merged_dapi_name}")
+    
     all_patch_files_non_dapi: list[Path] = []
     all_patch_files_dapi: list[Path] = []
     merged_X_non_dapi: list[np.ndarray] = []
@@ -883,14 +1003,21 @@ def run_patch_generation(
 
     for sample_idx, sample_dir in enumerate(sample_dirs, start=1):
         sample_name = sample_dir.name
-        sample_group_name = "__".join(sample_dir.parent.relative_to(care_root).parts)
+        rel_parent = sample_dir.parent.relative_to(care_root)
+        sample_group_name = "__".join(rel_parent.parts) if rel_parent.parts else "root"
 
-        print("\n" + "=" * 90)
-        print(f"[Sample {sample_idx}/{len(sample_dirs)}] {sample_name}")
+        print_section(f"Sample {sample_idx}/{len(sample_dirs)}: {sample_name}", color=T.CYAN)
+        print_info(f"Sample directory: {sample_dir}")
 
-        file_pairs = collect_pairs(sample_dir, source_dirname, target_dirname, pattern)
+        try:
+            file_pairs = collect_pairs(sample_dir, source_dirname, target_dirname, pattern)
+        except Exception as e:
+            print_error(f"Could not collect pairs for sample {sample_name}: {e}")
+            continue
+
         non_dapi_pairs_all, dapi_pairs_all, excluded_count = split_pairs_excluding_dapi(
-            file_pairs, dapi_channel_index=dapi_channel_index
+            file_pairs,
+            dapi_channel_index=dapi_channel_index,
         )
 
         non_dapi_pairs_sampled = subsample_pairs(
@@ -906,6 +1033,16 @@ def run_patch_generation(
             seed=sampling_seed,
         )
 
+        print_subsection("Pair discovery")
+        print_info(f"Total matched pairs: {len(file_pairs)}")
+        print_info(f"NON_DAPI pairs found: {len(non_dapi_pairs_all)}")
+        print_info(f"DAPI pairs found: {len(dapi_pairs_all)}")
+        print_info(f"NON_DAPI pairs sampled: {len(non_dapi_pairs_sampled)}")
+        print_info(f"DAPI pairs sampled: {len(dapi_pairs_sampled)}")
+
+        if excluded_count:
+            print_warn(f"Excluded files without _chN tag: {excluded_count}")
+
         non_dapi_pairs, removed_non_dapi_info = filter_pairs_with_usable_images(
             non_dapi_pairs_sampled,
             filter_settings=filter_settings,
@@ -915,43 +1052,11 @@ def run_patch_generation(
             filter_settings=filter_settings,
         )
 
-        non_dapi_pairs_for_patching, non_dapi_signal_summary = apply_signal_bias_to_pairs(
-            non_dapi_pairs,
-            pair_selection_mode=pair_selection_mode,
-            signal_score_use_target=signal_score_use_target,
-            max_pair_repeats=max_pair_repeats,
-            drop_low_score_fraction=drop_low_score_fraction,
-            min_pairs_to_keep_after_signal_bias=min_pairs_to_keep_after_signal_bias,
-            signal_score_pmin=signal_score_pmin,
-            signal_score_pmax=signal_score_pmax,
-            signal_foreground_fraction=signal_foreground_fraction,
-            signal_weight_std=signal_weight_std,
-            signal_weight_robust_range=signal_weight_robust_range,
-            signal_weight_foreground=signal_weight_foreground,
-            signal_weight_max=signal_weight_max,
-        )
-        dapi_pairs_for_patching, dapi_signal_summary = apply_signal_bias_to_pairs(
-            dapi_pairs,
-            pair_selection_mode=pair_selection_mode,
-            signal_score_use_target=signal_score_use_target,
-            max_pair_repeats=max_pair_repeats,
-            drop_low_score_fraction=drop_low_score_fraction,
-            min_pairs_to_keep_after_signal_bias=min_pairs_to_keep_after_signal_bias,
-            signal_score_pmin=signal_score_pmin,
-            signal_score_pmax=signal_score_pmax,
-            signal_foreground_fraction=signal_foreground_fraction,
-            signal_weight_std=signal_weight_std,
-            signal_weight_robust_range=signal_weight_robust_range,
-            signal_weight_foreground=signal_weight_foreground,
-            signal_weight_max=signal_weight_max,
-        )
-
-        print("NON_DAPI usable pairs:", len(non_dapi_pairs))
-        print("NON_DAPI pairs for patching:", len(non_dapi_pairs_for_patching))
-        print("DAPI usable pairs:", len(dapi_pairs))
-        print("DAPI pairs for patching:", len(dapi_pairs_for_patching))
-        if excluded_count:
-            print("Excluded without _chN tag:", excluded_count)
+        print_subsection("Image-level filtering")
+        print_info(f"NON_DAPI usable pairs before patch creation: {len(non_dapi_pairs)}")
+        print_info(f"DAPI usable pairs before patch creation: {len(dapi_pairs)}")
+        print_info(f"NON_DAPI removed by image/pair filters: {len(removed_non_dapi_info)}")
+        print_info(f"DAPI removed by image/pair filters: {len(removed_dapi_info)}")
 
         out_dir = sample_dir / patch_dirname
         out_file_non_dapi = out_dir / f"{sample_group_name}__{sample_name}__NON_DAPI__train_patches.npz"
@@ -960,66 +1065,107 @@ def run_patch_generation(
         sample_summary = {
             "sample_name": sample_name,
             "sample_dir": str(sample_dir),
-            "n_non_dapi_pairs": len(non_dapi_pairs),
-            "n_dapi_pairs": len(dapi_pairs),
-            "n_non_dapi_pairs_for_patching": len(non_dapi_pairs_for_patching),
-            "n_dapi_pairs_for_patching": len(dapi_pairs_for_patching),
-            "n_excluded_pairs": excluded_count,
+            "n_total_pairs_found": len(file_pairs),
+            "n_non_dapi_pairs_before_filtering": len(non_dapi_pairs_sampled),
+            "n_dapi_pairs_before_filtering": len(dapi_pairs_sampled),
+            "n_non_dapi_pairs_used": 0,
+            "n_dapi_pairs_used": 0,
+            "n_non_dapi_pairs_dropped_during_patch_creation": 0,
+            "n_dapi_pairs_dropped_during_patch_creation": 0,
+            "n_excluded_pairs_no_channel_tag": excluded_count,
             "removed_non_dapi_examples": removed_non_dapi_info[:10],
             "removed_dapi_examples": removed_dapi_info[:10],
-            "non_dapi_signal_bias_summary": non_dapi_signal_summary,
-            "dapi_signal_bias_summary": dapi_signal_summary,
+            "dropped_non_dapi_pairs_during_patch_creation": [],
+            "dropped_dapi_pairs_during_patch_creation": [],
             "n_non_dapi_patches": 0,
             "n_dapi_patches": 0,
             "non_dapi_file": None,
             "dapi_file": None,
+            "non_dapi_error": None,
+            "dapi_error": None,
         }
 
-        if non_dapi_pairs_for_patching:
-            raw_data_non_dapi = rawdata_from_pairs(non_dapi_pairs_for_patching, axes=axes)
-            Xn, Yn, axes_n = make_patches_for_variant(
-                raw_data=raw_data_non_dapi,
-                out_file=out_file_non_dapi,
-                patch_size=patch_size,
-                n_patches_per_image=n_patches_per_image,
-                patch_axes=patch_axes,
-                patch_filter_threshold=patch_filter_threshold,
-                extreme_value_cutoff=extreme_value_cutoff,
-                variant_name="NON_DAPI",
-                extra_summary=sample_summary,
-            )
-            all_patch_files_non_dapi.append(out_file_non_dapi)
-            sample_summary["n_non_dapi_patches"] = int(len(Xn))
-            sample_summary["non_dapi_file"] = str(out_file_non_dapi)
+        if non_dapi_pairs:
+            try:
+                Xn, Yn, axes_n, dropped_non_dapi_pairs = make_patches_for_variant(
+                    pairs=non_dapi_pairs,
+                    out_file=out_file_non_dapi,
+                    axes=axes,
+                    patch_size=patch_size,
+                    n_patches_per_image=n_patches_per_image,
+                    patch_axes=patch_axes,
+                    patch_filter_threshold=patch_filter_threshold,
+                    extreme_value_cutoff=extreme_value_cutoff,
+                    variant_name="NON_DAPI",
+                    extra_summary=sample_summary,
+                )
+            except Exception as e:
+                sample_summary["non_dapi_error"] = str(e)
+                print_warn(f"Skipping NON_DAPI patches for sample: {sample_name}")
+                print_warn(f"Reason: {e}")
+            else:
+                all_patch_files_non_dapi.append(out_file_non_dapi)
+                sample_summary["n_non_dapi_patches"] = int(len(Xn))
+                sample_summary["non_dapi_file"] = str(out_file_non_dapi)
+                sample_summary["n_non_dapi_pairs_used"] = int(len(non_dapi_pairs) - len(dropped_non_dapi_pairs))
+                sample_summary["n_non_dapi_pairs_dropped_during_patch_creation"] = int(len(dropped_non_dapi_pairs))
+                sample_summary["dropped_non_dapi_pairs_during_patch_creation"] = dropped_non_dapi_pairs[:20]
 
-            if merge_all_samples:
-                merged_X_non_dapi.append(Xn)
-                merged_Y_non_dapi.append(Yn)
-                if axes_ref_non_dapi is None:
-                    axes_ref_non_dapi = axes_n
+                if merge_all_samples:
+                    merged_X_non_dapi.append(Xn)
+                    merged_Y_non_dapi.append(Yn)
+                    if axes_ref_non_dapi is None:
+                        axes_ref_non_dapi = axes_n
+        else:
+            print_warn("No NON_DAPI pairs left after filtering.")
 
-        if dapi_pairs_for_patching:
-            raw_data_dapi = rawdata_from_pairs(dapi_pairs_for_patching, axes=axes)
-            Xd, Yd, axes_d = make_patches_for_variant(
-                raw_data=raw_data_dapi,
-                out_file=out_file_dapi,
-                patch_size=patch_size,
-                n_patches_per_image=n_patches_per_image,
-                patch_axes=patch_axes,
-                patch_filter_threshold=patch_filter_threshold,
-                extreme_value_cutoff=extreme_value_cutoff,
-                variant_name="DAPI_ONLY",
-                extra_summary=sample_summary,
-            )
-            all_patch_files_dapi.append(out_file_dapi)
-            sample_summary["n_dapi_patches"] = int(len(Xd))
-            sample_summary["dapi_file"] = str(out_file_dapi)
+        if dapi_pairs:
+            try:
+                Xd, Yd, axes_d, dropped_dapi_pairs = make_patches_for_variant(
+                    pairs=dapi_pairs,
+                    out_file=out_file_dapi,
+                    axes=axes,
+                    patch_size=patch_size,
+                    n_patches_per_image=n_patches_per_image,
+                    patch_axes=patch_axes,
+                    patch_filter_threshold=patch_filter_threshold,
+                    extreme_value_cutoff=extreme_value_cutoff,
+                    variant_name="DAPI_ONLY",
+                    extra_summary=sample_summary,
+                )
+            except Exception as e:
+                sample_summary["dapi_error"] = str(e)
+                print_warn(f"Skipping DAPI patches for sample: {sample_name}")
+                print_warn(f"Reason: {e}")
+            else:
+                all_patch_files_dapi.append(out_file_dapi)
+                sample_summary["n_dapi_patches"] = int(len(Xd))
+                sample_summary["dapi_file"] = str(out_file_dapi)
+                sample_summary["n_dapi_pairs_used"] = int(len(dapi_pairs) - len(dropped_dapi_pairs))
+                sample_summary["n_dapi_pairs_dropped_during_patch_creation"] = int(len(dropped_dapi_pairs))
+                sample_summary["dropped_dapi_pairs_during_patch_creation"] = dropped_dapi_pairs[:20]
 
-            if merge_all_samples:
-                merged_X_dapi.append(Xd)
-                merged_Y_dapi.append(Yd)
-                if axes_ref_dapi is None:
-                    axes_ref_dapi = axes_d
+                if merge_all_samples:
+                    merged_X_dapi.append(Xd)
+                    merged_Y_dapi.append(Yd)
+                    if axes_ref_dapi is None:
+                        axes_ref_dapi = axes_d
+        else:
+            print_warn("No DAPI pairs left after filtering.")
+
+        print_subsection("Sample summary", color=T.GREEN)
+        print_info(f"NON_DAPI patches: {sample_summary['n_non_dapi_patches']}")
+        print_info(f"DAPI patches: {sample_summary['n_dapi_patches']}")
+        print_info(f"NON_DAPI pairs used: {sample_summary['n_non_dapi_pairs_used']}")
+        print_info(f"DAPI pairs used: {sample_summary['n_dapi_pairs_used']}")
+        print_info(
+            f"NON_DAPI pairs dropped during patch creation: "
+            f"{sample_summary['n_non_dapi_pairs_dropped_during_patch_creation']}"
+        )
+        print_info(
+            f"DAPI pairs dropped during patch creation: "
+            f"{sample_summary['n_dapi_pairs_dropped_during_patch_creation']}"
+        )
 
         sample_summaries.append(sample_summary)
 
@@ -1028,12 +1174,15 @@ def run_patch_generation(
     merge_timestamp = timestamp_for_filename()
 
     if merge_all_samples:
+        print_section("Merging samples", color=T.MAGENTA)
+
         merged_out_dir = care_root / patch_dirname
         merged_out_dir.mkdir(parents=True, exist_ok=True)
 
         if merged_X_non_dapi:
             merged_non_dapi_file = merged_out_dir / append_timestamp_to_filename(
-                merged_non_dapi_name, merge_timestamp
+                merged_non_dapi_name,
+                merge_timestamp,
             )
             X = np.concatenate(merged_X_non_dapi, axis=0)
             Y = np.concatenate(merged_Y_non_dapi, axis=0)
@@ -1041,9 +1190,32 @@ def run_patch_generation(
             validate_patch_array(Y, "Merged NON_DAPI Y")
             np.savez_compressed(merged_non_dapi_file, X=X, Y=Y, axes=axes_ref_non_dapi)
 
+            print_success(f"Merged NON_DAPI file saved: {merged_non_dapi_file}")
+            print_info(f"Merged NON_DAPI patches: {len(X)}")
+
+            save_patch_metadata(
+                patch_file=merged_non_dapi_file,
+                variant_name="MERGED_NON_DAPI",
+                axes=axes_ref_non_dapi,
+                X_shape=X.shape,
+                Y_shape=Y.shape,
+                n_pairs_used=sum(s["n_non_dapi_pairs_used"] for s in sample_summaries),
+                n_patches_total=len(X),
+                patch_size=patch_size,
+                n_patches_per_image=n_patches_per_image,
+                patch_filter_threshold=patch_filter_threshold,
+                extra_summary={
+                    "merged_from_files": [str(p) for p in all_patch_files_non_dapi],
+                    "sample_summaries": sample_summaries,
+                },
+            )
+        else:
+            print_warn("No NON_DAPI patches available for merging.")
+
         if merged_X_dapi:
             merged_dapi_file = merged_out_dir / append_timestamp_to_filename(
-                merged_dapi_name, merge_timestamp
+                merged_dapi_name,
+                merge_timestamp,
             )
             X = np.concatenate(merged_X_dapi, axis=0)
             Y = np.concatenate(merged_Y_dapi, axis=0)
@@ -1051,25 +1223,109 @@ def run_patch_generation(
             validate_patch_array(Y, "Merged DAPI Y")
             np.savez_compressed(merged_dapi_file, X=X, Y=Y, axes=axes_ref_dapi)
 
+            print_success(f"Merged DAPI file saved: {merged_dapi_file}")
+            print_info(f"Merged DAPI patches: {len(X)}")
+
+            save_patch_metadata(
+                patch_file=merged_dapi_file,
+                variant_name="MERGED_DAPI_ONLY",
+                axes=axes_ref_dapi,
+                X_shape=X.shape,
+                Y_shape=Y.shape,
+                n_pairs_used=sum(s["n_dapi_pairs_used"] for s in sample_summaries),
+                n_patches_total=len(X),
+                patch_size=patch_size,
+                n_patches_per_image=n_patches_per_image,
+                patch_filter_threshold=patch_filter_threshold,
+                extra_summary={
+                    "merged_from_files": [str(p) for p in all_patch_files_dapi],
+                    "sample_summaries": sample_summaries,
+                },
+            )
+        else:
+            print_warn("No DAPI patches available for merging.")
+
+    total_non_dapi_patches = int(sum(s["n_non_dapi_patches"] for s in sample_summaries))
+    total_dapi_patches = int(sum(s["n_dapi_patches"] for s in sample_summaries))
+    total_patches = total_non_dapi_patches + total_dapi_patches
+
+    total_non_dapi_pairs_used = int(sum(s["n_non_dapi_pairs_used"] for s in sample_summaries))
+    total_dapi_pairs_used = int(sum(s["n_dapi_pairs_used"] for s in sample_summaries))
+    total_non_dapi_pairs_dropped = int(
+        sum(s["n_non_dapi_pairs_dropped_during_patch_creation"] for s in sample_summaries)
+    )
+    total_dapi_pairs_dropped = int(
+        sum(s["n_dapi_pairs_dropped_during_patch_creation"] for s in sample_summaries)
+    )
+
+    run_id = merge_timestamp  # reuse the same timestamp used for merged files
+    
     metadata = {
-        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,  # <-- consistent identifier across all outputs
+        "timestamp": datetime.now().isoformat(),  # exact time (human-readable)
+    
         "user": getpass.getuser(),
         "hostname": socket.gethostname(),
+    
+        "total_non_dapi_patches": total_non_dapi_patches,
+        "total_dapi_patches": total_dapi_patches,
+        "total_patches": total_patches,
+    
+        "total_non_dapi_pairs_used": total_non_dapi_pairs_used,
+        "total_dapi_pairs_used": total_dapi_pairs_used,
+    
+        "total_non_dapi_pairs_dropped_during_patch_creation": total_non_dapi_pairs_dropped,
+        "total_dapi_pairs_dropped_during_patch_creation": total_dapi_pairs_dropped,
+    
         "sample_summaries": sample_summaries,
+    
         "all_patch_files_non_dapi": [str(p) for p in all_patch_files_non_dapi],
         "all_patch_files_dapi": [str(p) for p in all_patch_files_dapi],
+    
         "merged_non_dapi_file": str(merged_non_dapi_file) if merged_non_dapi_file else None,
         "merged_dapi_file": str(merged_dapi_file) if merged_dapi_file else None,
+    
+        "settings": {
+            "care_root": str(care_root),
+            "care_subdirs": list(care_subdirs),
+            "source_dirname": source_dirname,
+            "target_dirname": target_dirname,
+            "pattern": pattern,
+            "dapi_channel_index": dapi_channel_index,
+            "axes": axes,
+            "patch_size": patch_size_to_jsonable(patch_size),
+            "n_patches_per_image": n_patches_per_image,
+            "patch_axes": patch_axes,
+            "patch_filter_threshold": patch_filter_threshold,
+            "patch_dirname": patch_dirname,
+            "merge_all_samples": merge_all_samples,
+            "merged_non_dapi_name": merged_non_dapi_name,
+            "merged_dapi_name": merged_dapi_name,
+            "max_images_per_sample": max_images_per_sample,
+            "fraction_images_per_sample": fraction_images_per_sample,
+            "sampling_seed": sampling_seed,
+            "filter_settings": filter_settings,
+        },
     }
 
     metadata_dir = care_root / patch_dirname
     metadata_dir.mkdir(parents=True, exist_ok=True)
-    metadata_file = metadata_dir / "patch_generation_metadata.json"
+    metadata_file = metadata_dir / f"patch_generation_metadata__{run_id}.json"
+
     with open(metadata_file, "w") as f:
         json.dump(to_jsonable(metadata), f, indent=2)
 
-    print("\nPatch generation complete.")
-    print("Metadata file:", metadata_file)
+    print_section("Patch generation complete", color=T.GREEN)
+    print_info(f"Total NON_DAPI patches: {total_non_dapi_patches}")
+    print_info(f"Total DAPI patches: {total_dapi_patches}")
+    print_info(f"Total patches: {total_patches}")
+    print_info(f"Total NON_DAPI image pairs used: {total_non_dapi_pairs_used}")
+    print_info(f"Total DAPI image pairs used: {total_dapi_pairs_used}")
+    print_info(f"Total NON_DAPI image pairs dropped during patch creation: {total_non_dapi_pairs_dropped}")
+    print_info(f"Total DAPI image pairs dropped during patch creation: {total_dapi_pairs_dropped}")
+    print_info(f"Metadata file: {metadata_file}")
+    print_info(f"Merged NON_DAPI file: {merged_non_dapi_file}")
+    print_info(f"Merged DAPI file: {merged_dapi_file}")
 
     return {
         "sample_dirs": sample_dirs,
@@ -1081,112 +1337,3 @@ def run_patch_generation(
         "metadata": metadata,
         "metadata_file": metadata_file,
     }
-
-def normalize_pairs_jointly(
-    x_batch: np.ndarray,
-    y_batch: np.ndarray,
-    pmin: float = 1.0,
-    pmax: float = 99.8,
-    eps: float = 1e-8,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Percentile-normalize each input-target pair jointly for visualization.
-    """
-    x_batch = np.asarray(x_batch, dtype=np.float32)
-    y_batch = np.asarray(y_batch, dtype=np.float32)
-
-    x_norm = np.empty_like(x_batch, dtype=np.float32)
-    y_norm = np.empty_like(y_batch, dtype=np.float32)
-
-    for i in range(len(x_batch)):
-        pair_vals = np.concatenate([x_batch[i].ravel(), y_batch[i].ravel()])
-        lo = np.percentile(pair_vals, pmin)
-        hi = np.percentile(pair_vals, pmax)
-
-        x_norm[i] = np.clip((x_batch[i] - lo) / (hi - lo + eps), 0, 1)
-        y_norm[i] = np.clip((y_batch[i] - lo) / (hi - lo + eps), 0, 1)
-
-    return x_norm, y_norm
-
-
-def visualize_patch_pairs(
-    X: np.ndarray,
-    Y: np.ndarray,
-    *,
-    n_show: int = 5,
-    random_seed: Optional[int] = None,
-    normalize: bool = True,
-    title: Optional[str] = None,
-    figsize=(12, 5),
-):
-    """
-    Visualize random patch pairs from one dataset.
-    """
-    if len(X) == 0:
-        raise ValueError("X is empty; nothing to visualize.")
-    if len(Y) == 0:
-        raise ValueError("Y is empty; nothing to visualize.")
-
-    n_show = min(n_show, len(X))
-
-    rng = np.random.default_rng(random_seed)
-    idx = rng.choice(len(X), size=n_show, replace=False)
-
-    X_show = X[idx]
-    Y_show = Y[idx]
-
-    if normalize:
-        X_show, Y_show = normalize_pairs_jointly(X_show, Y_show)
-
-    plt.figure(figsize=figsize)
-    plot_some(X_show, Y_show)
-
-    if title is None:
-        title = f"{n_show} random patch pairs"
-
-    if normalize:
-        title = f"{title}\n(top: input, bottom: target; jointly normalized per pair)"
-    else:
-        title = f"{title}\n(top: input, bottom: target)"
-
-    plt.suptitle(title)
-    plt.show()
-
-
-def visualize_saved_patches_across_samples(
-    patch_files: Sequence[Path | str],
-    *,
-    n_show_per_sample: int = 3,
-    variant_name: str = "NON_DAPI",
-    random_seed: Optional[int] = None,
-    normalize: bool = True,
-    figsize=(12, 5),
-):
-    """
-    Show example patch pairs for every saved sample patch file.
-    """
-    patch_files = [Path(p) for p in patch_files]
-
-    if not patch_files:
-        print(f"No patch files found for {variant_name}.")
-        return
-
-    base_rng = np.random.default_rng(random_seed)
-
-    for patch_file in patch_files:
-        data = np.load(patch_file)
-        X = data["X"]
-        Y = data["Y"]
-
-        sample_title = patch_file.stem
-        seed_i = int(base_rng.integers(0, 2**32 - 1)) if random_seed is not None else None
-
-        visualize_patch_pairs(
-            X,
-            Y,
-            n_show=n_show_per_sample,
-            random_seed=seed_i,
-            normalize=normalize,
-            title=f"{variant_name}: {sample_title}",
-            figsize=figsize,
-        )

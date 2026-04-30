@@ -10,12 +10,57 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 # -----------------------------------------------------------------------------
+# Pretty terminal printing
+# -----------------------------------------------------------------------------
+
+USE_COLOR_PRINTS = True
+
+
+class T:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    MAGENTA = "\033[95m"
+
+
+def color_text(text: str, color: str = "", bold: bool = False) -> str:
+    if not USE_COLOR_PRINTS:
+        return text
+
+    prefix = ""
+    if bold:
+        prefix += T.BOLD
+    prefix += color
+    return f"{prefix}{text}{T.RESET}"
+
+
+def print_section(title: str, color: str = T.CYAN) -> None:
+    line = "=" * 90
+    print("\n" + color_text(line, color, bold=True))
+    print(color_text(title, color, bold=True))
+    print(color_text(line, color, bold=True))
+
+
+def print_subsection(title: str, color: str = T.BLUE) -> None:
+    line = "-" * 80
+    print("\n" + color_text(line, color, bold=True))
+    print(color_text(title, color, bold=True))
+    print(color_text(line, color, bold=True))
+
+
+def print_info(msg: str) -> None:
+    print(color_text("[INFO] ", T.GREEN, bold=True) + msg)
+
+
+def print_warn(msg: str) -> None:
+    print(color_text("[WARN] ", T.YELLOW, bold=True) + msg)
+
+
+# -----------------------------------------------------------------------------
 # GPU setup
-#
-# Keep this simple and automatic:
-# - select one GPU before importing TensorFlow / CSBDeep
-# - print one short informative line
-# - let TensorFlow see only that GPU
 # -----------------------------------------------------------------------------
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -25,28 +70,6 @@ def choose_gpu_for_rl(
     preferred_max_mem_mb: int = 2000,
     preferred_max_util: int = 20,
 ) -> int | None:
-    """
-    Select one GPU using a simple "prefer free GPU" strategy.
-
-    Priority
-    --------
-    1. Prefer GPUs with:
-         - memory.used <= preferred_max_mem_mb
-         - utilization.gpu <= preferred_max_util
-    2. Otherwise choose the GPU with the lowest memory use.
-    3. Break ties by lower utilization, then lower GPU index.
-
-    Side effects
-    ------------
-    Sets:
-      - CUDA_VISIBLE_DEVICES
-      - PYOPENCL_CTX
-
-    Returns
-    -------
-    int | None
-        Selected physical GPU index, or None if selection failed.
-    """
     try:
         result = subprocess.check_output(
             [
@@ -58,7 +81,7 @@ def choose_gpu_for_rl(
         ).decode("utf-8", errors="replace").strip()
 
         if not result:
-            print("[WARN] nvidia-smi returned no GPU information.")
+            print_warn("nvidia-smi returned no GPU information.")
             return None
 
         rows: list[tuple[int, int, int]] = []
@@ -67,7 +90,7 @@ def choose_gpu_for_rl(
             rows.append((int(idx), int(mem), int(util)))
 
         if not rows:
-            print("[WARN] No GPUs parsed from nvidia-smi output.")
+            print_warn("No GPUs parsed from nvidia-smi output.")
             return None
 
         preferred = [
@@ -82,17 +105,20 @@ def choose_gpu_for_rl(
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         os.environ["PYOPENCL_CTX"] = f"0:{gpu_id}"
 
-        print(f"[INFO] Selected GPU {gpu_id} (mem={mem_mb} MiB, util={util_pct}%)")
+        print_info(f"Selected GPU {gpu_id} (mem={mem_mb} MiB, util={util_pct}%)")
         return gpu_id
 
     except Exception as e:
-        print(f"[WARN] Automatic GPU selection failed: {e}")
-        print("[WARN] Proceeding without forcing CUDA_VISIBLE_DEVICES.")
+        print_warn(f"Automatic GPU selection failed: {e}")
+        print_warn("Proceeding without forcing CUDA_VISIBLE_DEVICES.")
         return None
 
 
-# Must run before TensorFlow / CSBDeep imports.
 choose_gpu_for_rl()
+
+# -----------------------------------------------------------------------------
+# Imports after GPU selection
+# -----------------------------------------------------------------------------
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -101,17 +127,16 @@ from csbdeep.io import load_training_data
 from csbdeep.models import CARE, Config
 from csbdeep.utils import axes_dict, plot_history, plot_some
 
-# Enable TensorFlow memory growth so it does not grab all GPU memory up front.
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"[INFO] TensorFlow sees {len(gpus)} GPU(s)")
+        print_info(f"TensorFlow sees {len(gpus)} GPU(s)")
     except RuntimeError as e:
-        print(f"[WARN] Could not set TensorFlow memory growth: {e}")
+        print_warn(f"Could not set TensorFlow memory growth: {e}")
 else:
-    print("[INFO] TensorFlow sees no GPU. Training will run on CPU.")
+    print_info("TensorFlow sees no GPU. Training will run on CPU.")
 
 
 # -----------------------------------------------------------------------------
@@ -119,9 +144,6 @@ else:
 # -----------------------------------------------------------------------------
 
 def to_jsonable(obj):
-    """
-    Recursively convert numpy/scalar/container types into JSON-safe Python types.
-    """
     if isinstance(obj, dict):
         return {k: to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -129,6 +151,11 @@ def to_jsonable(obj):
     if isinstance(obj, np.generic):
         return obj.item()
     return obj
+
+
+def load_json_file(path: Path) -> dict:
+    with open(path, "r") as f:
+        return json.load(f)
 
 
 # -----------------------------------------------------------------------------
@@ -139,9 +166,6 @@ def find_patch_dir(
     care_root: Path,
     patch_dirname_candidates: Sequence[str] = ("train_patches", "train patches"),
 ) -> Path:
-    """
-    Find the patch directory under `care_root`.
-    """
     for name in patch_dirname_candidates:
         p = care_root / name
         if p.exists():
@@ -154,9 +178,6 @@ def resolve_patch_file(
     patch_dirname_candidates: Sequence[str] = ("train_patches", "train patches"),
     patch_file_name: Optional[str] = None,
 ) -> tuple[Path, Path]:
-    """
-    Resolve patch directory and patch file.
-    """
     patch_dir = find_patch_dir(care_root, patch_dirname_candidates)
     patch_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,49 +185,37 @@ def resolve_patch_file(
         patch_file = patch_dir / patch_file_name
         if not patch_file.exists():
             raise FileNotFoundError(f"Patch file not found: {patch_file}")
+        print_info(f"Using explicit patch file: {patch_file}")
         return patch_dir, patch_file
 
     patch_files = sorted(patch_dir.glob("*.npz"))
+
     if not patch_files:
         raise FileNotFoundError(f"No .npz patch files found in {patch_dir}")
 
     if len(patch_files) == 1:
+        print_info(f"Only one patch file found; using: {patch_files[0].name}")
         return patch_dir, patch_files[0]
 
-    merged_non_dapi = [
-        p for p in patch_files
-        if "NON_DAPI" in p.name and ("ALL_SAMPLES" in p.name or "merged" in p.name.lower())
-    ]
-    if len(merged_non_dapi) == 1:
-        return patch_dir, merged_non_dapi[0]
+    print_warn(f"Multiple patch files found in {patch_dir}.")
+    print("Available patch files:")
+    for p in patch_files:
+        print("  -", p.name)
 
     raise FileNotFoundError(
-        f"Multiple patch files found in {patch_dir}. "
-        "Please specify patch_file_name explicitly."
+        "\nMultiple patch files found.\n"
+        "Please specify patch_file_name explicitly to keep training reproducible."
     )
 
 
-def resolve_patch_metadata_file(
-    patch_file: Path,
-    metadata_suffix: str = "__metadata.json",
-) -> Optional[Path]:
-    """
-    Resolve the sidecar metadata file saved next to a patch file.
+def resolve_patch_metadata_file(patch_file: Path) -> Optional[Path]:
+    metadata_file = patch_file.with_suffix(".json")
 
-    Returns None if no sidecar metadata file exists.
-    """
-    metadata_file = patch_file.with_name(f"{patch_file.stem}{metadata_suffix}")
     if metadata_file.exists():
         return metadata_file
+
+    print_info(f"No metadata file found for: {patch_file.name}")
     return None
-
-
-def load_json_file(path: Path) -> dict:
-    """
-    Load a JSON file into a dictionary.
-    """
-    with open(path, "r") as f:
-        return json.load(f)
 
 
 def build_model_run_name(
@@ -214,13 +223,6 @@ def build_model_run_name(
     patch_file: Path,
     prefix: str = "CARE",
 ) -> str:
-    """
-    Build a unique model run name using patch file stem + timestamp.
-
-    Example
-    -------
-    CARE__NON_DAPI_train_patches_Leica40X_final__2026-04-15_14-32
-    """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     return f"{prefix}__{patch_file.stem}__{timestamp}"
 
@@ -229,36 +231,26 @@ def build_model_run_name(
 # Patch loading / validation
 # -----------------------------------------------------------------------------
 
-def summarize_loaded_patches(X: np.ndarray, Y: np.ndarray, name: str = "training"):
-    """
-    Print basic sanity checks for loaded patch arrays.
-    """
-    print(f"\nPatch summary ({name}):")
-    print("  X shape:", X.shape)
-    print("  Y shape:", Y.shape)
+def summarize_loaded_patches(X: np.ndarray, Y: np.ndarray, name: str = "training") -> None:
+    print_subsection(f"Patch summary: {name}", color=T.MAGENTA)
 
-    print("  X has NaN:", bool(np.isnan(X).any()))
-    print("  Y has NaN:", bool(np.isnan(Y).any()))
-    print("  X has inf:", bool(np.isinf(X).any()))
-    print("  Y has inf:", bool(np.isinf(Y).any()))
-
-    print("  X min/max:", float(np.min(X)), float(np.max(X)))
-    print("  Y min/max:", float(np.min(Y)), float(np.max(Y)))
+    print_info(f"X shape: {X.shape}")
+    print_info(f"Y shape: {Y.shape}")
+    print_info(f"X has NaN: {bool(np.isnan(X).any())}")
+    print_info(f"Y has NaN: {bool(np.isnan(Y).any())}")
+    print_info(f"X has inf: {bool(np.isinf(X).any())}")
+    print_info(f"Y has inf: {bool(np.isinf(Y).any())}")
+    print_info(f"X min/max: {float(np.min(X)):.6g} / {float(np.max(X)):.6g}")
+    print_info(f"Y min/max: {float(np.min(Y)):.6g} / {float(np.max(Y)):.6g}")
 
     x_std = np.std(X.astype(np.float64), axis=(1, 2, 3))
     y_std = np.std(Y.astype(np.float64), axis=(1, 2, 3))
 
-    n_const_x = int(np.sum(x_std <= 1e-6))
-    n_const_y = int(np.sum(y_std <= 1e-6))
-
-    print("  constant/near-constant X patches:", n_const_x)
-    print("  constant/near-constant Y patches:", n_const_y)
+    print_info(f"Constant/near-constant X patches: {int(np.sum(x_std <= 1e-6))}")
+    print_info(f"Constant/near-constant Y patches: {int(np.sum(y_std <= 1e-6))}")
 
 
-def validate_loaded_patches(X: np.ndarray, Y: np.ndarray, name: str = "training"):
-    """
-    Raise an error if loaded patches contain obviously bad values.
-    """
+def validate_loaded_patches(X: np.ndarray, Y: np.ndarray, name: str = "training") -> None:
     if X.size == 0 or Y.size == 0:
         raise ValueError(f"{name} patches are empty.")
 
@@ -286,9 +278,8 @@ def load_care_training_data(
     patch_file: Path,
     validation_split: float,
 ):
-    """
-    Load CARE training data from a `.npz` patch file.
-    """
+    print_section("Loading CARE training data")
+
     (X, Y), (X_val, Y_val), axes = load_training_data(
         str(patch_file),
         validation_split=validation_split,
@@ -302,34 +293,30 @@ def load_care_training_data(
     n_channel_in = X.shape[c]
     n_channel_out = Y.shape[c]
 
-    print("PATCH_FILE:", patch_file)
-    print("Axes:", axes)
-    print("Training X:", X.shape)
-    print("Training Y:", Y.shape)
-    print("Validation X:", X_val.shape)
-    print("Validation Y:", Y_val.shape)
-    print("Input channels:", n_channel_in)
-    print("Output channels:", n_channel_out)
-    print("Validation split:", validation_split)
+    print_info(f"Patch file: {patch_file}")
+    print_info(f"Axes: {axes}")
+    print_info(f"Training X: {X.shape}")
+    print_info(f"Training Y: {Y.shape}")
+    print_info(f"Validation X: {X_val.shape}")
+    print_info(f"Validation Y: {Y_val.shape}")
+    print_info(f"Input channels: {n_channel_in}")
+    print_info(f"Output channels: {n_channel_out}")
+    print_info(f"Validation split: {validation_split}")
 
     patch_metadata_file = resolve_patch_metadata_file(patch_file)
+
     if patch_metadata_file is not None:
-        print("Patch metadata file:", patch_metadata_file)
+        print_info(f"Patch metadata file: {patch_metadata_file}")
         try:
             patch_metadata = load_json_file(patch_metadata_file)
-            if "sample_summary" in patch_metadata:
-                sample_summary = patch_metadata["sample_summary"]
-                if isinstance(sample_summary, dict):
-                    if "patches_per_sample" in sample_summary:
-                        print("Patch counts per sample:")
-                        for k, v in sample_summary["patches_per_sample"].items():
-                            print(f"  {k}: {v}")
-                    elif "n_patches_total" in patch_metadata:
-                        print("Total patches recorded in metadata:", patch_metadata["n_patches_total"])
+            if "n_patches_total" in patch_metadata:
+                print_info(f"Total patches in metadata: {patch_metadata['n_patches_total']}")
+            if "n_pairs_used" in patch_metadata:
+                print_info(f"Image pairs used in metadata: {patch_metadata['n_pairs_used']}")
         except Exception as e:
-            print(f"WARNING: Could not read patch metadata file: {e}")
+            print_warn(f"Could not read patch metadata file: {e}")
     else:
-        print("Patch metadata file: not found")
+        print_warn("Patch metadata file not found.")
 
     summarize_loaded_patches(X, Y, name="training")
     summarize_loaded_patches(X_val, Y_val, name="validation")
@@ -350,9 +337,6 @@ def normalize_percentile(
     pmax: float = 99.8,
     eps: float = 1e-8,
 ) -> np.ndarray:
-    """
-    Percentile-normalize a single patch/image to [0, 1].
-    """
     arr = np.asarray(arr, dtype=np.float32)
     lo = np.percentile(arr, pmin)
     hi = np.percentile(arr, pmax)
@@ -370,46 +354,26 @@ def normalize_patch_dataset(
     pmax: float = 99.8,
     eps: float = 1e-8,
 ):
-    """
-    Optionally percentile-normalize training and validation patches.
+    print_section("Normalization settings")
 
-    Notes
-    -----
-    This is applied in the training notebook/script rather than patch generation
-    so users can change the normalization strategy without regenerating patches.
-    """
-    print("\n" + "=" * 60)
-    print("Normalization settings")
-    print("=" * 60)
-    print("Enabled:", enabled)
+    print_info(f"Enabled: {enabled}")
 
     if not enabled:
-        print("Percentile normalization is OFF. Raw loaded patch values will be used.")
-        print("=" * 60 + "\n")
+        print_info("Percentile normalization is OFF. Raw patch values will be used.")
         return X, Y, X_val, Y_val
 
-    print("Applying percentile normalization to training and validation data")
-    print(f"pmin = {pmin}")
-    print(f"pmax = {pmax}")
-    print(f"eps = {eps}")
+    print_info(f"Applying percentile normalization with pmin={pmin}, pmax={pmax}, eps={eps}")
 
-    print("\nBefore normalization:")
-    print(f"  X:     min={X.min():.6g}, max={X.max():.6g}")
-    print(f"  Y:     min={Y.min():.6g}, max={Y.max():.6g}")
-    print(f"  X_val: min={X_val.min():.6g}, max={X_val.max():.6g}")
-    print(f"  Y_val: min={Y_val.min():.6g}, max={Y_val.max():.6g}")
+    print_info(f"Before normalization X max: {X.max():.6g}")
+    print_info(f"Before normalization Y max: {Y.max():.6g}")
 
     X = np.stack([normalize_percentile(x, pmin=pmin, pmax=pmax, eps=eps) for x in X], axis=0)
     Y = np.stack([normalize_percentile(y, pmin=pmin, pmax=pmax, eps=eps) for y in Y], axis=0)
     X_val = np.stack([normalize_percentile(x, pmin=pmin, pmax=pmax, eps=eps) for x in X_val], axis=0)
     Y_val = np.stack([normalize_percentile(y, pmin=pmin, pmax=pmax, eps=eps) for y in Y_val], axis=0)
 
-    print("\nAfter normalization:")
-    print(f"  X:     min={X.min():.6g}, max={X.max():.6g}")
-    print(f"  Y:     min={Y.min():.6g}, max={Y.max():.6g}")
-    print(f"  X_val: min={X_val.min():.6g}, max={X_val.max():.6g}")
-    print(f"  Y_val: min={Y_val.min():.6g}, max={Y_val.max():.6g}")
-    print("=" * 60 + "\n")
+    print_info(f"After normalization X max: {X.max():.6g}")
+    print_info(f"After normalization Y max: {Y.max():.6g}")
 
     return X, Y, X_val, Y_val
 
@@ -423,23 +387,33 @@ def plot_patch_examples(
     Y: np.ndarray,
     n_show: int = 5,
     title: str = "Example patch pairs (top: input, bottom: target)",
+    pmin: float = 1.0,
+    pmax: float = 99.8,
 ):
     """
     Plot a few input/target patch pairs.
+
+    The pmin/pmax values are used only for display scaling.
+    They do not modify the arrays used for training.
     """
     n_show = min(n_show, len(X))
+
     plt.figure(figsize=(12, 5))
-    plot_some(X[:n_show], Y[:n_show])
+    plot_some(
+        X[:n_show],
+        Y[:n_show],
+        pmin=pmin,
+        pmax=pmax,
+    )
     plt.suptitle(title)
     plt.show()
 
 
 def plot_training_curves(history):
-    """
-    Plot training history from CARE training.
-    """
+    print_section("Training curves")
+
     keys = sorted(history.history.keys())
-    print("Available metrics:", keys)
+    print_info(f"Available metrics: {keys}")
 
     loss_keys = [k for k in ["loss", "val_loss"] if k in history.history]
     metric_keys = [k for k in ["mse", "val_mse", "mae", "val_mae"] if k in history.history]
@@ -469,19 +443,8 @@ def build_care_config(
     probabilistic: bool = False,
     train_loss: Optional[str] = None,
 ):
-    """
-    Build a csbdeep CARE Config object.
+    print_section("CARE model configuration")
 
-    Parameters
-    ----------
-    train_loss : str or None
-        Optional training loss override, e.g. "mae" or "mse".
-
-    Notes
-    -----
-    Some CARE / CSBDeep versions do not accept `train_loss` directly in the
-    Config constructor, so we set it after creating the config object.
-    """
     if train_reduce_lr is None:
         train_reduce_lr = {"factor": 0.5, "patience": 10}
 
@@ -502,27 +465,27 @@ def build_care_config(
     if train_loss is not None:
         try:
             config.train_loss = train_loss
-            print(f"Using training loss: {config.train_loss}")
+            print_info(f"Using training loss: {config.train_loss}")
         except Exception as e:
-            print(
-                f"WARNING: Could not set train_loss={train_loss!r} on Config. "
+            print_warn(
+                f"Could not set train_loss={train_loss!r}. "
                 f"Proceeding with default CARE loss. Error: {e}"
             )
 
-    print("\nConfig summary:")
-    print(f"  axes: {config.axes}")
-    print(f"  n_channel_in: {config.n_channel_in}")
-    print(f"  n_channel_out: {config.n_channel_out}")
-    print(f"  probabilistic: {config.probabilistic}")
-    print(f"  unet_kern_size: {config.unet_kern_size}")
-    print(f"  unet_n_depth: {config.unet_n_depth}")
-    print(f"  train_batch_size: {config.train_batch_size}")
-    print(f"  train_steps_per_epoch: {config.train_steps_per_epoch}")
-    print(f"  train_epochs: {config.train_epochs}")
-    print(f"  train_learning_rate: {config.train_learning_rate}")
-    print(f"  train_reduce_lr: {config.train_reduce_lr}")
+    print_info(f"axes: {config.axes}")
+    print_info(f"n_channel_in: {config.n_channel_in}")
+    print_info(f"n_channel_out: {config.n_channel_out}")
+    print_info(f"probabilistic: {config.probabilistic}")
+    print_info(f"unet_kern_size: {config.unet_kern_size}")
+    print_info(f"unet_n_depth: {config.unet_n_depth}")
+    print_info(f"train_batch_size: {config.train_batch_size}")
+    print_info(f"train_steps_per_epoch: {config.train_steps_per_epoch}")
+    print_info(f"train_epochs: {config.train_epochs}")
+    print_info(f"train_learning_rate: {config.train_learning_rate}")
+    print_info(f"train_reduce_lr: {config.train_reduce_lr}")
+
     if hasattr(config, "train_loss"):
-        print(f"  train_loss: {config.train_loss}")
+        print_info(f"train_loss: {config.train_loss}")
 
     return config
 
@@ -533,9 +496,10 @@ def create_care_model(
     model_name: str,
     model_dir: Path,
 ) -> CARE:
-    """
-    Create a CARE model instance.
-    """
+    print_section("Creating CARE model")
+    print_info(f"Model name: {model_name}")
+    print_info(f"Model directory: {model_dir}")
+
     model = CARE(
         config=config,
         name=model_name,
@@ -549,25 +513,17 @@ def print_model_save_info(
     model_dir: Path,
     model_name: str,
 ):
-    """
-    Print where the model and its training artifacts are expected to be saved.
-    """
     out_dir = model_dir / model_name
 
-    print("\n" + "=" * 60)
-    print("Model output locations")
-    print("=" * 60)
-    print("Model output directory:", out_dir)
-    print("CARE saves training artifacts in this directory.")
-    print("Common files include:")
-    print("  - weights_best.h5        (best validation checkpoint)")
-    print("  - weights_last.h5        (last epoch checkpoint, depending on version/setup)")
-    print("  - config.json            (model/config description)")
-    print("  - training_metadata.json (run metadata from this script)")
-    print("  - training_history.json  (saved training curves/metrics)")
-    print("\nAt the end of training, CARE usually restores the best checkpoint")
-    print("when it prints: Loading network weights from 'weights_best.h5'.")
-    print("=" * 60 + "\n")
+    print_section("Model output locations")
+    print_info(f"Model output directory: {out_dir}")
+    print_info("Expected files:")
+    print("  - weights_best.h5")
+    print("  - weights_last.h5")
+    print("  - config.json")
+    print("  - training_metadata.json")
+    print("  - training_history.json")
+    print_info("CARE usually restores weights_best.h5 at the end of training.")
 
 
 def train_care_model(
@@ -578,18 +534,16 @@ def train_care_model(
     X_val: np.ndarray,
     Y_val: np.ndarray,
 ):
-    """
-    Train the CARE model.
-    """
+    print_section("Starting CARE training")
+
     try:
         history = model.train(X, Y, validation_data=(X_val, Y_val))
     except Exception:
-        print("Training failed.")
-        print(
-            "This is often caused by bad patches "
-            "(NaN, inf, constant patches, or extreme values)."
-        )
+        print_warn("Training failed.")
+        print_warn("This is often caused by bad patches, NaNs, infs, constants, or extreme values.")
         raise
+
+    print_section("CARE training complete", color=T.GREEN)
     return history
 
 
@@ -600,12 +554,6 @@ def save_training_history(
     model_name: str,
     filename: str = "training_history.json",
 ) -> Path:
-    """
-    Save Keras/CARE training history as JSON.
-
-    Converts numpy scalar types (e.g. float32) to plain Python floats
-    so the history can be serialized safely.
-    """
     out_dir = model_dir / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -615,7 +563,7 @@ def save_training_history(
     with open(history_file, "w") as f:
         json.dump(history_clean, f, indent=2)
 
-    print("Saved training history:", history_file)
+    print_info(f"Saved training history: {history_file}")
     return history_file
 
 
@@ -627,9 +575,6 @@ def summarize_validation_prediction(
     Y_true: np.ndarray,
     Y_pred: np.ndarray,
 ) -> dict[str, float]:
-    """
-    Compute simple numeric validation summary statistics.
-    """
     mae = float(np.mean(np.abs(Y_true - Y_pred)))
     mse = float(np.mean((Y_true - Y_pred) ** 2))
     return {"mae": mae, "mse": mse}
@@ -643,9 +588,8 @@ def predict_on_validation_examples(
     probabilistic: bool,
     n_examples: int = 5,
 ):
-    """
-    Run a quick prediction check on validation patches.
-    """
+    print_section("Validation prediction check")
+
     n_examples = min(n_examples, len(X_val))
 
     X_example = X_val[:n_examples]
@@ -666,9 +610,9 @@ def predict_on_validation_examples(
     plt.show()
 
     summary = summarize_validation_prediction(Y_example, Y_pred)
-    print("Validation prediction summary:")
-    print(f"  MAE: {summary['mae']:.6g}")
-    print(f"  MSE: {summary['mse']:.6g}")
+
+    print_info(f"Validation MAE: {summary['mae']:.6g}")
+    print_info(f"Validation MSE: {summary['mse']:.6g}")
 
     return X_example, Y_example, Y_pred
 
@@ -705,11 +649,6 @@ def build_training_metadata(
     normalization_pmax: Optional[float],
     normalization_eps: Optional[float],
 ):
-    """
-    Build metadata dictionary for a CARE training run.
-
-    This version ensures everything is JSON-serializable.
-    """
     model_output_dir = (model_dir / model_name).resolve()
 
     metadata = {
@@ -775,9 +714,6 @@ def save_training_metadata(
     model_name: str,
     filename: str = "training_metadata.json",
 ) -> Path:
-    """
-    Save training metadata next to the trained model (JSON-safe).
-    """
     out_dir = model_dir / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -787,5 +723,5 @@ def save_training_metadata(
     with open(metadata_file, "w") as f:
         json.dump(metadata_clean, f, indent=2)
 
-    print("Saved training metadata:", metadata_file)
+    print_info(f"Saved training metadata: {metadata_file}")
     return metadata_file
