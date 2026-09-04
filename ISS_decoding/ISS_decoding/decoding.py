@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 # NOTE (provenance policy):
-#   - We ONLY write a decoding XML if this run actually writes the region-level CSV.
+#   - We ONLY write a decoding XML if this run actually writes the region-level outputs.
 #   - We NEVER overwrite existing XMLs: each productive run writes a uniquely-named XML.
 #   - Runs that skip because outputs already exist produce NO XML.
 
@@ -514,7 +514,7 @@ def process_experiment(
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
 
     Coordinate units are read from the SpaceTX XML metadata written during SpaceTX generation.
-    They are recorded in the decoded CSV and decoding XML.
+    They are recorded in the decoded Parquet/CSV tables and decoding XML.
     """
 
     input_dir = Path(input_dir)
@@ -625,8 +625,8 @@ def process_experiment(
             f"{region_name}_decoded_postcode" if is_postcode else f"{region_name}_decoded"
         )
         final_csv = decoded_dir / f"{final_stem}.csv"
-        final_parquet = decoded_dir / f"{final_stem}.parquet" if is_postcode else None
-        if is_postcode and final_parquet.exists():
+        final_parquet = decoded_dir / f"{final_stem}.parquet"
+        if final_parquet.exists():
             if not final_csv.exists():
                 pd.read_parquet(final_parquet).to_csv(final_csv, index=False)
                 print(f"[{region_name}] Restored missing CSV compatibility copy.")
@@ -634,7 +634,10 @@ def process_experiment(
             print(f"  ✔ {final_parquet}")
             continue
         if not is_postcode and final_csv.exists():
-            print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
+            print(
+                f"[{region_name}] Skipping: legacy CSV output {final_csv.name} "
+                "already exists."
+            )
             print(f"  ✔ {final_csv}")
             continue
 
@@ -649,12 +652,12 @@ def process_experiment(
 
         experiment = Experiment.from_json(str(SpaceTX_dir / "experiment.json"))
         tiles = list(experiment.keys())
-        tile_output_dir = decoded_dir / "tiles" if is_postcode else decoded_dir
+        tile_output_dir = decoded_dir / "tiles"
         tile_output_dir.mkdir(parents=True, exist_ok=True)
         if is_postcode and save_postcode_artifacts:
             (decoded_dir / "posteriors").mkdir(parents=True, exist_ok=True)
             (decoded_dir / "models").mkdir(parents=True, exist_ok=True)
-        tile_suffix = ".parquet" if is_postcode else ".csv"
+        tile_suffix = ".parquet"
         tile_files = sorted(tile_output_dir.glob(f"fov_*{tile_suffix}"))
         print(f"Found {len(tile_files)} completed tile outputs")
 
@@ -687,7 +690,7 @@ def process_experiment(
                 df = pipeline_result
                 raw_postcode_output = None
 
-            if df is None or (df.empty and not is_postcode):
+            if df is None:
                 continue
 
             df["tile"] = tile_id
@@ -706,16 +709,13 @@ def process_experiment(
                         df["spot_uid"].to_numpy(),
                         postcode_kwargs=postcode_kwargs,
                     )
-                tile_path = tile_output_dir / f"{tile_id}.parquet"
-                print(f"Saving per-tile Parquet: {tile_path}")
-                df.to_parquet(tile_path, index=False)
-            else:
-                tile_path = tile_output_dir / f"{tile_id}.csv"
-                print(f"Saving per-tile CSV: {tile_path}")
-                df.to_csv(tile_path, index=False)
+            tile_path = tile_output_dir / f"{tile_id}.parquet"
+            print(f"Saving per-tile Parquet: {tile_path}")
+            df.to_parquet(tile_path, index=False)
 
-        output_label = "Parquet and CSV" if is_postcode else "CSV"
-        print(f"\nWriting region-level concatenated {output_label} for {region_name!r} ...")
+        print(
+            f"\nWriting region-level concatenated Parquet and CSV for {region_name!r} ..."
+        )
 
         tile_paths = sorted(tile_output_dir.glob(f"fov*{tile_suffix}"))
         wrote_region_output = False
@@ -724,7 +724,7 @@ def process_experiment(
         else:
             dfs = []
             for path in tile_paths:
-                df = pd.read_parquet(path) if is_postcode else pd.read_csv(path)
+                df = pd.read_parquet(path)
                 dfs.append(df)
                 print(f"  • Loaded {path.name} ({len(df)} rows)")
 
@@ -738,14 +738,12 @@ def process_experiment(
                         "Duplicate spot_uid values detected across region output: "
                         f"{duplicates[:5].tolist()}"
                     )
-                concat.to_parquet(final_parquet, index=False)
-                concat.to_csv(final_csv, index=False)
-                print(f" → Wrote {len(concat)} rows to {final_parquet.name}")
-                print(f" → Wrote CSV compatibility copy to {final_csv.name}")
             else:
                 concat.insert(0, "cont. spot ids", np.arange(len(concat), dtype=int))
-                concat.to_csv(final_csv, index=False)
-                print(f" → Wrote {len(concat)} total rows to {final_csv.name}")
+            concat.to_parquet(final_parquet, index=False)
+            concat.to_csv(final_csv, index=False)
+            print(f" → Wrote {len(concat)} rows to {final_parquet.name}")
+            print(f" → Wrote CSV compatibility copy to {final_csv.name}")
             wrote_region_output = True
 
         if wrote_region_output:
@@ -762,8 +760,7 @@ def process_experiment(
             ET.SubElement(paths_el, "SpaceTXDir").text = str(SpaceTX_dir)
             ET.SubElement(paths_el, "ExperimentJSON").text = str(SpaceTX_dir / "experiment.json")
             ET.SubElement(paths_el, "FinalCSV").text = str(final_csv)
-            if is_postcode:
-                ET.SubElement(paths_el, "FinalParquet").text = str(final_parquet)
+            ET.SubElement(paths_el, "FinalParquet").text = str(final_parquet)
 
             params_el = ET.SubElement(root, "Parameters")
             ET.SubElement(params_el, "dense").text = str(dense)

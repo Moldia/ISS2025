@@ -48,6 +48,27 @@ python -c "import ISS_decoding; print(ISS_decoding.__file__)"
 # conda deactivate
 ```
 
+## Decoding outputs
+
+Both the standard Starfish workflow and the PoSTcode workflow use Parquet as
+their canonical tabular output. Per-tile tables are kept in `tiles/` to support
+restarting interrupted runs, and a region-level CSV is also written for
+compatibility with existing analysis tools. Tiles with no decoded spots are
+stored as empty Parquet checkpoints so they are not needlessly processed again.
+
+```text
+2_decoded/
+├── R1_decoded.parquet
+├── R1_decoded.csv
+├── tiles/fov_*.parquet
+└── decoding_run_<timestamp>.xml
+```
+
+Dense Starfish decoding uses the same layout under `2_decoded_dense/`. Existing
+completed CSV-only Starfish runs are still recognized and skipped. Parquet is
+recommended for analysis because it preserves column types and per-round QC
+arrays; the CSV is intended as an interchange copy.
+
 ## PoSTcode decoding
 
 PoSTcode is available as an alternative decoder while the existing Starfish
