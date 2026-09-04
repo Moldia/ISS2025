@@ -55,6 +55,10 @@ registration, filtering, and spot detection remain unchanged. The dependency is
 pinned to the tested compatibility fork commit
 [`4db68cc`](https://github.com/mgcizzu/postcode/commit/4db68cc5cc398128bcfd97a764bef3c98ee3c583).
 
+A complete one-region example, including both creating SpaceTx from retiled
+TIFFs and starting from an existing SpaceTx experiment, is available in
+[`Notebooks/ISS_PoSTcode_decoding.ipynb`](Notebooks/ISS_PoSTcode_decoding.ipynb).
+
 The adapter converts Starfish spot traces from `spots x rounds x channels` to
 PoSTcode's `spots x channels x rounds` layout. It applies the same conversion to
 the SpaceTx codebook and validates that the codebook is one-hot.
