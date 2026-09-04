@@ -9,8 +9,9 @@ dependencies:
   - wheel
 
   # Arrays / data
-  - numpy
+  - numpy>=1.26,<2
   - pandas
+  - pyarrow>=10
 
   # Imaging & plotting
   - scikit-image
@@ -41,5 +42,5 @@ dependencies:
       # Spotiflow (your script imports Spotiflow and SpotiflowDetector)
       - spotiflow==0.5.8
 
-      # Install current project (non-editable)
-      - .
+      # Install current project plus the pinned PoSTcode compatibility fork
+      - "./ISS_decoding[postcode]"
