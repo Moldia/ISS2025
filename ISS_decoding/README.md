@@ -36,7 +36,7 @@ conda env create --name ISS_decoding --file ISS_decoding/ISS_decoding.yml
 conda activate ISS_decoding
 
 # Install / reinstall the package (required after pulling updates)
-python -m pip install "./ISS_decoding[postcode]" --upgrade
+python -m pip install "./ISS_decoding[postcode,spotiflow]" --upgrade
 
 # (Optional) Register a Jupyter kernel
 python -m ipykernel install --user --name ISS_decoding
@@ -69,11 +69,55 @@ completed CSV-only Starfish runs are still recognized and skipped. Parquet is
 recommended for analysis because it preserves column types and per-round QC
 arrays; the CSV is intended as an interchange copy.
 
+## Spotiflow detection
+
+Spotiflow can replace Starfish's blob detector while keeping registration,
+filtering, intensity measurement, decoding, QC, and output formatting unchanged.
+The ISS-specific `hybiss` model is the default; `general` or a local trained model
+path can be selected explicitly.
+
+```python
+from ISS_decoding.decoding import process_experiment
+
+process_experiment(
+    input_dir="/path/to/experiment",
+    spot_detection_mode="spotiflow",
+    spotiflow_kwargs={
+        "model": "hybiss",
+        "probability_threshold": None,  # model-optimized threshold
+        "min_distance": 2,
+        "n_tiles": None,               # e.g. (2, 2) to reduce GPU memory use
+        "measurement_type": "mean",
+    },
+)
+```
+
+The Spotiflow model is loaded lazily and reused across every selected tile and
+region. Detection uses the same 2D reference projections as the Starfish path.
+The `spotiflow_probability` output column preserves the model confidence before
+Starfish replaces the reference intensity with measured barcode intensities.
+
+Detector alternatives are stored separately so they can be compared safely:
+
+```text
+2_decoded/                         # Starfish detector + Starfish decoder
+2_decoded_spotiflow/              # Spotiflow detector + Starfish decoder
+2_decoded_postcode/               # Starfish detector + PoSTcode decoder
+2_decoded_postcode_spotiflow/     # Spotiflow detector + PoSTcode decoder
+2_decoded_dense/                   # dense Starfish detection
+2_decoded_dense_spotiflow/        # dense Spotiflow detection
+```
+
+`prob_threshold` remains the PoSTcode assignment threshold. Spotiflow's
+detection threshold is independently configured as
+`spotiflow_kwargs["probability_threshold"]`. Spotiflow model/version/settings
+are recorded in the decoding metadata.
+
 ## PoSTcode decoding
 
-PoSTcode is available as an alternative decoder while the existing Starfish
-registration, filtering, and spot detection remain unchanged. The dependency is
-pinned to the tested compatibility fork commit
+PoSTcode is available as an alternative decoder while registration, filtering,
+and the selected Starfish or Spotiflow detector remain unchanged. The dependency
+is pinned to the tested compatibility fork commit
 [`4db68cc`](https://github.com/mgcizzu/postcode/commit/4db68cc5cc398128bcfd97a764bef3c98ee3c583).
 
 A complete one-region example, including both creating SpaceTx from retiled
@@ -102,10 +146,10 @@ process_experiment(
 )
 ```
 
-PoSTcode results are written separately under `decoding/2_decoded_postcode` so
-they can be compared with the original Starfish output. Parquet is the canonical
-format and preserves the per-round QC arrays; a region-level CSV is also written
-for compatibility:
+PoSTcode results are written under `decoding/2_decoded_postcode`, or
+`decoding/2_decoded_postcode_spotiflow` when Spotiflow performs detection, so
+alternatives can be compared. Parquet is the canonical format and preserves the
+per-round QC arrays; a region-level CSV is also written for compatibility:
 
 ```text
 2_decoded_postcode/
@@ -143,5 +187,5 @@ can be large. The legacy `postcode_probability` and `postcode_class` columns
 remain as aliases for compatibility.
 
 For an Ubuntu CUDA machine, install the PyTorch build appropriate for the
-machine's NVIDIA driver before installing `ISS_decoding[postcode]` if the pip
-default is not suitable.
+machine's NVIDIA driver before installing `ISS_decoding[postcode,spotiflow]` if
+the pip default is not suitable.

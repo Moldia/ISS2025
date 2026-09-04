@@ -1,6 +1,7 @@
 # Standard library
 import json
 import re
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -41,6 +42,15 @@ POSTCODE_DEFAULT_KWARGS = {
     "set_seed": 1,
     "device": "auto",
 }
+SPOTIFLOW_DEFAULT_KWARGS = {
+    "model": "hybiss",
+    "probability_threshold": None,
+    "min_distance": 2,
+    "n_tiles": None,
+    "measurement_type": "mean",
+}
+VALID_SPOT_DETECTION_MODES = {"starfish", "spotiflow"}
+SPOTIFLOW_PROBABILITY_COLUMN = "spotiflow_probability"
 
 
 def timestamp_for_filename() -> str:
@@ -52,6 +62,129 @@ def effective_postcode_kwargs(overrides=None):
     settings = dict(POSTCODE_DEFAULT_KWARGS)
     settings.update(overrides or {})
     return settings
+
+
+def normalize_spot_detection_mode(mode):
+    """Return a validated, case-insensitive spot detector name."""
+    normalized = str(mode).strip().lower()
+    if normalized not in VALID_SPOT_DETECTION_MODES:
+        choices = ", ".join(sorted(VALID_SPOT_DETECTION_MODES))
+        raise ValueError(
+            f"Unknown spot_detection_mode: {mode!r}. Expected one of: {choices}."
+        )
+    return normalized
+
+
+def effective_spotiflow_kwargs(overrides=None):
+    """Return validated Spotiflow detector settings after applying overrides."""
+    overrides = dict(overrides or {})
+    unknown = sorted(set(overrides) - set(SPOTIFLOW_DEFAULT_KWARGS))
+    if unknown:
+        raise ValueError(f"Unknown Spotiflow setting(s): {unknown}")
+
+    settings = dict(SPOTIFLOW_DEFAULT_KWARGS)
+    settings.update(overrides)
+
+    model = settings["model"]
+    if model is None or (isinstance(model, str) and not model.strip()):
+        raise ValueError("Spotiflow 'model' must be a registered model name or model path.")
+
+    probability_threshold = settings["probability_threshold"]
+    if probability_threshold is not None and not 0 <= probability_threshold <= 1:
+        raise ValueError("Spotiflow 'probability_threshold' must be between 0 and 1.")
+
+    if settings["min_distance"] <= 0:
+        raise ValueError("Spotiflow 'min_distance' must be greater than zero.")
+
+    n_tiles = settings["n_tiles"]
+    if n_tiles is not None:
+        if not isinstance(n_tiles, (list, tuple)) or len(n_tiles) != 2:
+            raise ValueError(
+                "Spotiflow 'n_tiles' must contain two positive integers for 2D detection."
+            )
+        normalized_n_tiles = tuple(int(value) for value in n_tiles)
+        if any(value < 1 for value in normalized_n_tiles) or any(
+            value != normalized for value, normalized in zip(n_tiles, normalized_n_tiles)
+        ):
+            raise ValueError(
+                "Spotiflow 'n_tiles' must contain two positive integers for 2D detection."
+            )
+        settings["n_tiles"] = normalized_n_tiles
+
+    if settings["measurement_type"] not in {"mean", "max"}:
+        raise ValueError("Spotiflow 'measurement_type' must be 'mean' or 'max'.")
+
+    return settings
+
+
+def installed_spotiflow_version():
+    """Return the installed Spotiflow version without importing the optional package."""
+    try:
+        return distribution_version("spotiflow")
+    except PackageNotFoundError:
+        return None
+
+
+def create_spot_detector(
+    spot_detection_mode,
+    *,
+    int_threshold=0.002,
+    sigma_vals=(1, 10, 30),
+    spotiflow_model=None,
+    spotiflow_kwargs=None,
+):
+    """Create a Starfish-compatible BlobDetector or Spotiflow detector."""
+    mode = normalize_spot_detection_mode(spot_detection_mode)
+    if mode == "starfish":
+        min_sigma, max_sigma, num_sigma = sigma_vals
+        return FindSpots.BlobDetector(
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigma=num_sigma,
+            threshold=int_threshold,
+            measurement_type="mean",
+        )
+
+    try:
+        from spotiflow.starfish import SpotiflowDetector
+    except ImportError as exc:
+        raise ImportError(
+            "Spotiflow is not installed. Install ISS_decoding with the 'spotiflow' "
+            "extra or create the environment from ISS_decoding.yml."
+        ) from exc
+
+    settings = effective_spotiflow_kwargs(spotiflow_kwargs)
+    model = spotiflow_model if spotiflow_model is not None else settings.pop("model")
+
+    class ProbabilityPreservingSpotiflowDetector(SpotiflowDetector):
+        """Preserve detector confidence when Starfish measures barcode intensities."""
+
+        def image_to_spots(self, data_image):
+            results = super().image_to_spots(data_image)
+            spot_data = results.spot_attrs.data
+            spot_data[SPOTIFLOW_PROBABILITY_COLUMN] = spot_data[
+                Features.INTENSITY
+            ].to_numpy(copy=True)
+            return results
+
+    return ProbabilityPreservingSpotiflowDetector(
+        model=model,
+        is_volume=False,
+        subpix=False,
+        **settings,
+    )
+
+
+def decoding_output_subdir(decode_mode, dense, spot_detection_mode):
+    """Return an output directory that keeps detector alternatives separate."""
+    mode = normalize_spot_detection_mode(spot_detection_mode)
+    decode_mode = str(decode_mode).upper()
+    base = (
+        "2_decoded_dense"
+        if dense
+        else "2_decoded_postcode" if decode_mode == "POSTCODE" else "2_decoded"
+    )
+    return f"{base}_spotiflow" if mode == "spotiflow" else base
 
 
 def add_spot_identity(dataframe, region_name, tile_id):
@@ -114,6 +247,8 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "second_gene_probability",
         "gene_probability_margin",
         "decoder",
+        "spot_detector",
+        SPOTIFLOW_PROBABILITY_COLUMN,
     ]
     leading_columns = [column for column in leading_columns if column in dataframe]
     remaining_columns = [
@@ -374,11 +509,14 @@ def ISS_pipeline(
     channel_normalization="MH",
     spot_detection_mode="starfish",
     spotiflow_model=None,
+    spotiflow_kwargs=None,
+    spot_detector=None,
     prob_threshold=None,
     postcode_kwargs=None,
     return_postcode_raw=False,
 ):
     decode_mode = decode_mode.upper()
+    spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
     print("Loading image planes")
     primary_image = tile.get_image(FieldOfView.PRIMARY_IMAGES)
     nuclei = tile.get_image("nuclei")
@@ -430,14 +568,14 @@ def ISS_pipeline(
 
     scaled = sbp.run(filtered, n_processes=1, in_place=False)
 
-    min_sigma, max_sigma, num_sigma = sigma_vals
-    bd = FindSpots.BlobDetector(
-        min_sigma=min_sigma,
-        max_sigma=max_sigma,
-        num_sigma=num_sigma,
-        threshold=int_threshold,
-        measurement_type="mean",
-    )
+    if spot_detector is None:
+        spot_detector = create_spot_detector(
+            spot_detection_mode,
+            int_threshold=int_threshold,
+            sigma_vals=sigma_vals,
+            spotiflow_model=spotiflow_model,
+            spotiflow_kwargs=spotiflow_kwargs,
+        )
 
     def make_decoder():
         if decode_mode == "PRMC":
@@ -475,8 +613,8 @@ def ISS_pipeline(
 
         for ch in channels:
             channel_ref = primary_image.sel({Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0})
-            print(f"Locating spots for channel {ch}")
-            spots = bd.run(reference_image=channel_ref, image_stack=scaled)
+            print(f"Locating spots for channel {ch} with {spot_detection_mode}")
+            spots = spot_detector.run(reference_image=channel_ref, image_stack=scaled)
 
             df_qc = decode_detected_spots(spots)
             df_qc["channel"] = ch
@@ -487,8 +625,8 @@ def ISS_pipeline(
     dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
     dots_max = dots.reduce({Axes.ZPLANE}, func="max")
 
-    print("Locating spots in reference image")
-    spots = bd.run(reference_image=dots_max, image_stack=scaled)
+    print(f"Locating spots in reference image with {spot_detection_mode}")
+    spots = spot_detector.run(reference_image=dots_max, image_stack=scaled)
 
     return decode_detected_spots(spots)
 
@@ -508,6 +646,7 @@ def process_experiment(
     sigma_vals=(1, 10, 30),
     prob_threshold=None,
     postcode_kwargs=None,
+    spotiflow_kwargs=None,
     save_postcode_artifacts=False,
 ):
     """
@@ -519,6 +658,15 @@ def process_experiment(
 
     input_dir = Path(input_dir)
     decode_mode = decode_mode.upper()
+    spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
+    spotiflow_settings = (
+        effective_spotiflow_kwargs(spotiflow_kwargs)
+        if spot_detection_mode == "spotiflow"
+        else {}
+    )
+    spotiflow_package_version = (
+        installed_spotiflow_version() if spot_detection_mode == "spotiflow" else None
+    )
     print(f"Processing directory: {input_dir}")
 
     run_id = timestamp_for_filename()
@@ -590,14 +738,7 @@ def process_experiment(
     if skipped_regions:
         print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
 
-    SPOTIFLOW_MODEL = None
-    SpotiflowDetector = None
-
-    if spot_detection_mode == "spotiflow":
-        from spotiflow.model import Spotiflow
-        from spotiflow.starfish import SpotiflowDetector
-
-        SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
+    shared_spot_detector = None
 
     for region_directory in region_directories:
         region_name = region_directory.name
@@ -606,10 +747,10 @@ def process_experiment(
             effective_postcode_kwargs(postcode_kwargs) if is_postcode else {}
         )
 
-        decoded_subdir = (
-            "2_decoded_dense"
-            if dense
-            else "2_decoded_postcode" if is_postcode else "2_decoded"
+        decoded_subdir = decoding_output_subdir(
+            decode_mode,
+            dense,
+            spot_detection_mode,
         )
         if output_dir_prefix is None:
             decoded_dir = region_directory / "decoding" / decoded_subdir
@@ -669,6 +810,12 @@ def process_experiment(
             tile = experiment[tile_id]
             print(f"\033[1;90mProcessing tile {tile_id[-3:]} \033[0m")
 
+            if spot_detection_mode == "spotiflow" and shared_spot_detector is None:
+                shared_spot_detector = create_spot_detector(
+                    "spotiflow",
+                    spotiflow_kwargs=spotiflow_settings,
+                )
+
             pipeline_result = ISS_pipeline(
                 tile,
                 experiment.codebook,
@@ -680,6 +827,9 @@ def process_experiment(
                 sigma_vals=sigma_vals,
                 decode_mode=decode_mode,
                 channel_normalization=normalization_method,
+                spot_detection_mode=spot_detection_mode,
+                spotiflow_kwargs=spotiflow_settings,
+                spot_detector=shared_spot_detector,
                 prob_threshold=prob_threshold,
                 postcode_kwargs=postcode_kwargs,
                 return_postcode_raw=save_postcode_artifacts,
@@ -694,6 +844,7 @@ def process_experiment(
                 continue
 
             df["tile"] = tile_id
+            df["spot_detector"] = spot_detection_mode
             df["coordinate_units"] = coordinate_units
             df["coordinate_pixel_to_um"] = coordinate_pixel_to_um
 
@@ -770,6 +921,13 @@ def process_experiment(
             ET.SubElement(params_el, "normalization_method").text = str(normalization_method)
             ET.SubElement(params_el, "decode_mode").text = str(decode_mode)
             ET.SubElement(params_el, "spot_detection_mode").text = str(spot_detection_mode)
+            if spot_detection_mode == "spotiflow":
+                ET.SubElement(params_el, "spotiflow_version").text = str(
+                    spotiflow_package_version
+                )
+                ET.SubElement(params_el, "spotiflow_kwargs").text = json.dumps(
+                    spotiflow_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "int_threshold").text = str(int_threshold)
             ET.SubElement(params_el, "sigma_vals").text = ",".join([str(x) for x in sigma_vals])
             ET.SubElement(params_el, "prob_threshold").text = (
@@ -840,6 +998,10 @@ def process_experiment(
                         "masking_radius": masking_radius,
                         "normalization_method": normalization_method,
                         "spot_detection_mode": spot_detection_mode,
+                        "spotiflow_version": spotiflow_package_version,
+                        "spotiflow_kwargs": json.loads(
+                            json.dumps(spotiflow_settings, default=str)
+                        ),
                         "int_threshold": int_threshold,
                         "sigma_vals": list(sigma_vals),
                         "prob_threshold": prob_threshold,

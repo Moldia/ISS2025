@@ -39,8 +39,5 @@ dependencies:
       - regional
       - showit
 
-      # Spotiflow (your script imports Spotiflow and SpotiflowDetector)
-      - spotiflow==0.5.8
-
-      # Install current project plus the pinned PoSTcode compatibility fork
-      - ".[postcode]"
+      # Install the current project with the pinned PoSTcode and Spotiflow integrations
+      - ".[postcode,spotiflow]"
