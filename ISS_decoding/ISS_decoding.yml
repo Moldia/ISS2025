@@ -43,4 +43,4 @@ dependencies:
       - spotiflow==0.5.8
 
       # Install current project plus the pinned PoSTcode compatibility fork
-      - "./ISS_decoding[postcode]"
+      - ".[postcode]"
