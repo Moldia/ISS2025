@@ -36,7 +36,7 @@ conda env create --name ISS_decoding --file ISS_decoding/ISS_decoding.yml
 conda activate ISS_decoding
 
 # Install / reinstall the package (required after pulling updates)
-python -m pip install "./ISS_decoding[postcode,spotiflow]" --upgrade
+python -m pip install "./ISS_decoding[postcode,spotiflow,istdeco]" --upgrade
 
 # (Optional) Register a Jupyter kernel
 python -m ipykernel install --user --name ISS_decoding
@@ -111,6 +111,7 @@ Detector alternatives are stored separately so they can be compared safely:
 2_decoded_postcode_spotiflow/     # Spotiflow detector + PoSTcode decoder
 2_decoded_dense/                   # dense Starfish detection
 2_decoded_dense_spotiflow/        # dense Spotiflow detection
+2_decoded_istdeco/                # joint ISTDECO detection + decoding
 ```
 
 `prob_threshold` remains the PoSTcode assignment threshold. Spotiflow's
@@ -192,5 +193,59 @@ can be large. The legacy `postcode_probability` and `postcode_class` columns
 remain as aliases for compatibility.
 
 For an Ubuntu CUDA machine, install the PyTorch build appropriate for the
-machine's NVIDIA driver before installing `ISS_decoding[postcode,spotiflow]` if
+machine's NVIDIA driver before installing
+`ISS_decoding[postcode,spotiflow,istdeco]` if
 the pip default is not suitable.
+
+## ISTDECO joint detection and decoding
+
+ISTDECO is an image-level alternative to the separate detector/decoder paths
+above. It jointly deconvolves and assigns barcodes, so it does not use the
+Starfish blob detector or Spotiflow. SpaceTx remains the common input: the
+adapter projects the preprocessed image stack to `(rounds, channels, y, x)`
+and passes the one-hot SpaceTx codebook directly as
+`(targets, rounds, channels)`.
+
+The optional dependency is pinned to the tested modernized fork commit
+[`2200b4e`](https://github.com/mgcizzu/istdeco/commit/2200b4e969528e46588fbe75b6b039f72cd962eb).
+The fork adds standard packaging, Python 3.10+ support, current PyTorch support,
+input validation, device-safe outputs, and numerical safeguards while retaining
+the original ISTDECO update equations.
+
+```python
+from ISS_decoding.decoding import process_experiment
+
+process_experiment(
+    input_dir="/path/to/experiment",
+    regions_to_process=[1],
+    decode_mode="ISTDECO",
+    istdeco_kwargs={
+        "sigma": 1.2,
+        "background": 1e-8,
+        "niter": 75,
+        "acceleration": 1.0,
+        "suppress_radius": 1,
+        "tile_size": (512, 512),
+        "overlap": None,             # automatic PSF-safe halo
+        "intensity_percentile": 99.0,
+        "intensity_threshold": None, # overrides percentile when set
+        "quality_threshold": 0.5,
+        "device": "auto",           # CUDA when available, otherwise CPU
+        "z_projection": "max",
+    },
+)
+```
+
+The full SpaceTx FOV is decoded in overlapping reads. Only the non-overlapping
+core of each read is retained, which avoids duplicate detections at internal
+seams while bounding GPU memory. Dense barcode intensity and quality images are
+not saved by default because they can be extremely large. The spot table stores
+`istdeco_intensity`, `istdeco_quality`, the actual intensity threshold, and the
+internal `istdeco_tile`; quality is the algorithm's filtering score, not a
+calibrated probability.
+
+Outputs use restartable per-FOV Parquet checkpoints plus region-level Parquet
+and CSV copies under `decoding/2_decoded_istdeco/`. Exact settings, package
+version, and the pinned fork commit are stored in XML and JSON run manifests.
+See [`Notebooks/ISS_ISTDECO_decoding.ipynb`](Notebooks/ISS_ISTDECO_decoding.ipynb)
+for a complete example, including the optional SpaceTx formatting step.

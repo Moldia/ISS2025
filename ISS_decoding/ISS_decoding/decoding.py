@@ -26,10 +26,17 @@ from .postcode_adapter import (
     postcode_output_to_decoded_table,
     summarize_postcode_output,
 )
+from .istdeco_adapter import (
+    decode_imagestack_with_istdeco,
+    effective_istdeco_kwargs,
+    installed_istdeco_version,
+)
 
 
 POSTCODE_COMMIT = "4db68cc5cc398128bcfd97a764bef3c98ee3c583"
 POSTCODE_OUTPUT_SCHEMA_VERSION = "1.0"
+ISTDECO_COMMIT = "2200b4e969528e46588fbe75b6b039f72cd962eb"
+ISTDECO_OUTPUT_SCHEMA_VERSION = "1.0"
 POSTCODE_DEFAULT_KWARGS = {
     "num_iter": 60,
     "batch_size": 15000,
@@ -190,8 +197,10 @@ def create_spot_detector(
 
 def decoding_output_subdir(decode_mode, dense, spot_detection_mode):
     """Return an output directory that keeps detector alternatives separate."""
-    mode = normalize_spot_detection_mode(spot_detection_mode)
     decode_mode = str(decode_mode).upper()
+    if decode_mode == "ISTDECO":
+        return "2_decoded_istdeco"
+    mode = normalize_spot_detection_mode(spot_detection_mode)
     base = (
         "2_decoded_dense"
         if dense
@@ -262,6 +271,11 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "decoder",
         "spot_detector",
         SPOTIFLOW_PROBABILITY_COLUMN,
+        "target_id",
+        "istdeco_intensity",
+        "istdeco_quality",
+        "istdeco_intensity_threshold",
+        "istdeco_tile",
     ]
     leading_columns = [column for column in leading_columns if column in dataframe]
     remaining_columns = [
@@ -509,27 +523,16 @@ def decode_spots_with_postcode(
     return (dataframe, output) if return_raw else dataframe
 
 
-def ISS_pipeline(
+def preprocess_iss_tile(
     tile,
-    codebook,
+    *,
     dense=False,
     register=True,
     register_dapi=True,
     masking_radius=15,
-    int_threshold=0.002,
-    sigma_vals=(1, 10, 30),
-    decode_mode="PRMC",
     channel_normalization="MH",
-    spot_detection_mode="starfish",
-    spotiflow_model=None,
-    spotiflow_kwargs=None,
-    spot_detector=None,
-    prob_threshold=None,
-    postcode_kwargs=None,
-    return_postcode_raw=False,
 ):
-    decode_mode = decode_mode.upper()
-    spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
+    """Load, optionally register, filter, and normalize one SpaceTx FOV."""
     print("Loading image planes")
     primary_image = tile.get_image(FieldOfView.PRIMARY_IMAGES)
     nuclei = tile.get_image("nuclei")
@@ -580,6 +583,70 @@ def ISS_pipeline(
         )
 
     scaled = sbp.run(filtered, n_processes=1, in_place=False)
+    return primary_image, scaled
+
+
+def ISS_istdeco_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    istdeco_kwargs=None,
+):
+    """Preprocess and jointly detect/decode one SpaceTx FOV with ISTDECO."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+    print("Joint spot detection and decoding with ISTDECO")
+    return decode_imagestack_with_istdeco(
+        scaled,
+        codebook,
+        istdeco_kwargs=istdeco_kwargs,
+    )
+
+
+def ISS_pipeline(
+    tile,
+    codebook,
+    dense=False,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    int_threshold=0.002,
+    sigma_vals=(1, 10, 30),
+    decode_mode="PRMC",
+    channel_normalization="MH",
+    spot_detection_mode="starfish",
+    spotiflow_model=None,
+    spotiflow_kwargs=None,
+    spot_detector=None,
+    prob_threshold=None,
+    postcode_kwargs=None,
+    return_postcode_raw=False,
+):
+    decode_mode = decode_mode.upper()
+    spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
+    if decode_mode == "ISTDECO":
+        raise ValueError(
+            "ISTDECO is a joint image-level detector/decoder. Use "
+            "ISS_istdeco_pipeline or process_experiment(decode_mode='ISTDECO')."
+        )
+    primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=dense,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
 
     if spot_detector is None:
         spot_detector = create_spot_detector(
@@ -661,6 +728,7 @@ def process_experiment(
     postcode_kwargs=None,
     spotiflow_kwargs=None,
     save_postcode_artifacts=False,
+    istdeco_kwargs=None,
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
@@ -671,7 +739,17 @@ def process_experiment(
 
     input_dir = Path(input_dir)
     decode_mode = decode_mode.upper()
-    spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
+    is_istdeco = decode_mode == "ISTDECO"
+    if is_istdeco:
+        requested_detector = str(spot_detection_mode).strip().lower()
+        if requested_detector != "starfish":
+            raise ValueError(
+                "decode_mode='ISTDECO' performs joint spot detection and decoding; "
+                "do not combine it with spot_detection_mode."
+            )
+        spot_detection_mode = "istdeco_joint"
+    else:
+        spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
     spotiflow_settings = (
         effective_spotiflow_kwargs(spotiflow_kwargs)
         if spot_detection_mode == "spotiflow"
@@ -680,6 +758,8 @@ def process_experiment(
     spotiflow_package_version = (
         installed_spotiflow_version() if spot_detection_mode == "spotiflow" else None
     )
+    istdeco_settings = effective_istdeco_kwargs(istdeco_kwargs) if is_istdeco else {}
+    istdeco_package_version = installed_istdeco_version() if is_istdeco else None
     print(f"Processing directory: {input_dir}")
 
     run_id = timestamp_for_filename()
@@ -691,6 +771,8 @@ def process_experiment(
     else:
         print("[INFO] Using default output location under each region directory")
 
+    if dense and is_istdeco:
+        raise ValueError("dense=True is not supported with decode_mode='ISTDECO'.")
     if dense:
         print("DENSE (per-channel) decoding")
 
@@ -776,7 +858,11 @@ def process_experiment(
         print(f"Output decoded directory: {decoded_dir}")
 
         final_stem = (
-            f"{region_name}_decoded_postcode" if is_postcode else f"{region_name}_decoded"
+            f"{region_name}_decoded_postcode"
+            if is_postcode
+            else f"{region_name}_decoded_istdeco"
+            if is_istdeco
+            else f"{region_name}_decoded"
         )
         final_csv = decoded_dir / f"{final_stem}.csv"
         final_parquet = decoded_dir / f"{final_stem}.parquet"
@@ -829,24 +915,35 @@ def process_experiment(
                     spotiflow_kwargs=spotiflow_settings,
                 )
 
-            pipeline_result = ISS_pipeline(
-                tile,
-                experiment.codebook,
-                dense=dense,
-                register=register,
-                register_dapi=register_dapi,
-                masking_radius=masking_radius,
-                int_threshold=int_threshold,
-                sigma_vals=sigma_vals,
-                decode_mode=decode_mode,
-                channel_normalization=normalization_method,
-                spot_detection_mode=spot_detection_mode,
-                spotiflow_kwargs=spotiflow_settings,
-                spot_detector=shared_spot_detector,
-                prob_threshold=prob_threshold,
-                postcode_kwargs=postcode_kwargs,
-                return_postcode_raw=save_postcode_artifacts,
-            )
+            if is_istdeco:
+                pipeline_result = ISS_istdeco_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    istdeco_kwargs=istdeco_settings,
+                )
+            else:
+                pipeline_result = ISS_pipeline(
+                    tile,
+                    experiment.codebook,
+                    dense=dense,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    int_threshold=int_threshold,
+                    sigma_vals=sigma_vals,
+                    decode_mode=decode_mode,
+                    channel_normalization=normalization_method,
+                    spot_detection_mode=spot_detection_mode,
+                    spotiflow_kwargs=spotiflow_settings,
+                    spot_detector=shared_spot_detector,
+                    prob_threshold=prob_threshold,
+                    postcode_kwargs=postcode_kwargs,
+                    return_postcode_raw=save_postcode_artifacts,
+                )
             if is_postcode and save_postcode_artifacts:
                 df, raw_postcode_output = pipeline_result
             else:
@@ -861,7 +958,7 @@ def process_experiment(
             df["coordinate_units"] = coordinate_units
             df["coordinate_pixel_to_um"] = coordinate_pixel_to_um
 
-            if is_postcode:
+            if is_postcode or is_istdeco:
                 df = add_spot_identity(df, region_name, tile_id)
                 if df["spot_uid"].duplicated().any():
                     raise ValueError(f"Duplicate spot_uid values detected in tile {tile_id}.")
@@ -893,7 +990,7 @@ def process_experiment(
                 print(f"  • Loaded {path.name} ({len(df)} rows)")
 
             concat = pd.concat(dfs, ignore_index=True)
-            if is_postcode:
+            if is_postcode or is_istdeco:
                 if concat["spot_uid"].duplicated().any():
                     duplicates = concat.loc[
                         concat["spot_uid"].duplicated(keep=False), "spot_uid"
@@ -957,6 +1054,17 @@ def process_experiment(
                 ET.SubElement(params_el, "output_schema_version").text = (
                     POSTCODE_OUTPUT_SCHEMA_VERSION
                 )
+            if is_istdeco:
+                ET.SubElement(params_el, "istdeco_version").text = str(
+                    istdeco_package_version
+                )
+                ET.SubElement(params_el, "istdeco_commit").text = ISTDECO_COMMIT
+                ET.SubElement(params_el, "istdeco_output_schema_version").text = (
+                    ISTDECO_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "istdeco_kwargs").text = json.dumps(
+                    istdeco_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "coordinate_units").text = str(coordinate_units)
             ET.SubElement(params_el, "coordinate_pixel_to_um").text = (
                 "None" if coordinate_pixel_to_um is None else str(coordinate_pixel_to_um)
@@ -976,16 +1084,23 @@ def process_experiment(
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             print(f"[{region_name}] Decoding XML written to: {xml_path}")
 
-            if is_postcode:
+            if is_postcode or is_istdeco:
                 manifest_path = decoded_dir / f"decoding_run_{run_id}.json"
                 manifest = {
-                    "schema_version": POSTCODE_OUTPUT_SCHEMA_VERSION,
+                    "schema_version": (
+                        POSTCODE_OUTPUT_SCHEMA_VERSION
+                        if is_postcode
+                        else ISTDECO_OUTPUT_SCHEMA_VERSION
+                    ),
                     "run_id": run_id,
                     "created_at": datetime.now().astimezone().isoformat(),
                     "region": region_name,
                     "decoder": {
-                        "name": "postcode",
-                        "commit": POSTCODE_COMMIT,
+                        "name": "postcode" if is_postcode else "istdeco",
+                        "commit": POSTCODE_COMMIT if is_postcode else ISTDECO_COMMIT,
+                        "version": (
+                            None if is_postcode else istdeco_package_version
+                        ),
                     },
                     "paths": {
                         "decoded_dir": str(decoded_dir),
@@ -1022,6 +1137,9 @@ def process_experiment(
                             json.dumps(postcode_settings, default=str)
                         ),
                         "save_postcode_artifacts": save_postcode_artifacts,
+                        "istdeco_kwargs": json.loads(
+                            json.dumps(istdeco_settings, default=str)
+                        ),
                         "coordinate_units": coordinate_units,
                         "coordinate_pixel_to_um": coordinate_pixel_to_um,
                     },

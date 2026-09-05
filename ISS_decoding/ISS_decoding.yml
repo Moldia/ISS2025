@@ -39,5 +39,5 @@ dependencies:
       - regional
       - showit
 
-      # Install the current project with the pinned PoSTcode and Spotiflow integrations
-      - ".[postcode,spotiflow]"
+      # Install the current project with all optional decoding integrations
+      - ".[postcode,spotiflow,istdeco]"

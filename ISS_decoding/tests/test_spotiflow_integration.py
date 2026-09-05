@@ -207,6 +207,7 @@ def test_iss_pipeline_uses_the_supplied_spotiflow_detector(monkeypatch):
         ("POSTCODE", False, "spotiflow", "2_decoded_postcode_spotiflow"),
         ("PRMC", True, "starfish", "2_decoded_dense"),
         ("PRMC", True, "spotiflow", "2_decoded_dense_spotiflow"),
+        ("ISTDECO", False, "starfish", "2_decoded_istdeco"),
     ],
 )
 def test_detector_and_decoder_output_directories_are_separate(

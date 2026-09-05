@@ -6,7 +6,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="ISS_decoding",
-    version="0.0.28",
+    version="0.0.29",
     author="Marco Grillo",
     author_email="marco.grillo@scilifelab.se",
     description="Decode preprocessed ISS images, including SpaceTx formatting and plotting",
@@ -31,6 +31,10 @@ setup(
         ],
         "spotiflow": [
             "spotiflow==0.6.5",
+        ],
+        "istdeco": [
+            "torch>=2.1,<3",
+            "istdeco @ git+https://github.com/mgcizzu/istdeco.git@2200b4e969528e46588fbe75b6b039f72cd962eb",
         ],
     },
     keywords=[
