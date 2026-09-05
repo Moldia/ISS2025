@@ -76,6 +76,10 @@ filtering, intensity measurement, decoding, QC, and output formatting unchanged.
 The ISS-specific `hybiss` model is the default; `general` or a local trained model
 path can be selected explicitly.
 
+A complete one-region example, including optional SpaceTx creation, detector QC,
+and a side-by-side BlobDetector comparison, is available in
+[`Notebooks/ISS_Spotiflow_decoding.ipynb`](Notebooks/ISS_Spotiflow_decoding.ipynb).
+
 ```python
 from ISS_decoding.decoding import process_experiment
 
