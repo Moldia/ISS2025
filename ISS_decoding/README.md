@@ -74,7 +74,8 @@ arrays; the CSV is intended as an interchange copy.
 Spotiflow can replace Starfish's blob detector while keeping registration,
 filtering, intensity measurement, decoding, QC, and output formatting unchanged.
 The ISS-specific `hybiss` model is the default; `general` or a local trained model
-path can be selected explicitly.
+path can be selected explicitly. The integration pins Spotiflow 0.6.5, which uses
+the maintained GitHub release registry for pretrained models.
 
 A complete one-region example, including optional SpaceTx creation, detector QC,
 and a side-by-side BlobDetector comparison, is available in

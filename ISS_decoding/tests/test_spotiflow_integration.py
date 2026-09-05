@@ -244,7 +244,7 @@ def test_process_experiment_reuses_spotiflow_detector_and_records_provenance(
         "read_spacetx_coordinate_metadata",
         lambda _: ("microns", 0.5),
     )
-    monkeypatch.setattr(decoding, "installed_spotiflow_version", lambda: "0.5.8")
+    monkeypatch.setattr(decoding, "installed_spotiflow_version", lambda: "0.6.5")
 
     detector = object()
     detector_calls = []
@@ -306,7 +306,7 @@ def test_process_experiment_reuses_spotiflow_detector_and_records_provenance(
     xml_path = next(output_dir.glob("decoding_run_*.xml"))
     parameters = ET.parse(xml_path).getroot().find("Parameters")
     assert parameters.findtext("spot_detection_mode") == "spotiflow"
-    assert parameters.findtext("spotiflow_version") == "0.5.8"
+    assert parameters.findtext("spotiflow_version") == "0.6.5"
     assert json.loads(parameters.findtext("spotiflow_kwargs")) == {
         **spotiflow_kwargs,
         "n_tiles": [2, 2],
