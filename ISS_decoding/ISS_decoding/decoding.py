@@ -160,6 +160,19 @@ def create_spot_detector(
         """Preserve detector confidence when Starfish measures barcode intensities."""
 
         def image_to_spots(self, data_image):
+            data_image = np.asarray(data_image)
+            if not self.is_volume:
+                # Starfish reference projections retain a singleton Z dimension.
+                # Spotiflow interprets any 3D 2D-model input as (Y, X, C), so
+                # passing (1, Y, X) would incorrectly treat X as the channels.
+                if data_image.ndim == 3 and data_image.shape[0] == 1:
+                    data_image = data_image[0]
+                if data_image.ndim != 2:
+                    raise ValueError(
+                        "Spotiflow 2D detection expected a (Y, X) image or a "
+                        "Starfish (1, Y, X) reference projection, but received "
+                        f"shape {data_image.shape}."
+                    )
             results = super().image_to_spots(data_image)
             spot_data = results.spot_attrs.data
             spot_data[SPOTIFLOW_PROBABILITY_COLUMN] = spot_data[

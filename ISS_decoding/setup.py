@@ -6,7 +6,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="ISS_decoding",
-    version="0.0.27",
+    version="0.0.28",
     author="Marco Grillo",
     author_email="marco.grillo@scilifelab.se",
     description="Decode preprocessed ISS images, including SpaceTx formatting and plotting",

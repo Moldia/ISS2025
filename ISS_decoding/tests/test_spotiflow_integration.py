@@ -80,12 +80,15 @@ def test_starfish_detector_uses_blob_parameters(monkeypatch):
 
 def test_spotiflow_detector_receives_settings_and_preserves_probability(monkeypatch):
     captured = {}
+    input_shapes = []
 
     class FakeSpotiflowDetector:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            self.is_volume = kwargs["is_volume"]
 
-        def image_to_spots(self, _data_image):
+        def image_to_spots(self, data_image):
+            input_shapes.append(data_image.shape)
             dataframe = pd.DataFrame({Features.INTENSITY: [0.9, 0.6]})
             return SimpleNamespace(spot_attrs=SimpleNamespace(data=dataframe))
 
@@ -116,8 +119,12 @@ def test_spotiflow_detector_receives_settings_and_preserves_probability(monkeypa
         "is_volume": False,
         "subpix": False,
     }
-    results = detector.image_to_spots(np.zeros((5, 5), dtype=np.float32))
+    results = detector.image_to_spots(np.zeros((1, 5, 5), dtype=np.float32))
+    assert input_shapes == [(5, 5)]
     assert results.spot_attrs.data["spotiflow_probability"].tolist() == [0.9, 0.6]
+
+    with pytest.raises(ValueError, match=r"received shape \(2, 5, 5\)"):
+        detector.image_to_spots(np.zeros((2, 5, 5), dtype=np.float32))
 
 
 def test_iss_pipeline_uses_the_supplied_spotiflow_detector(monkeypatch):
