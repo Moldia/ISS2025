@@ -40,4 +40,4 @@ dependencies:
       - showit
 
       # Install the current project with all optional decoding integrations
-      - ".[postcode,spotiflow,istdeco]"
+      - ".[postcode,spotiflow,istdeco,bardensr]"

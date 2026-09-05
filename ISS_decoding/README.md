@@ -36,7 +36,7 @@ conda env create --name ISS_decoding --file ISS_decoding/ISS_decoding.yml
 conda activate ISS_decoding
 
 # Install / reinstall the package (required after pulling updates)
-python -m pip install "./ISS_decoding[postcode,spotiflow,istdeco]" --upgrade
+python -m pip install "./ISS_decoding[postcode,spotiflow,istdeco,bardensr]" --upgrade
 
 # (Optional) Register a Jupyter kernel
 python -m ipykernel install --user --name ISS_decoding
@@ -112,6 +112,7 @@ Detector alternatives are stored separately so they can be compared safely:
 2_decoded_dense/                   # dense Starfish detection
 2_decoded_dense_spotiflow/        # dense Spotiflow detection
 2_decoded_istdeco/                # joint ISTDECO detection + decoding
+2_decoded_bardensr/               # joint Bardensr detection + decoding
 ```
 
 `prob_threshold` remains the PoSTcode assignment threshold. Spotiflow's
@@ -249,3 +250,62 @@ and CSV copies under `decoding/2_decoded_istdeco/`. Exact settings, package
 version, and the pinned fork commit are stored in XML and JSON run manifests.
 See [`Notebooks/ISS_ISTDECO_decoding.ipynb`](Notebooks/ISS_ISTDECO_decoding.ipynb)
 for a complete example, including the optional SpaceTx formatting step.
+
+## Bardensr joint detection and decoding
+
+Bardensr is a second image-level alternative. Like ISTDECO, it jointly estimates
+barcode density and calls peaks, so it bypasses both Starfish/Spotiflow detection
+and the downstream Starfish/PoSTcode decoders. SpaceTx remains the input format:
+the adapter flattens `(rounds, channels, z, y, x)` images to Bardensr's
+`(frames, z, y, x)` layout and transposes the codebook to `(frames, targets)`.
+
+The optional dependency is pinned to the tested compatibility fork commit
+[`79cf8f9`](https://github.com/mgcizzu/bardensr/commit/79cf8f9f1f28c8dbd00ab2dd948a214574948307).
+The fork retains Bardensr's algorithms while adding Python 3.10+ packaging,
+current TensorFlow support for float32 inputs, and repaired regression tests.
+
+```python
+from ISS_decoding.decoding import process_experiment
+
+process_experiment(
+    input_dir="/path/to/experiment",
+    regions_to_process=[1],
+    decode_mode="BARDENSR",
+    bardensr_kwargs={
+        "method": "singleshot",       # fast correlation-based decoder
+        "noisefloor": 0.05,
+        "peak_threshold": 0.72,
+        "peak_threshold_fraction": None,
+        "poolsize": (1, 1, 1),
+        "tile_size": (512, 512),
+        "overlap": None,              # automatic peak/PSF-safe halo
+        "normalize_frames": True,
+        "device": "auto",            # TensorFlow GPU when available
+        "z_projection": "max",
+    },
+)
+```
+
+For the slower optimization-based method, set `method="iterative"`. Its default
+threshold is `0.1` times each internal tile's maximum evidence, matching the
+upstream example; set an absolute `peak_threshold` after inspecting a pilot
+region if cross-tile threshold consistency is important. Iterative-only controls
+include `l1_penalty`, `psf_radius`, `iterations`, `estimate_codebook_gain`, and
+`estimate_colormixing`. Upstream phasing estimation is unfinished and is rejected
+rather than silently doing nothing.
+
+The full FOV is processed in overlapping reads and only each read's owned core is
+retained, preventing duplicate calls at seams. Results are written under
+`decoding/2_decoded_bardensr/` as restartable per-FOV Parquet files plus
+region-level Parquet and CSV copies. Each row includes `bardensr_evidence`, the
+actual `bardensr_peak_threshold`, `bardensr_tile_max`, `bardensr_method`, and the
+internal `bardensr_tile`. Evidence is an algorithm score, not a calibrated
+probability. Dense target-density maps are not retained because they can be very
+large.
+
+On Linux, the `bardensr` extra installs TensorFlow's CUDA runtime dependencies via
+`tensorflow[and-cuda]`; these are independent of the system CUDA toolkit used by
+the PyTorch decoders. Verify both frameworks after installation, and avoid running
+the PyTorch and TensorFlow decoders simultaneously when GPU memory is limited.
+See [`Notebooks/ISS_Bardensr_decoding.ipynb`](Notebooks/ISS_Bardensr_decoding.ipynb)
+for a complete pilot workflow and the optional SpaceTx formatting step.

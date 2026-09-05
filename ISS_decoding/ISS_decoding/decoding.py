@@ -31,12 +31,19 @@ from .istdeco_adapter import (
     effective_istdeco_kwargs,
     installed_istdeco_version,
 )
+from .bardensr_adapter import (
+    decode_imagestack_with_bardensr,
+    effective_bardensr_kwargs,
+    installed_bardensr_version,
+)
 
 
 POSTCODE_COMMIT = "4db68cc5cc398128bcfd97a764bef3c98ee3c583"
 POSTCODE_OUTPUT_SCHEMA_VERSION = "1.0"
 ISTDECO_COMMIT = "2200b4e969528e46588fbe75b6b039f72cd962eb"
 ISTDECO_OUTPUT_SCHEMA_VERSION = "1.0"
+BARDENSR_COMMIT = "79cf8f9f1f28c8dbd00ab2dd948a214574948307"
+BARDENSR_OUTPUT_SCHEMA_VERSION = "1.0"
 POSTCODE_DEFAULT_KWARGS = {
     "num_iter": 60,
     "batch_size": 15000,
@@ -200,6 +207,8 @@ def decoding_output_subdir(decode_mode, dense, spot_detection_mode):
     decode_mode = str(decode_mode).upper()
     if decode_mode == "ISTDECO":
         return "2_decoded_istdeco"
+    if decode_mode == "BARDENSR":
+        return "2_decoded_bardensr"
     mode = normalize_spot_detection_mode(spot_detection_mode)
     base = (
         "2_decoded_dense"
@@ -276,6 +285,11 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "istdeco_quality",
         "istdeco_intensity_threshold",
         "istdeco_tile",
+        "bardensr_evidence",
+        "bardensr_peak_threshold",
+        "bardensr_tile_max",
+        "bardensr_tile",
+        "bardensr_method",
     ]
     leading_columns = [column for column in leading_columns if column in dataframe]
     remaining_columns = [
@@ -613,6 +627,33 @@ def ISS_istdeco_pipeline(
     )
 
 
+def ISS_bardensr_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    bardensr_kwargs=None,
+):
+    """Preprocess and jointly detect/decode one SpaceTx FOV with Bardensr."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+    print("Joint spot detection and decoding with Bardensr")
+    return decode_imagestack_with_bardensr(
+        scaled,
+        codebook,
+        bardensr_kwargs=bardensr_kwargs,
+    )
+
+
 def ISS_pipeline(
     tile,
     codebook,
@@ -634,10 +675,10 @@ def ISS_pipeline(
 ):
     decode_mode = decode_mode.upper()
     spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
-    if decode_mode == "ISTDECO":
+    if decode_mode in {"ISTDECO", "BARDENSR"}:
         raise ValueError(
-            "ISTDECO is a joint image-level detector/decoder. Use "
-            "ISS_istdeco_pipeline or process_experiment(decode_mode='ISTDECO')."
+            f"{decode_mode} is a joint image-level detector/decoder. Use its "
+            f"dedicated pipeline or process_experiment(decode_mode='{decode_mode}')."
         )
     primary_image, scaled = preprocess_iss_tile(
         tile,
@@ -729,6 +770,7 @@ def process_experiment(
     spotiflow_kwargs=None,
     save_postcode_artifacts=False,
     istdeco_kwargs=None,
+    bardensr_kwargs=None,
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
@@ -740,14 +782,18 @@ def process_experiment(
     input_dir = Path(input_dir)
     decode_mode = decode_mode.upper()
     is_istdeco = decode_mode == "ISTDECO"
-    if is_istdeco:
+    is_bardensr = decode_mode == "BARDENSR"
+    is_joint_decoder = is_istdeco or is_bardensr
+    if is_joint_decoder:
         requested_detector = str(spot_detection_mode).strip().lower()
         if requested_detector != "starfish":
             raise ValueError(
-                "decode_mode='ISTDECO' performs joint spot detection and decoding; "
+                f"decode_mode='{decode_mode}' performs joint spot detection and decoding; "
                 "do not combine it with spot_detection_mode."
             )
-        spot_detection_mode = "istdeco_joint"
+        spot_detection_mode = (
+            "istdeco_joint" if is_istdeco else "bardensr_joint"
+        )
     else:
         spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
     spotiflow_settings = (
@@ -760,6 +806,12 @@ def process_experiment(
     )
     istdeco_settings = effective_istdeco_kwargs(istdeco_kwargs) if is_istdeco else {}
     istdeco_package_version = installed_istdeco_version() if is_istdeco else None
+    bardensr_settings = (
+        effective_bardensr_kwargs(bardensr_kwargs) if is_bardensr else {}
+    )
+    bardensr_package_version = (
+        installed_bardensr_version() if is_bardensr else None
+    )
     print(f"Processing directory: {input_dir}")
 
     run_id = timestamp_for_filename()
@@ -771,8 +823,8 @@ def process_experiment(
     else:
         print("[INFO] Using default output location under each region directory")
 
-    if dense and is_istdeco:
-        raise ValueError("dense=True is not supported with decode_mode='ISTDECO'.")
+    if dense and is_joint_decoder:
+        raise ValueError(f"dense=True is not supported with decode_mode='{decode_mode}'.")
     if dense:
         print("DENSE (per-channel) decoding")
 
@@ -862,6 +914,8 @@ def process_experiment(
             if is_postcode
             else f"{region_name}_decoded_istdeco"
             if is_istdeco
+            else f"{region_name}_decoded_bardensr"
+            if is_bardensr
             else f"{region_name}_decoded"
         )
         final_csv = decoded_dir / f"{final_stem}.csv"
@@ -925,6 +979,16 @@ def process_experiment(
                     channel_normalization=normalization_method,
                     istdeco_kwargs=istdeco_settings,
                 )
+            elif is_bardensr:
+                pipeline_result = ISS_bardensr_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    bardensr_kwargs=bardensr_settings,
+                )
             else:
                 pipeline_result = ISS_pipeline(
                     tile,
@@ -958,7 +1022,7 @@ def process_experiment(
             df["coordinate_units"] = coordinate_units
             df["coordinate_pixel_to_um"] = coordinate_pixel_to_um
 
-            if is_postcode or is_istdeco:
+            if is_postcode or is_joint_decoder:
                 df = add_spot_identity(df, region_name, tile_id)
                 if df["spot_uid"].duplicated().any():
                     raise ValueError(f"Duplicate spot_uid values detected in tile {tile_id}.")
@@ -990,7 +1054,7 @@ def process_experiment(
                 print(f"  • Loaded {path.name} ({len(df)} rows)")
 
             concat = pd.concat(dfs, ignore_index=True)
-            if is_postcode or is_istdeco:
+            if is_postcode or is_joint_decoder:
                 if concat["spot_uid"].duplicated().any():
                     duplicates = concat.loc[
                         concat["spot_uid"].duplicated(keep=False), "spot_uid"
@@ -1065,6 +1129,17 @@ def process_experiment(
                 ET.SubElement(params_el, "istdeco_kwargs").text = json.dumps(
                     istdeco_settings, sort_keys=True, default=str
                 )
+            if is_bardensr:
+                ET.SubElement(params_el, "bardensr_version").text = str(
+                    bardensr_package_version
+                )
+                ET.SubElement(params_el, "bardensr_commit").text = BARDENSR_COMMIT
+                ET.SubElement(params_el, "bardensr_output_schema_version").text = (
+                    BARDENSR_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "bardensr_kwargs").text = json.dumps(
+                    bardensr_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "coordinate_units").text = str(coordinate_units)
             ET.SubElement(params_el, "coordinate_pixel_to_um").text = (
                 "None" if coordinate_pixel_to_um is None else str(coordinate_pixel_to_um)
@@ -1084,22 +1159,40 @@ def process_experiment(
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             print(f"[{region_name}] Decoding XML written to: {xml_path}")
 
-            if is_postcode or is_istdeco:
+            if is_postcode or is_joint_decoder:
                 manifest_path = decoded_dir / f"decoding_run_{run_id}.json"
                 manifest = {
                     "schema_version": (
                         POSTCODE_OUTPUT_SCHEMA_VERSION
                         if is_postcode
                         else ISTDECO_OUTPUT_SCHEMA_VERSION
+                        if is_istdeco
+                        else BARDENSR_OUTPUT_SCHEMA_VERSION
                     ),
                     "run_id": run_id,
                     "created_at": datetime.now().astimezone().isoformat(),
                     "region": region_name,
                     "decoder": {
-                        "name": "postcode" if is_postcode else "istdeco",
-                        "commit": POSTCODE_COMMIT if is_postcode else ISTDECO_COMMIT,
+                        "name": (
+                            "postcode"
+                            if is_postcode
+                            else "istdeco"
+                            if is_istdeco
+                            else "bardensr"
+                        ),
+                        "commit": (
+                            POSTCODE_COMMIT
+                            if is_postcode
+                            else ISTDECO_COMMIT
+                            if is_istdeco
+                            else BARDENSR_COMMIT
+                        ),
                         "version": (
-                            None if is_postcode else istdeco_package_version
+                            None
+                            if is_postcode
+                            else istdeco_package_version
+                            if is_istdeco
+                            else bardensr_package_version
                         ),
                     },
                     "paths": {
@@ -1139,6 +1232,9 @@ def process_experiment(
                         "save_postcode_artifacts": save_postcode_artifacts,
                         "istdeco_kwargs": json.loads(
                             json.dumps(istdeco_settings, default=str)
+                        ),
+                        "bardensr_kwargs": json.loads(
+                            json.dumps(bardensr_settings, default=str)
                         ),
                         "coordinate_units": coordinate_units,
                         "coordinate_pixel_to_um": coordinate_pixel_to_um,
