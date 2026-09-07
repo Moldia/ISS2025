@@ -18,7 +18,7 @@ import pandas as pd
 # Starfish
 from starfish import Experiment, FieldOfView
 from starfish.image import ApplyTransform, Filter, LearnTransform
-from starfish.spots import DecodeSpots, FindSpots
+from starfish.spots import DecodeSpots, DetectPixels, FindSpots
 from starfish.types import Axes, Features, TraceBuildingStrategies, Levels
 
 from .postcode_adapter import (
@@ -51,6 +51,7 @@ BARDENSR_COMMIT = "79cf8f9f1f28c8dbd00ab2dd948a214574948307"
 BARDENSR_OUTPUT_SCHEMA_VERSION = "1.0"
 GRAPHISS_COMMIT = "478387f1bdb20084ab41fb5763976defd933a676"
 GRAPHISS_OUTPUT_SCHEMA_VERSION = "1.0"
+PIXEL_OUTPUT_SCHEMA_VERSION = "1.0"
 POSTCODE_DEFAULT_KWARGS = {
     "num_iter": 60,
     "batch_size": 15000,
@@ -72,6 +73,15 @@ SPOTIFLOW_DEFAULT_KWARGS = {
 }
 VALID_SPOT_DETECTION_MODES = {"starfish", "spotiflow"}
 SPOTIFLOW_PROBABILITY_COLUMN = "spotiflow_probability"
+PIXEL_DEFAULT_KWARGS = {
+    "metric": "euclidean",
+    "distance_threshold": 0.5,
+    "magnitude_threshold": 0.1,
+    "min_area": 2,
+    "max_area": 100,
+    "norm_order": 2,
+    "n_processes": 1,
+}
 
 
 def timestamp_for_filename() -> str:
@@ -108,7 +118,9 @@ def effective_spotiflow_kwargs(overrides=None):
 
     model = settings["model"]
     if model is None or (isinstance(model, str) and not model.strip()):
-        raise ValueError("Spotiflow 'model' must be a registered model name or model path.")
+        raise ValueError(
+            "Spotiflow 'model' must be a registered model name or model path."
+        )
 
     probability_threshold = settings["probability_threshold"]
     if probability_threshold is not None and not 0 <= probability_threshold <= 1:
@@ -125,7 +137,8 @@ def effective_spotiflow_kwargs(overrides=None):
             )
         normalized_n_tiles = tuple(int(value) for value in n_tiles)
         if any(value < 1 for value in normalized_n_tiles) or any(
-            value != normalized for value, normalized in zip(n_tiles, normalized_n_tiles)
+            value != normalized
+            for value, normalized in zip(n_tiles, normalized_n_tiles)
         ):
             raise ValueError(
                 "Spotiflow 'n_tiles' must contain two positive integers for 2D detection."
@@ -144,6 +157,48 @@ def installed_spotiflow_version():
         return distribution_version("spotiflow")
     except PackageNotFoundError:
         return None
+
+
+def effective_pixel_kwargs(overrides=None):
+    """Return validated settings for Starfish ``PixelSpotDecoder``."""
+    overrides = dict(overrides or {})
+    unknown = sorted(set(overrides) - set(PIXEL_DEFAULT_KWARGS))
+    if unknown:
+        raise ValueError(f"Unknown Starfish pixel-decoding setting(s): {unknown}")
+
+    settings = dict(PIXEL_DEFAULT_KWARGS)
+    settings.update(overrides)
+
+    metric = settings["metric"]
+    if not isinstance(metric, str) or not metric.strip():
+        raise ValueError("Pixel-decoding 'metric' must be a non-empty string.")
+
+    if settings["distance_threshold"] <= 0:
+        raise ValueError(
+            "Pixel-decoding 'distance_threshold' must be greater than zero."
+        )
+    if settings["magnitude_threshold"] < 0:
+        raise ValueError("Pixel-decoding 'magnitude_threshold' cannot be negative.")
+    if settings["min_area"] < 1:
+        raise ValueError("Pixel-decoding 'min_area' must be at least one pixel.")
+    if settings["max_area"] <= settings["min_area"]:
+        raise ValueError("Pixel-decoding 'max_area' must be greater than 'min_area'.")
+    if settings["norm_order"] <= 0:
+        raise ValueError("Pixel-decoding 'norm_order' must be greater than zero.")
+
+    n_processes = settings["n_processes"]
+    if n_processes is not None:
+        if isinstance(n_processes, bool) or int(n_processes) != n_processes:
+            raise ValueError(
+                "Pixel-decoding 'n_processes' must be a positive integer or None."
+            )
+        if n_processes < 1:
+            raise ValueError(
+                "Pixel-decoding 'n_processes' must be a positive integer or None."
+            )
+        settings["n_processes"] = int(n_processes)
+
+    return settings
 
 
 def create_spot_detector(
@@ -212,6 +267,8 @@ def create_spot_detector(
 def decoding_output_subdir(decode_mode, dense, spot_detection_mode):
     """Return an output directory that keeps detector alternatives separate."""
     decode_mode = str(decode_mode).upper()
+    if decode_mode == "PIXEL":
+        return "2_decoded_pixel"
     if decode_mode == "ISTDECO":
         return "2_decoded_istdeco"
     if decode_mode == "BARDENSR":
@@ -310,6 +367,12 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "graphiss_quality",
         "graphiss_search_mode",
         "graphiss_path_candidate_indices",
+        "pixel_area",
+        "pixel_distance",
+        "pixel_distance_threshold",
+        "pixel_magnitude_threshold",
+        "pixel_min_area",
+        "pixel_max_area",
     ]
     leading_columns = [column for column in leading_columns if column in dataframe]
     remaining_columns = [
@@ -628,6 +691,101 @@ def preprocess_iss_tile(
     return primary_image, scaled
 
 
+def _empty_pixel_decoding_table():
+    """Return a typed checkpoint table when no pixels survive decoder thresholds."""
+    columns = {
+        Features.SPOT_ID: "int64",
+        Axes.X.value: "int64",
+        Axes.Y.value: "int64",
+        Axes.ZPLANE.value: "int64",
+        "xc": "float64",
+        "yc": "float64",
+        "zc": "float64",
+        Features.TARGET: "object",
+        "candidate_target": "object",
+        "assignment_class": "object",
+        Features.PASSES_THRESHOLDS: "bool",
+        Features.DISTANCE: "float64",
+        "quality_minimum": "float64",
+        "quality_mean": "float64",
+        "quality_all_bases": "object",
+        "second_peak_ratio_min": "float64",
+        "second_peak_ratio_mean": "float64",
+        "second_peak_ratio_all_bases": "object",
+        "pixel_area": "float64",
+        "pixel_distance": "float64",
+        "pixel_distance_threshold": "float64",
+        "pixel_magnitude_threshold": "float64",
+        "pixel_min_area": "float64",
+        "pixel_max_area": "float64",
+        "decoder": "object",
+    }
+    return pd.DataFrame(
+        {name: pd.Series(dtype=dtype) for name, dtype in columns.items()}
+    )
+
+
+def ISS_pixel_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    pixel_kwargs=None,
+):
+    """Preprocess and decode every pixel with Starfish ``PixelSpotDecoder``."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+
+    settings = effective_pixel_kwargs(pixel_kwargs)
+    n_processes = settings.pop("n_processes")
+    decoder = DetectPixels.PixelSpotDecoder(codebook=codebook, **settings)
+    print("Decoding every pixel with Starfish PixelSpotDecoder")
+    try:
+        decoded, connected_components = decoder.run(
+            scaled,
+            n_processes=n_processes,
+        )
+    except ValueError as exc:
+        # Starfish 0.3.3 raises while unpacking an empty connected-component
+        # iterator when no pixels survive its magnitude and distance filters.
+        if "not enough values to unpack" not in str(exc):
+            raise
+        print("No pixels survived the pixel-decoding thresholds")
+        return _empty_pixel_decoding_table()
+
+    dataframe = QC_score_calc(decoded)
+    properties = connected_components.region_properties
+    if len(properties) != len(dataframe):
+        raise ValueError(
+            "Starfish pixel-decoding returned inconsistent component and table counts: "
+            f"{len(properties)} components versus {len(dataframe)} rows."
+        )
+
+    dataframe["pixel_area"] = [float(prop.area) for prop in properties]
+    dataframe["pixel_distance"] = dataframe[Features.DISTANCE].astype(float)
+    dataframe["pixel_distance_threshold"] = settings["distance_threshold"]
+    dataframe["pixel_magnitude_threshold"] = settings["magnitude_threshold"]
+    dataframe["pixel_min_area"] = settings["min_area"]
+    dataframe["pixel_max_area"] = settings["max_area"]
+    dataframe["candidate_target"] = dataframe[Features.TARGET]
+    dataframe["assignment_class"] = np.where(
+        dataframe[Features.PASSES_THRESHOLDS],
+        "gene",
+        "area_filtered",
+    )
+    dataframe["decoder"] = "starfish_pixel"
+    return dataframe
+
+
 def ISS_istdeco_pipeline(
     tile,
     codebook,
@@ -731,7 +889,7 @@ def ISS_pipeline(
 ):
     decode_mode = decode_mode.upper()
     spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
-    if decode_mode in {"ISTDECO", "BARDENSR", "GRAPHISS"}:
+    if decode_mode in {"PIXEL", "ISTDECO", "BARDENSR", "GRAPHISS"}:
         raise ValueError(
             f"{decode_mode} is a joint image-level detector/decoder. Use its "
             f"dedicated pipeline or process_experiment(decode_mode='{decode_mode}')."
@@ -789,7 +947,9 @@ def ISS_pipeline(
         per_channel_qc = []
 
         for ch in channels:
-            channel_ref = primary_image.sel({Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0})
+            channel_ref = primary_image.sel(
+                {Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0}
+            )
             print(f"Locating spots for channel {ch} with {spot_detection_mode}")
             spots = spot_detector.run(reference_image=channel_ref, image_stack=scaled)
 
@@ -797,7 +957,11 @@ def ISS_pipeline(
             df_qc["channel"] = ch
             per_channel_qc.append(df_qc)
 
-        return pd.concat(per_channel_qc, ignore_index=True) if per_channel_qc else pd.DataFrame()
+        return (
+            pd.concat(per_channel_qc, ignore_index=True)
+            if per_channel_qc
+            else pd.DataFrame()
+        )
 
     dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
     dots_max = dots.reduce({Axes.ZPLANE}, func="max")
@@ -828,6 +992,7 @@ def process_experiment(
     istdeco_kwargs=None,
     bardensr_kwargs=None,
     graphiss_kwargs=None,
+    pixel_kwargs=None,
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
@@ -838,10 +1003,11 @@ def process_experiment(
 
     input_dir = Path(input_dir)
     decode_mode = decode_mode.upper()
+    is_pixel = decode_mode == "PIXEL"
     is_istdeco = decode_mode == "ISTDECO"
     is_bardensr = decode_mode == "BARDENSR"
     is_graphiss = decode_mode == "GRAPHISS"
-    is_joint_decoder = is_istdeco or is_bardensr or is_graphiss
+    is_joint_decoder = is_pixel or is_istdeco or is_bardensr or is_graphiss
     if is_joint_decoder:
         requested_detector = str(spot_detection_mode).strip().lower()
         if requested_detector != "starfish":
@@ -850,11 +1016,13 @@ def process_experiment(
                 "do not combine it with spot_detection_mode."
             )
         spot_detection_mode = (
-            "istdeco_joint"
-            if is_istdeco
-            else "bardensr_joint"
-            if is_bardensr
-            else "graphiss_joint"
+            "starfish_pixel"
+            if is_pixel
+            else (
+                "istdeco_joint"
+                if is_istdeco
+                else "bardensr_joint" if is_bardensr else "graphiss_joint"
+            )
         )
     else:
         spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
@@ -871,15 +1039,13 @@ def process_experiment(
     bardensr_settings = (
         effective_bardensr_kwargs(bardensr_kwargs) if is_bardensr else {}
     )
-    bardensr_package_version = (
-        installed_bardensr_version() if is_bardensr else None
-    )
+    bardensr_package_version = installed_bardensr_version() if is_bardensr else None
     graphiss_settings = (
         effective_graphiss_kwargs(graphiss_kwargs) if is_graphiss else {}
     )
-    graphiss_package_version = (
-        installed_graphiss_version() if is_graphiss else None
-    )
+    graphiss_package_version = installed_graphiss_version() if is_graphiss else None
+    pixel_settings = effective_pixel_kwargs(pixel_kwargs) if is_pixel else {}
+    starfish_package_version = distribution_version("starfish") if is_pixel else None
     print(f"Processing directory: {input_dir}")
 
     run_id = timestamp_for_filename()
@@ -980,6 +1146,8 @@ def process_experiment(
         final_stem = (
             f"{region_name}_decoded_postcode"
             if is_postcode
+            else f"{region_name}_decoded_pixel"
+            if is_pixel
             else f"{region_name}_decoded_istdeco"
             if is_istdeco
             else f"{region_name}_decoded_bardensr"
@@ -1039,7 +1207,17 @@ def process_experiment(
                     spotiflow_kwargs=spotiflow_settings,
                 )
 
-            if is_istdeco:
+            if is_pixel:
+                pipeline_result = ISS_pixel_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    pixel_kwargs=pixel_settings,
+                )
+            elif is_istdeco:
                 pipeline_result = ISS_istdeco_pipeline(
                     tile,
                     experiment.codebook,
@@ -1231,9 +1409,21 @@ def process_experiment(
                 ET.SubElement(params_el, "graphiss_kwargs").text = json.dumps(
                     graphiss_settings, sort_keys=True, default=str
                 )
+            if is_pixel:
+                ET.SubElement(params_el, "starfish_version").text = str(
+                    starfish_package_version
+                )
+                ET.SubElement(params_el, "pixel_output_schema_version").text = (
+                    PIXEL_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "pixel_kwargs").text = json.dumps(
+                    pixel_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "coordinate_units").text = str(coordinate_units)
             ET.SubElement(params_el, "coordinate_pixel_to_um").text = (
-                "None" if coordinate_pixel_to_um is None else str(coordinate_pixel_to_um)
+                "None"
+                if coordinate_pixel_to_um is None
+                else str(coordinate_pixel_to_um)
             )
 
             tiles_el = ET.SubElement(root, "Tiles")
@@ -1256,11 +1446,19 @@ def process_experiment(
                     "schema_version": (
                         POSTCODE_OUTPUT_SCHEMA_VERSION
                         if is_postcode
-                        else ISTDECO_OUTPUT_SCHEMA_VERSION
-                        if is_istdeco
-                        else BARDENSR_OUTPUT_SCHEMA_VERSION
-                        if is_bardensr
-                        else GRAPHISS_OUTPUT_SCHEMA_VERSION
+                        else (
+                            PIXEL_OUTPUT_SCHEMA_VERSION
+                            if is_pixel
+                            else (
+                                ISTDECO_OUTPUT_SCHEMA_VERSION
+                                if is_istdeco
+                                else (
+                                    BARDENSR_OUTPUT_SCHEMA_VERSION
+                                    if is_bardensr
+                                    else GRAPHISS_OUTPUT_SCHEMA_VERSION
+                                )
+                            )
+                        )
                     ),
                     "run_id": run_id,
                     "created_at": datetime.now().astimezone().isoformat(),
@@ -1269,29 +1467,49 @@ def process_experiment(
                         "name": (
                             "postcode"
                             if is_postcode
-                            else "istdeco"
-                            if is_istdeco
-                            else "bardensr"
-                            if is_bardensr
-                            else "graphiss"
+                            else (
+                                "starfish_pixel"
+                                if is_pixel
+                                else (
+                                    "istdeco"
+                                    if is_istdeco
+                                    else "bardensr" if is_bardensr else "graphiss"
+                                )
+                            )
                         ),
                         "commit": (
                             POSTCODE_COMMIT
                             if is_postcode
-                            else ISTDECO_COMMIT
-                            if is_istdeco
-                            else BARDENSR_COMMIT
-                            if is_bardensr
-                            else GRAPHISS_COMMIT
+                            else (
+                                None
+                                if is_pixel
+                                else (
+                                    ISTDECO_COMMIT
+                                    if is_istdeco
+                                    else (
+                                        BARDENSR_COMMIT
+                                        if is_bardensr
+                                        else GRAPHISS_COMMIT
+                                    )
+                                )
+                            )
                         ),
                         "version": (
-                            None
-                            if is_postcode
-                            else istdeco_package_version
-                            if is_istdeco
-                            else bardensr_package_version
-                            if is_bardensr
-                            else graphiss_package_version
+                            starfish_package_version
+                            if is_pixel
+                            else (
+                                None
+                                if is_postcode
+                                else (
+                                    istdeco_package_version
+                                    if is_istdeco
+                                    else (
+                                        bardensr_package_version
+                                        if is_bardensr
+                                        else graphiss_package_version
+                                    )
+                                )
+                            )
                         ),
                     },
                     "paths": {
@@ -1337,6 +1555,9 @@ def process_experiment(
                         ),
                         "graphiss_kwargs": json.loads(
                             json.dumps(graphiss_settings, default=str)
+                        ),
+                        "pixel_kwargs": json.loads(
+                            json.dumps(pixel_settings, default=str)
                         ),
                         "coordinate_units": coordinate_units,
                         "coordinate_pixel_to_um": coordinate_pixel_to_um,

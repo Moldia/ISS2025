@@ -69,6 +69,52 @@ completed CSV-only Starfish runs are still recognized and skipped. Parquet is
 recommended for analysis because it preserves column types and per-round QC
 arrays; the CSV is intended as an interchange copy.
 
+## Starfish pixel-based decoding
+
+True pixel-based decoding is available with `decode_mode="PIXEL"`. This is
+different from `dense=True`: dense mode still detects discrete spots before
+decoding, whereas Starfish's `PixelSpotDecoder` compares every pixel trace with
+the SpaceTx codebook and then merges adjacent pixels assigned to the same target.
+
+A complete example is available in
+[`Notebooks/ISS_Pixel_decoding.ipynb`](Notebooks/ISS_Pixel_decoding.ipynb).
+
+```python
+from ISS_decoding.decoding import process_experiment
+
+process_experiment(
+    input_dir="/path/to/experiment",
+    regions_to_process=[1],
+    decode_mode="PIXEL",
+    masking_radius=7,
+    normalization_method="MH",
+    pixel_kwargs={
+        "metric": "euclidean",
+        "distance_threshold": 0.5,
+        "magnitude_threshold": 0.1,
+        "min_area": 2,
+        "max_area": 100,
+        "norm_order": 2,
+        "n_processes": 1,
+    },
+)
+```
+
+Pixel decoding is CPU- and RAM-intensive and Starfish materializes an indexed
+trace for every pixel. A 6000 x 6000 FOV with six rounds and five channels has
+about 4.3 GB of raw float32 pixel traces before temporary and indexed copies,
+so the preprocessing default tile size is not a safe first test. Start with
+512 x 512 or 1024 x 1024 SpaceTx FOVs and one region, then monitor peak memory
+before scaling up. Starfish's `n_processes` setting only controls connected-
+component attribute measurement; it does not provide GPU acceleration for the
+nearest-code search.
+
+The raw output retains components that fail the area filter and records
+`pixel_distance`, `pixel_area`, `passes_thresholds`, and the effective pixel
+thresholds. Results and restart checkpoints are written under
+`2_decoded_pixel/` as Parquet, with the usual region CSV compatibility copy and
+XML/JSON provenance manifests.
+
 ## Spotiflow detection
 
 Spotiflow can replace Starfish's blob detector while keeping registration,
@@ -111,6 +157,7 @@ Detector alternatives are stored separately so they can be compared safely:
 2_decoded_postcode_spotiflow/     # Spotiflow detector + PoSTcode decoder
 2_decoded_dense/                   # dense Starfish detection
 2_decoded_dense_spotiflow/        # dense Spotiflow detection
+2_decoded_pixel/                   # Starfish per-pixel decoding
 2_decoded_istdeco/                # joint ISTDECO detection + decoding
 2_decoded_bardensr/               # joint Bardensr detection + decoding
 2_decoded_graphiss/               # joint Graph-ISS detection + decoding
