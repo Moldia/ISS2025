@@ -36,7 +36,7 @@ conda env create --name ISS_decoding --file ISS_decoding/ISS_decoding.yml
 conda activate ISS_decoding
 
 # Install / reinstall the package (required after pulling updates)
-python -m pip install "./ISS_decoding[postcode,spotiflow,istdeco,bardensr]" --upgrade
+python -m pip install "./ISS_decoding[postcode,spotiflow,istdeco,bardensr,graphiss]" --upgrade
 
 # (Optional) Register a Jupyter kernel
 python -m ipykernel install --user --name ISS_decoding
@@ -113,6 +113,7 @@ Detector alternatives are stored separately so they can be compared safely:
 2_decoded_dense_spotiflow/        # dense Spotiflow detection
 2_decoded_istdeco/                # joint ISTDECO detection + decoding
 2_decoded_bardensr/               # joint Bardensr detection + decoding
+2_decoded_graphiss/               # joint Graph-ISS detection + decoding
 ```
 
 `prob_threshold` remains the PoSTcode assignment threshold. Spotiflow's
@@ -309,3 +310,71 @@ the PyTorch decoders. Verify both frameworks after installation, and avoid runni
 the PyTorch and TensorFlow decoders simultaneously when GPU memory is limited.
 See [`Notebooks/ISS_Bardensr_decoding.ipynb`](Notebooks/ISS_Bardensr_decoding.ipynb)
 for a complete pilot workflow and the optional SpaceTx formatting step.
+
+## Graph-ISS joint detection and decoding
+
+Graph-ISS is a graph-based image-level workflow: it detects candidate maxima in
+each sequencing round and channel, classifies 5 x 5 signal patches, links nearby
+candidates across rounds, and resolves paths using max-flow/min-cost decoding.
+It therefore bypasses Starfish/Spotiflow spot detection and Starfish/PoSTcode
+decoding. SpaceTx remains the common input to `ISS_decoding`; the adapter reads
+the image and one-hot codebook directly in `(rounds, channels, y, x)` and
+`(targets, rounds, channels)` order.
+
+The optional dependency is pinned to the tested modernized fork commit
+[`478387f`](https://github.com/mgcizzu/graph-iss/commit/478387f1bdb20084ab41fb5763976defd933a676).
+The fork provides a Python 3.10+ package and modern NetworkX/scikit-image API.
+It preserves the original trained signal-classifier weights, but performs
+mathematically equivalent NumPy inference rather than loading the obsolete
+Keras 2.1 serialization. Graph-ISS consequently adds no PyTorch or TensorFlow
+requirement.
+
+```python
+from ISS_decoding.decoding import process_experiment
+
+process_experiment(
+    input_dir="/path/to/experiment",
+    regions_to_process=[1],
+    decode_mode="GRAPHISS",
+    graphiss_kwargs={
+        "h": 0.05,
+        "radius": 3,
+        "candidate_probability_threshold": None,
+        "graph_radius": 3.0,
+        "transition_radius": 4.0,
+        "spatial_decay": 0.33,
+        "search_mode": "prior",       # or "blind" for unexpected sequences
+        "quality_distance_scale": 3.0,
+        "quality_threshold": None,
+        "min_signal_probability": None,
+        "max_distance": None,
+        "normalize_frames": True,
+        "z_projection": "max",
+    },
+)
+```
+
+`search_mode="prior"` restricts paths to sequences represented by the codebook.
+`search_mode="blind"` also retains unexpected sequences, labeling them
+`unexpected_sequence` with a `candidate_target` such as `sequence:0-2-1-3`.
+The following output columns are intended for data-dependent post-decoding QC:
+
+- `graphiss_signal_probability_min`, `_mean`, and `_sum`: original CNN signal
+  confidence along the selected multi-round path.
+- `graphiss_max_distance`: maximum spatial separation between path candidates,
+  in pixels.
+- `graphiss_transition_probability_product`: spatial continuity across
+  consecutive rounds.
+- `graphiss_spatial_quality`: the published log-distance penalty using
+  `quality_distance_scale`.
+- `graphiss_quality`: signal-probability sum multiplied by spatial quality.
+
+Optional cutoffs mark `passes_thresholds` and move rejected assignments from
+`target` to `candidate_target`; they do not delete rows. This keeps the complete
+result available for later CSV filtering. Outputs and run manifests are written
+under `decoding/2_decoded_graphiss/` using the same restartable Parquet plus CSV
+layout as ISTDECO and Bardensr.
+
+See [`Notebooks/ISS_GraphISS_decoding.ipynb`](Notebooks/ISS_GraphISS_decoding.ipynb)
+for the full pilot workflow, optional SpaceTx creation, blind-mode diagnostics,
+quality plots, and post-decoding filtering.

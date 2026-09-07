@@ -36,6 +36,11 @@ from .bardensr_adapter import (
     effective_bardensr_kwargs,
     installed_bardensr_version,
 )
+from .graphiss_adapter import (
+    decode_imagestack_with_graphiss,
+    effective_graphiss_kwargs,
+    installed_graphiss_version,
+)
 
 
 POSTCODE_COMMIT = "4db68cc5cc398128bcfd97a764bef3c98ee3c583"
@@ -44,6 +49,8 @@ ISTDECO_COMMIT = "2200b4e969528e46588fbe75b6b039f72cd962eb"
 ISTDECO_OUTPUT_SCHEMA_VERSION = "1.0"
 BARDENSR_COMMIT = "79cf8f9f1f28c8dbd00ab2dd948a214574948307"
 BARDENSR_OUTPUT_SCHEMA_VERSION = "1.0"
+GRAPHISS_COMMIT = "478387f1bdb20084ab41fb5763976defd933a676"
+GRAPHISS_OUTPUT_SCHEMA_VERSION = "1.0"
 POSTCODE_DEFAULT_KWARGS = {
     "num_iter": 60,
     "batch_size": 15000,
@@ -209,6 +216,8 @@ def decoding_output_subdir(decode_mode, dense, spot_detection_mode):
         return "2_decoded_istdeco"
     if decode_mode == "BARDENSR":
         return "2_decoded_bardensr"
+    if decode_mode == "GRAPHISS":
+        return "2_decoded_graphiss"
     mode = normalize_spot_detection_mode(spot_detection_mode)
     base = (
         "2_decoded_dense"
@@ -290,6 +299,17 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "bardensr_tile_max",
         "bardensr_tile",
         "bardensr_method",
+        "graphiss_sequence",
+        "graphiss_ambiguous_target",
+        "graphiss_signal_probability_sum",
+        "graphiss_signal_probability_mean",
+        "graphiss_signal_probability_min",
+        "graphiss_max_distance",
+        "graphiss_transition_probability_product",
+        "graphiss_spatial_quality",
+        "graphiss_quality",
+        "graphiss_search_mode",
+        "graphiss_path_candidate_indices",
     ]
     leading_columns = [column for column in leading_columns if column in dataframe]
     remaining_columns = [
@@ -545,6 +565,7 @@ def preprocess_iss_tile(
     register_dapi=True,
     masking_radius=15,
     channel_normalization="MH",
+    filter_images=True,
 ):
     """Load, optionally register, filter, and normalize one SpaceTx FOV."""
     print("Loading image planes")
@@ -579,12 +600,19 @@ def preprocess_iss_tile(
         warp = ApplyTransform.Warp()
         registered = warp.run(primary_image, transforms_list=transforms_list, in_place=False, verbose=True)
 
-        filt = Filter.WhiteTophat(masking_radius, is_volume=False)
-        filtered = filt.run(registered, verbose=True, in_place=False)
+        if filter_images:
+            filt = Filter.WhiteTophat(masking_radius, is_volume=False)
+            filtered = filt.run(registered, verbose=True, in_place=False)
+        else:
+            filtered = registered
     else:
-        print("Not registering images, applying filter to raw data")
-        filt = Filter.WhiteTophat(masking_radius, is_volume=False)
-        filtered = filt.run(primary_image, verbose=True, in_place=False)
+        if filter_images:
+            print("Not registering images, applying filter to raw data")
+            filt = Filter.WhiteTophat(masking_radius, is_volume=False)
+            filtered = filt.run(primary_image, verbose=True, in_place=False)
+        else:
+            print("Not registering images; Graph-ISS will apply its own top-hat filter")
+            filtered = primary_image
 
     print("Normalizing channel intensities")
     if channel_normalization == "MH":
@@ -654,6 +682,34 @@ def ISS_bardensr_pipeline(
     )
 
 
+def ISS_graphiss_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    graphiss_kwargs=None,
+):
+    """Preprocess and jointly detect/decode one SpaceTx FOV with Graph-ISS."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+        filter_images=False,
+    )
+    print("Joint spot detection and decoding with Graph-ISS")
+    return decode_imagestack_with_graphiss(
+        scaled,
+        codebook,
+        graphiss_kwargs=graphiss_kwargs,
+    )
+
+
 def ISS_pipeline(
     tile,
     codebook,
@@ -675,7 +731,7 @@ def ISS_pipeline(
 ):
     decode_mode = decode_mode.upper()
     spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
-    if decode_mode in {"ISTDECO", "BARDENSR"}:
+    if decode_mode in {"ISTDECO", "BARDENSR", "GRAPHISS"}:
         raise ValueError(
             f"{decode_mode} is a joint image-level detector/decoder. Use its "
             f"dedicated pipeline or process_experiment(decode_mode='{decode_mode}')."
@@ -771,6 +827,7 @@ def process_experiment(
     save_postcode_artifacts=False,
     istdeco_kwargs=None,
     bardensr_kwargs=None,
+    graphiss_kwargs=None,
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
@@ -783,7 +840,8 @@ def process_experiment(
     decode_mode = decode_mode.upper()
     is_istdeco = decode_mode == "ISTDECO"
     is_bardensr = decode_mode == "BARDENSR"
-    is_joint_decoder = is_istdeco or is_bardensr
+    is_graphiss = decode_mode == "GRAPHISS"
+    is_joint_decoder = is_istdeco or is_bardensr or is_graphiss
     if is_joint_decoder:
         requested_detector = str(spot_detection_mode).strip().lower()
         if requested_detector != "starfish":
@@ -792,7 +850,11 @@ def process_experiment(
                 "do not combine it with spot_detection_mode."
             )
         spot_detection_mode = (
-            "istdeco_joint" if is_istdeco else "bardensr_joint"
+            "istdeco_joint"
+            if is_istdeco
+            else "bardensr_joint"
+            if is_bardensr
+            else "graphiss_joint"
         )
     else:
         spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
@@ -811,6 +873,12 @@ def process_experiment(
     )
     bardensr_package_version = (
         installed_bardensr_version() if is_bardensr else None
+    )
+    graphiss_settings = (
+        effective_graphiss_kwargs(graphiss_kwargs) if is_graphiss else {}
+    )
+    graphiss_package_version = (
+        installed_graphiss_version() if is_graphiss else None
     )
     print(f"Processing directory: {input_dir}")
 
@@ -916,6 +984,8 @@ def process_experiment(
             if is_istdeco
             else f"{region_name}_decoded_bardensr"
             if is_bardensr
+            else f"{region_name}_decoded_graphiss"
+            if is_graphiss
             else f"{region_name}_decoded"
         )
         final_csv = decoded_dir / f"{final_stem}.csv"
@@ -988,6 +1058,16 @@ def process_experiment(
                     masking_radius=masking_radius,
                     channel_normalization=normalization_method,
                     bardensr_kwargs=bardensr_settings,
+                )
+            elif is_graphiss:
+                pipeline_result = ISS_graphiss_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    graphiss_kwargs=graphiss_settings,
                 )
             else:
                 pipeline_result = ISS_pipeline(
@@ -1140,6 +1220,17 @@ def process_experiment(
                 ET.SubElement(params_el, "bardensr_kwargs").text = json.dumps(
                     bardensr_settings, sort_keys=True, default=str
                 )
+            if is_graphiss:
+                ET.SubElement(params_el, "graphiss_version").text = str(
+                    graphiss_package_version
+                )
+                ET.SubElement(params_el, "graphiss_commit").text = GRAPHISS_COMMIT
+                ET.SubElement(params_el, "graphiss_output_schema_version").text = (
+                    GRAPHISS_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "graphiss_kwargs").text = json.dumps(
+                    graphiss_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "coordinate_units").text = str(coordinate_units)
             ET.SubElement(params_el, "coordinate_pixel_to_um").text = (
                 "None" if coordinate_pixel_to_um is None else str(coordinate_pixel_to_um)
@@ -1168,6 +1259,8 @@ def process_experiment(
                         else ISTDECO_OUTPUT_SCHEMA_VERSION
                         if is_istdeco
                         else BARDENSR_OUTPUT_SCHEMA_VERSION
+                        if is_bardensr
+                        else GRAPHISS_OUTPUT_SCHEMA_VERSION
                     ),
                     "run_id": run_id,
                     "created_at": datetime.now().astimezone().isoformat(),
@@ -1179,6 +1272,8 @@ def process_experiment(
                             else "istdeco"
                             if is_istdeco
                             else "bardensr"
+                            if is_bardensr
+                            else "graphiss"
                         ),
                         "commit": (
                             POSTCODE_COMMIT
@@ -1186,6 +1281,8 @@ def process_experiment(
                             else ISTDECO_COMMIT
                             if is_istdeco
                             else BARDENSR_COMMIT
+                            if is_bardensr
+                            else GRAPHISS_COMMIT
                         ),
                         "version": (
                             None
@@ -1193,6 +1290,8 @@ def process_experiment(
                             else istdeco_package_version
                             if is_istdeco
                             else bardensr_package_version
+                            if is_bardensr
+                            else graphiss_package_version
                         ),
                     },
                     "paths": {
@@ -1235,6 +1334,9 @@ def process_experiment(
                         ),
                         "bardensr_kwargs": json.loads(
                             json.dumps(bardensr_settings, default=str)
+                        ),
+                        "graphiss_kwargs": json.loads(
+                            json.dumps(graphiss_settings, default=str)
                         ),
                         "coordinate_units": coordinate_units,
                         "coordinate_pixel_to_um": coordinate_pixel_to_um,
