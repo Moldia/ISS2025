@@ -14,6 +14,7 @@ from datetime import datetime
 # Third-party
 import numpy as np
 import pandas as pd
+from skimage.exposure import match_histograms
 
 # Starfish
 from starfish import Experiment, FieldOfView
@@ -157,6 +158,79 @@ def installed_spotiflow_version():
         return distribution_version("spotiflow")
     except PackageNotFoundError:
         return None
+
+
+def _mean_sorted_histogram_reference(image_stack, group_by):
+    """Calculate Starfish's histogram reference without xarray MultiIndex operations."""
+    data = image_stack.xarray
+    group_dimensions = tuple(
+        dimension
+        for dimension in data.dims
+        if any(dimension == axis.value for axis in group_by)
+    )
+    if len(group_dimensions) != len(group_by):
+        missing = sorted(
+            {axis.value for axis in group_by} - set(group_dimensions)
+        )
+        raise ValueError(
+            "Cannot histogram-match an ImageStack without dimensions: "
+            + ", ".join(missing)
+        )
+
+    chunk_dimensions = tuple(
+        dimension for dimension in data.dims if dimension not in group_dimensions
+    )
+    ordered = np.asarray(
+        data.transpose(*group_dimensions, *chunk_dimensions).data
+    )
+    group_shape = ordered.shape[: len(group_dimensions)]
+    chunk_shape = ordered.shape[len(group_dimensions) :]
+    values_per_chunk = int(np.prod(chunk_shape, dtype=np.int64))
+    accumulator_dtype = np.result_type(ordered.dtype, np.float32)
+    reference = np.zeros(values_per_chunk, dtype=accumulator_dtype)
+
+    number_of_chunks = 0
+    for group_index in np.ndindex(group_shape):
+        sorted_chunk = np.sort(np.asarray(ordered[group_index]).reshape(-1))
+        np.add(reference, sorted_chunk, out=reference, casting="unsafe")
+        number_of_chunks += 1
+
+    if number_of_chunks == 0:
+        raise ValueError("Cannot histogram-match an empty ImageStack.")
+    reference /= number_of_chunks
+    return reference.reshape(chunk_shape)
+
+
+def _match_histogram_chunk(image, reference):
+    """Match one ImageStack chunk to a precomputed reference distribution."""
+    return match_histograms(np.asarray(image), reference=np.asarray(reference))
+
+
+def match_histograms_compatible(
+    image_stack,
+    *,
+    group_by=None,
+    n_processes=1,
+):
+    """Run Starfish-equivalent histogram matching without xarray stacking.
+
+    Starfish 0.3.x constructs two xarray MultiIndexes while calculating the
+    reference distribution.  That path can fail when old xarray releases are
+    combined with recent pandas releases, especially on large SpaceTx tiles.
+    Computing the same mean sorted distribution directly from the image values
+    avoids that dependency-sensitive indexing operation.
+    """
+    if group_by is None:
+        group_by = {Axes.CH, Axes.ROUND}
+    group_by = set(group_by)
+    reference = _mean_sorted_histogram_reference(image_stack, group_by)
+    return image_stack.apply(
+        _match_histogram_chunk,
+        reference,
+        group_by=group_by,
+        n_processes=n_processes,
+        in_place=False,
+    )
 
 
 def effective_pixel_kwargs(overrides=None):
@@ -679,15 +753,19 @@ def preprocess_iss_tile(
 
     print("Normalizing channel intensities")
     if channel_normalization == "MH":
-        sbp = Filter.MatchHistograms({Axes.CH, Axes.ROUND})
+        scaled = match_histograms_compatible(
+            filtered,
+            group_by={Axes.CH, Axes.ROUND},
+            n_processes=1,
+        )
     else:
         sbp = Filter.ClipPercentileToZero(
             p_min=80,
             p_max=99.999,
             level_method=Levels.SCALE_BY_CHUNK,
         )
+        scaled = sbp.run(filtered, n_processes=1, in_place=False)
 
-    scaled = sbp.run(filtered, n_processes=1, in_place=False)
     return primary_image, scaled
 
 

@@ -142,9 +142,9 @@ def test_iss_pipeline_uses_the_supplied_spotiflow_detector(monkeypatch):
 
     monkeypatch.setattr(decoding.Filter, "WhiteTophat", lambda *_args, **_kwargs: FakeFilter())
     monkeypatch.setattr(
-        decoding.Filter,
-        "MatchHistograms",
-        lambda *_args, **_kwargs: FakeFilter(),
+        decoding,
+        "match_histograms_compatible",
+        lambda stack, **_kwargs: stack,
     )
     monkeypatch.setattr(
         decoding,
