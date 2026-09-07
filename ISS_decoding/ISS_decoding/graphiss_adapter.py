@@ -24,6 +24,9 @@ GRAPHISS_DEFAULT_KWARGS = {
     "max_distance": None,
     "normalize_frames": True,
     "z_projection": "max",
+    "verbose": True,
+    "max_candidates": None,
+    "max_component_size": None,
 }
 
 
@@ -105,6 +108,23 @@ def effective_graphiss_kwargs(overrides=None):
     if z_projection not in {"max", "mean"}:
         raise ValueError("Graph-ISS 'z_projection' must be 'max' or 'mean'.")
     settings["z_projection"] = z_projection
+
+    if not isinstance(settings["verbose"], (bool, np.bool_)):
+        raise ValueError("Graph-ISS 'verbose' must be boolean.")
+    settings["verbose"] = bool(settings["verbose"])
+
+    for name in ("max_candidates", "max_component_size"):
+        value = settings[name]
+        if value is not None:
+            if (
+                not isinstance(value, (int, np.integer))
+                or isinstance(value, (bool, np.bool_))
+                or value < 1
+            ):
+                raise ValueError(
+                    f"Graph-ISS '{name}' must be a positive integer or None."
+                )
+            settings[name] = int(value)
     return settings
 
 
@@ -252,9 +272,15 @@ def decode_graphiss_array(images, barcodes, target_names, *, settings):
         spatial_decay=settings["spatial_decay"],
         search_mode=settings["search_mode"],
         quality_distance_scale=settings["quality_distance_scale"],
+        verbose=settings["verbose"],
+        max_candidates=settings["max_candidates"],
+        max_component_size=settings["max_component_size"],
     )
+    diagnostics = dict(raw.attrs.get("diagnostics", {}))
     if raw.empty:
-        return _empty_decoded_table()
+        result = _empty_decoded_table()
+        result.attrs["graphiss_diagnostics"] = diagnostics
+        return result
 
     result = pd.DataFrame(
         {
@@ -314,6 +340,7 @@ def decode_graphiss_array(images, barcodes, target_names, *, settings):
     result["xc"] = np.nan
     result["yc"] = np.nan
     result["zc"] = np.nan
+    result.attrs["graphiss_diagnostics"] = diagnostics
     return result
 
 

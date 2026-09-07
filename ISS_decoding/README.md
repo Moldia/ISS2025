@@ -368,8 +368,8 @@ decoding. SpaceTx remains the common input to `ISS_decoding`; the adapter reads
 the image and one-hot codebook directly in `(rounds, channels, y, x)` and
 `(targets, rounds, channels)` order.
 
-The optional dependency is pinned to the tested modernized fork commit
-[`478387f`](https://github.com/mgcizzu/graph-iss/commit/478387f1bdb20084ab41fb5763976defd933a676).
+The optional dependency is pinned to the tested optimized fork commit
+[`cc3dbeb`](https://github.com/mgcizzu/graph-iss/commit/cc3dbeb1aee785ab1f7c671c1296c62e6b34d42a).
 The fork provides a Python 3.10+ package and modern NetworkX/scikit-image API.
 It preserves the original trained signal-classifier weights, but performs
 mathematically equivalent NumPy inference rather than loading the obsolete
@@ -397,9 +397,17 @@ process_experiment(
         "max_distance": None,
         "normalize_frames": True,
         "z_projection": "max",
+        "verbose": True,
+        "max_candidates": None,
+        "max_component_size": None,
     },
 )
 ```
+
+The optimized build reports raw and retained candidate counts, per-round
+timing, spatial graph size, largest connected component, and graph-decoding
+time. `max_candidates` and `max_component_size` are optional safety limits that
+stop unexpectedly dense tiles before a pathological graph solve.
 
 `search_mode="prior"` restricts paths to sequences represented by the codebook.
 `search_mode="blind"` also retains unexpected sequences, labeling them

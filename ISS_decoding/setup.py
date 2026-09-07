@@ -6,7 +6,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="ISS_decoding",
-    version="0.0.32",
+    version="0.0.33",
     author="Marco Grillo",
     author_email="marco.grillo@scilifelab.se",
     description="Decode preprocessed ISS images, including SpaceTx formatting and plotting",
@@ -42,7 +42,7 @@ setup(
             "bardensr @ git+https://github.com/mgcizzu/bardensr.git@79cf8f9f1f28c8dbd00ab2dd948a214574948307",
         ],
         "graphiss": [
-            "graph-iss @ git+https://github.com/mgcizzu/graph-iss.git@478387f1bdb20084ab41fb5763976defd933a676",
+            "graph-iss @ git+https://github.com/mgcizzu/graph-iss.git@cc3dbeb1aee785ab1f7c671c1296c62e6b34d42a",
         ],
     },
     keywords=[
