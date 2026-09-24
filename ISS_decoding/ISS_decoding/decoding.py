@@ -425,6 +425,7 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "istdeco_quality",
         "istdeco_intensity_threshold",
         "istdeco_tile",
+        "istdeco_is_fake_barcode",
         "bardensr_evidence",
         "bardensr_peak_threshold",
         "bardensr_tile_max",

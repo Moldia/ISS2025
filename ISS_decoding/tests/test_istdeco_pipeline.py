@@ -60,6 +60,7 @@ def test_istdeco_process_is_restartable_and_records_provenance(monkeypatch, tmp_
                 "istdeco_quality": [0.7],
                 "istdeco_intensity_threshold": [0.2],
                 "istdeco_tile": ["0_0"],
+                "istdeco_is_fake_barcode": [False],
                 "decoder": ["istdeco"],
                 "spot_detector": ["istdeco_joint"],
             }
@@ -71,6 +72,8 @@ def test_istdeco_process_is_restartable_and_records_provenance(monkeypatch, tmp_
         "tile_size": (256, 256),
         "niter": 2,
         "device": "cpu",
+        "fake_barcode_fraction": 0.1,
+        "fake_barcode_seed": 17,
     }
 
     decoding.process_experiment(
@@ -103,6 +106,9 @@ def test_istdeco_process_is_restartable_and_records_provenance(monkeypatch, tmp_
     assert parameters.findtext("istdeco_version") == "0.1.0"
     assert parameters.findtext("istdeco_commit") == decoding.ISTDECO_COMMIT
     assert json.loads(parameters.findtext("istdeco_kwargs"))["tile_size"] == [256, 256]
+    assert json.loads(parameters.findtext("istdeco_kwargs"))[
+        "fake_barcode_fraction"
+    ] == 0.1
 
     manifest_path = next(output_dir.glob("decoding_run_*.json"))
     manifest = json.loads(manifest_path.read_text())
@@ -113,6 +119,7 @@ def test_istdeco_process_is_restartable_and_records_provenance(monkeypatch, tmp_
     }
     assert manifest["tiles"] == {"done": 2, "remaining": 0, "total": 2}
     assert manifest["rows"] == 2
+    assert manifest["parameters"]["istdeco_kwargs"]["fake_barcode_seed"] == 17
 
     monkeypatch.setattr(
         decoding,

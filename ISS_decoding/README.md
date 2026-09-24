@@ -281,6 +281,8 @@ process_experiment(
         "quality_threshold": 0.5,
         "device": "auto",           # CUDA when available, otherwise CPU
         "z_projection": "max",
+        "fake_barcode_fraction": 0.10, # add 10% unused negative-control codes
+        "fake_barcode_seed": 0,        # reproducible controls across tiles/runs
     },
 )
 ```
@@ -291,7 +293,14 @@ seams while bounding GPU memory. Dense barcode intensity and quality images are
 not saved by default because they can be extremely large. The spot table stores
 `istdeco_intensity`, `istdeco_quality`, the actual intensity threshold, and the
 internal `istdeco_tile`; quality is the algorithm's filtering score, not a
-calibrated probability.
+calibrated probability. When `fake_barcode_fraction` is greater than zero,
+unused one-hot codewords are generated in memory and appended only for the
+ISTDECO run; the SpaceTx codebook on disk is unchanged. A value of `0.10`
+requests controls equal to 10% of the true targets, rounded up. Calls assigned
+to these biologically absent controls have `assignment_class="fake_barcode"`
+and `istdeco_is_fake_barcode=True`, making them directly countable as empirical
+false-positive calls. Generated controls are unique, never duplicate a true
+barcode, and are reproducible under `fake_barcode_seed`.
 
 Outputs use restartable per-FOV Parquet checkpoints plus region-level Parquet
 and CSV copies under `decoding/2_decoded_istdeco/`. Exact settings, package

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version as distribution_version
+from itertools import product
 from math import ceil
 
 import numpy as np
@@ -25,7 +26,11 @@ ISTDECO_DEFAULT_KWARGS = {
     "quality_threshold": 0.5,
     "device": "auto",
     "z_projection": "max",
+    "fake_barcode_fraction": 0.0,
+    "fake_barcode_seed": 0,
 }
+
+ISTDECO_FAKE_BARCODE_PREFIX = "__istdeco_fake_barcode_"
 
 
 def installed_istdeco_version():
@@ -141,6 +146,34 @@ def effective_istdeco_kwargs(overrides=None):
     if z_projection not in {"max", "mean"}:
         raise ValueError("ISTDECO 'z_projection' must be 'max' or 'mean'.")
     settings["z_projection"] = z_projection
+
+    fake_fraction = settings["fake_barcode_fraction"]
+    if isinstance(fake_fraction, (bool, np.bool_)):
+        raise ValueError(
+            "ISTDECO 'fake_barcode_fraction' must be finite and non-negative."
+        )
+    try:
+        fake_fraction = float(fake_fraction)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "ISTDECO 'fake_barcode_fraction' must be finite and non-negative."
+        ) from exc
+    if not np.isfinite(fake_fraction) or fake_fraction < 0:
+        raise ValueError(
+            "ISTDECO 'fake_barcode_fraction' must be finite and non-negative."
+        )
+    settings["fake_barcode_fraction"] = fake_fraction
+
+    fake_seed = settings["fake_barcode_seed"]
+    if (
+        not isinstance(fake_seed, (int, np.integer))
+        or isinstance(fake_seed, (bool, np.bool_))
+        or fake_seed < 0
+    ):
+        raise ValueError(
+            "ISTDECO 'fake_barcode_seed' must be a non-negative integer."
+        )
+    settings["fake_barcode_seed"] = int(fake_seed)
     return settings
 
 
@@ -169,6 +202,85 @@ def format_spacetx_codebook_for_istdeco(codebook):
 
     target_names = np.asarray(ordered.coords[Features.TARGET].values).astype(str)
     return barcodes, target_names
+
+
+def augment_istdeco_codebook_with_fake_barcodes(
+    barcodes,
+    target_names,
+    *,
+    fraction=0.0,
+    seed=0,
+):
+    """Append reproducible unused one-hot codewords as negative controls.
+
+    ``fraction`` is relative to the number of true targets: ``0.10`` requests
+    fake barcodes equal to 10% of the true codebook, rounded up.  Fake
+    codewords are sampled without replacement and can never duplicate a true
+    codeword or another generated control.
+    """
+    barcodes = np.asarray(barcodes, dtype=np.float32)
+    target_names = np.asarray(target_names).astype(str)
+    if barcodes.ndim != 3:
+        raise ValueError("ISTDECO barcodes must have shape (codes, rounds, channels).")
+    if target_names.shape != (barcodes.shape[0],):
+        raise ValueError("ISTDECO target names must contain one value per barcode.")
+
+    fraction = float(fraction)
+    fake_count = int(ceil(len(barcodes) * fraction)) if fraction > 0 else 0
+    if fake_count == 0:
+        return barcodes, target_names, np.zeros(len(barcodes), dtype=bool)
+
+    active_per_round = barcodes.sum(axis=2)
+    if not np.allclose(active_per_round, 1) or not np.all(
+        np.isclose(barcodes, 0) | np.isclose(barcodes, 1)
+    ):
+        raise ValueError(
+            "ISTDECO fake barcode generation requires exactly one active channel "
+            "for every true barcode and round."
+        )
+
+    rounds, channels = barcodes.shape[1:]
+    true_sequences = {
+        tuple(sequence)
+        for sequence in barcodes.argmax(axis=2).astype(int)
+    }
+    unused_sequences = [
+        sequence
+        for sequence in product(range(channels), repeat=rounds)
+        if sequence not in true_sequences
+    ]
+    if fake_count > len(unused_sequences):
+        raise ValueError(
+            f"Requested {fake_count} ISTDECO fake barcodes, but only "
+            f"{len(unused_sequences)} unused codewords exist for {rounds} rounds "
+            f"and {channels} channels."
+        )
+
+    rng = np.random.default_rng(seed)
+    selected = rng.choice(len(unused_sequences), size=fake_count, replace=False)
+    fake_barcodes = np.zeros((fake_count, rounds, channels), dtype=np.float32)
+    for fake_index, sequence_index in enumerate(np.atleast_1d(selected)):
+        sequence = unused_sequences[int(sequence_index)]
+        fake_barcodes[fake_index, np.arange(rounds), sequence] = 1
+
+    existing_names = set(target_names.tolist())
+    fake_names = []
+    name_index = 1
+    while len(fake_names) < fake_count:
+        candidate = f"{ISTDECO_FAKE_BARCODE_PREFIX}{name_index:04d}"
+        if candidate not in existing_names:
+            fake_names.append(candidate)
+        name_index += 1
+
+    augmented_barcodes = np.concatenate((barcodes, fake_barcodes), axis=0)
+    augmented_names = np.concatenate((target_names, np.asarray(fake_names)))
+    fake_mask = np.concatenate(
+        (
+            np.zeros(len(barcodes), dtype=bool),
+            np.ones(fake_count, dtype=bool),
+        )
+    )
+    return augmented_barcodes, augmented_names, fake_mask
 
 
 def format_spacetx_image_for_istdeco(image_stack, z_projection="max"):
@@ -258,6 +370,7 @@ def _empty_decoded_table():
         "istdeco_quality": "float64",
         "istdeco_intensity_threshold": "float64",
         "istdeco_tile": "object",
+        "istdeco_is_fake_barcode": "bool",
         "decoder": "object",
         "spot_detector": "object",
     }
@@ -287,6 +400,15 @@ def decode_istdeco_array(images, barcodes, target_names, *, settings):
         raise ValueError("ISTDECO images must contain finite, non-negative values.")
 
     settings = effective_istdeco_kwargs(settings)
+    true_barcode_count = len(barcodes)
+    barcodes, target_names, fake_barcode_mask = (
+        augment_istdeco_codebook_with_fake_barcodes(
+            barcodes,
+            target_names,
+            fraction=settings["fake_barcode_fraction"],
+            seed=settings["fake_barcode_seed"],
+        )
+    )
     threshold = settings["intensity_threshold"]
     if threshold is None:
         threshold = float(np.percentile(images, settings["intensity_percentile"]))
@@ -345,6 +467,7 @@ def decode_istdeco_array(images, barcodes, target_names, *, settings):
                 local_y[owned],
                 local_x[owned],
             ):
+                is_fake_barcode = bool(fake_barcode_mask[code])
                 rows.append(
                     {
                         Axes.X.value: x_value,
@@ -353,11 +476,14 @@ def decode_istdeco_array(images, barcodes, target_names, *, settings):
                         Features.TARGET: target_names[code],
                         "candidate_target": target_names[code],
                         "target_id": int(code),
-                        "assignment_class": "gene",
+                        "assignment_class": (
+                            "fake_barcode" if is_fake_barcode else "gene"
+                        ),
                         Features.PASSES_THRESHOLDS: True,
                         "istdeco_intensity": float(intensity[code, local_y_value, local_x_value]),
                         "istdeco_quality": float(quality[code, local_y_value, local_x_value]),
                         "istdeco_tile": f"{row_index}_{column_index}",
+                        "istdeco_is_fake_barcode": is_fake_barcode,
                         "decoder": "istdeco",
                         "spot_detector": "istdeco_joint",
                     }
@@ -374,6 +500,11 @@ def decode_istdeco_array(images, barcodes, target_names, *, settings):
     result["istdeco_intensity_threshold"] = threshold
     result.attrs["istdeco_intensity_threshold"] = threshold
     result.attrs["istdeco_device"] = device
+    result.attrs["istdeco_true_barcode_count"] = true_barcode_count
+    result.attrs["istdeco_fake_barcode_count"] = int(fake_barcode_mask.sum())
+    result.attrs["istdeco_fake_barcode_fraction"] = settings[
+        "fake_barcode_fraction"
+    ]
     return result
 
 
