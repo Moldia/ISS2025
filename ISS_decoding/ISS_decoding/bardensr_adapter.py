@@ -12,6 +12,12 @@ import pandas as pd
 
 from starfish.types import Axes, Coordinates, Features
 
+from .barcode_controls import (
+    FAKE_BARCODE_DEFAULTS,
+    augment_one_hot_barcodes,
+    validate_fake_barcode_settings,
+)
+
 
 BARDENSR_DEFAULT_KWARGS = {
     "method": "singleshot",
@@ -30,6 +36,7 @@ BARDENSR_DEFAULT_KWARGS = {
     "estimate_phasing": False,
     "device": "auto",
     "z_projection": "max",
+    **FAKE_BARCODE_DEFAULTS,
 }
 
 
@@ -177,7 +184,7 @@ def effective_bardensr_kwargs(overrides=None):
     if z_projection not in {"max", "mean"}:
         raise ValueError("Bardensr 'z_projection' must be 'max' or 'mean'.")
     settings["z_projection"] = z_projection
-    return settings
+    return validate_fake_barcode_settings(settings, "Bardensr")
 
 
 def format_spacetx_codebook_for_bardensr(codebook):
@@ -313,6 +320,7 @@ def _empty_decoded_table():
         "bardensr_tile_max": "float64",
         "bardensr_tile": "object",
         "bardensr_method": "object",
+        "is_fake_barcode": "bool",
         "decoder": "object",
         "spot_detector": "object",
     }
@@ -346,6 +354,18 @@ def decode_bardensr_array(images, codebook, target_names, *, rounds, settings):
         raise ValueError("Bardensr images must contain finite, non-negative values.")
 
     settings = effective_bardensr_kwargs(settings)
+    true_barcode_count = codebook.shape[1]
+    channels = images.shape[0] // rounds
+    target_barcodes = codebook.reshape(rounds, channels, -1).transpose(2, 0, 1)
+    target_barcodes, target_names, fake_barcode_mask = augment_one_hot_barcodes(
+        target_barcodes,
+        target_names,
+        fraction=settings["fake_barcode_fraction"],
+        seed=settings["fake_barcode_seed"],
+    )
+    codebook = target_barcodes.transpose(1, 2, 0).reshape(
+        images.shape[0], -1
+    )
     if settings["normalize_frames"]:
         images = _normalize_frames(images)
 
@@ -404,6 +424,7 @@ def decode_bardensr_array(images, codebook, target_names, *, rounds, settings):
                 local_y = int(peak.m1)
                 local_x = int(peak.m2)
                 target_id = int(peak.j)
+                is_fake_barcode = bool(fake_barcode_mask[target_id])
                 global_y = read_y0 + local_y
                 global_x = read_x0 + local_x
                 if not (
@@ -419,7 +440,9 @@ def decode_bardensr_array(images, codebook, target_names, *, rounds, settings):
                         Features.TARGET: target_names[target_id],
                         "candidate_target": target_names[target_id],
                         "target_id": target_id,
-                        "assignment_class": "gene",
+                        "assignment_class": (
+                            "fake_barcode" if is_fake_barcode else "gene"
+                        ),
                         Features.PASSES_THRESHOLDS: True,
                         "bardensr_evidence": float(
                             density[local_z, local_y, local_x, target_id]
@@ -428,6 +451,7 @@ def decode_bardensr_array(images, codebook, target_names, *, rounds, settings):
                         "bardensr_tile_max": tile_max,
                         "bardensr_tile": f"{row_index}_{column_index}",
                         "bardensr_method": settings["method"],
+                        "is_fake_barcode": is_fake_barcode,
                         "decoder": "bardensr",
                         "spot_detector": "bardensr_joint",
                     }
@@ -443,6 +467,11 @@ def decode_bardensr_array(images, codebook, target_names, *, rounds, settings):
         result["zc"] = np.nan
     result.attrs["bardensr_device"] = device
     result.attrs["bardensr_method"] = settings["method"]
+    result.attrs["bardensr_true_barcode_count"] = true_barcode_count
+    result.attrs["bardensr_fake_barcode_count"] = int(fake_barcode_mask.sum())
+    result.attrs["bardensr_fake_barcode_fraction"] = settings[
+        "fake_barcode_fraction"
+    ]
     return result
 
 

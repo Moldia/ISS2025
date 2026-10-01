@@ -145,6 +145,53 @@ def test_tiling_crops_halos_and_avoids_duplicate_seam_spots(monkeypatch):
     assert result.loc[0, "y"] == 4
 
 
+def test_bardensr_fake_calls_are_marked(monkeypatch):
+    class FakeSpotCalling:
+        @staticmethod
+        def estimate_density_singleshot(image, codebook, noisefloor):
+            del noisefloor
+            density = np.zeros((*image.shape[1:], codebook.shape[1]), dtype=np.float32)
+            density[0, 2, 3, -1] = 0.9
+            return density
+
+        @staticmethod
+        def find_peaks(density, thresh, poolsize):
+            del poolsize
+            z, y, x, target = np.where(density > thresh)
+            return pd.DataFrame({"m0": z, "m1": y, "m2": x, "j": target})
+
+    fake_bardensr = SimpleNamespace(spot_calling=FakeSpotCalling())
+    fake_tf = SimpleNamespace(
+        config=SimpleNamespace(list_physical_devices=lambda _kind: []),
+        device=lambda _device: nullcontext(),
+    )
+    monkeypatch.setattr(
+        bardensr_adapter,
+        "_load_bardensr_runtime",
+        lambda: (fake_bardensr, fake_tf),
+    )
+
+    result = bardensr_adapter.decode_bardensr_array(
+        np.ones((4, 1, 6, 7), dtype=np.float32),
+        np.array([[1, 0], [0, 1], [1, 0], [0, 1]], dtype=np.float32),
+        np.array(["gene_a", "gene_b"]),
+        rounds=2,
+        settings={
+            "tile_size": (8, 8),
+            "overlap": 0,
+            "peak_threshold": 0.5,
+            "fake_barcode_fraction": 0.5,
+            "fake_barcode_seed": 7,
+        },
+    )
+
+    assert len(result) == 1
+    assert result.loc[0, "target"] == "__fake_barcode_0001"
+    assert result.loc[0, "assignment_class"] == "fake_barcode"
+    assert bool(result.loc[0, "is_fake_barcode"])
+    assert result.attrs["bardensr_fake_barcode_count"] == 1
+
+
 def test_imagestack_decoder_adds_physical_coordinates(monkeypatch):
     monkeypatch.setattr(
         bardensr_adapter,

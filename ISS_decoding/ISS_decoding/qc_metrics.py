@@ -4,6 +4,57 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 
+def estimate_fake_barcode_fdr(reads: pd.DataFrame, accepted_only: bool = True):
+    """Estimate false discovery rate from generated negative-control barcodes.
+
+    The estimate scales observed fake calls by the ratio of real to fake
+    codewords, then divides by accepted real-target calls. Pass an already
+    filtered table to estimate FDR at a custom quality/intensity threshold.
+    """
+    required = {
+        "is_fake_barcode",
+        "barcode_control_true_count",
+        "barcode_control_fake_count",
+    }
+    missing = sorted(required - set(reads.columns))
+    if missing:
+        raise KeyError(f"Missing fake-barcode control column(s): {missing}")
+
+    evaluated = reads
+    if accepted_only and "passes_thresholds" in evaluated:
+        evaluated = evaluated[evaluated["passes_thresholds"].fillna(False).astype(bool)]
+
+    true_counts = reads["barcode_control_true_count"].dropna().astype(int).unique()
+    fake_counts = reads["barcode_control_fake_count"].dropna().astype(int).unique()
+    if len(true_counts) != 1 or len(fake_counts) != 1:
+        raise ValueError(
+            "Input rows must come from runs with one consistent true/fake codebook size."
+        )
+    true_barcode_count = int(true_counts[0])
+    fake_barcode_count = int(fake_counts[0])
+    if fake_barcode_count <= 0:
+        raise ValueError("No fake barcodes were configured for this decoding run.")
+
+    fake_calls = int(evaluated["is_fake_barcode"].fillna(False).astype(bool).sum())
+    real_calls = int(len(evaluated) - fake_calls)
+    estimated_false_calls = fake_calls * true_barcode_count / fake_barcode_count
+    estimated_fdr = (
+        min(1.0, estimated_false_calls / real_calls)
+        if real_calls > 0
+        else (1.0 if fake_calls > 0 else np.nan)
+    )
+    return pd.Series(
+        {
+            "accepted_real_calls": real_calls,
+            "accepted_fake_calls": fake_calls,
+            "true_barcode_count": true_barcode_count,
+            "fake_barcode_count": fake_barcode_count,
+            "estimated_false_calls": float(estimated_false_calls),
+            "estimated_fdr": float(estimated_fdr),
+        }
+    )
+
+
 def quality_per_gene(
     reads: pd.DataFrame,
     on: str = 'quality_mean',

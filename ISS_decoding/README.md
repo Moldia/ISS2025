@@ -69,6 +69,51 @@ completed CSV-only Starfish runs are still recognized and skipped. Parquet is
 recommended for analysis because it preserves column types and per-round QC
 arrays; the CSV is intended as an interchange copy.
 
+## Shared fake-barcode controls and empirical FDR
+
+Every decoder can append reproducible, unused one-hot codewords in memory. The
+SpaceTx codebook on disk is never modified. Set the same fraction and seed for
+each method so Starfish PRMC/MD, Starfish pixel decoding, PoSTcode, ISTDECO,
+Bardensr, and Graph-ISS are evaluated against the same negative controls:
+
+```python
+# PRMC or MD
+starfish_kwargs={
+    "fake_barcode_fraction": 0.10,
+    "fake_barcode_seed": 0,
+}
+
+# Use the same two entries in postcode_kwargs, pixel_kwargs,
+# istdeco_kwargs, bardensr_kwargs, or graphiss_kwargs.
+```
+
+`0.10` requests controls equal to 10% of the real targets, rounded up. Generated
+codes never duplicate a real target or one another. If the real codebook already
+occupies the complete code space, generation stops with an explicit error.
+
+All output tables include `is_fake_barcode`; accepted control calls also have
+`assignment_class="fake_barcode"`. The repeated
+`barcode_control_true_count`, `barcode_control_fake_count`, and
+`barcode_control_fraction` columns make a threshold-specific empirical FDR easy
+to calculate:
+
+```python
+accepted = decoded[decoded["passes_thresholds"]].copy()
+# Optionally apply the decoder-specific score threshold being evaluated here.
+
+from ISS_decoding.qc_metrics import estimate_fake_barcode_fdr
+fdr_summary = estimate_fake_barcode_fdr(accepted, accepted_only=False)
+print(fdr_summary)
+```
+
+Interpret this as an empirical calibration diagnostic, not a formal guarantee:
+barcode composition, Hamming distance, expression abundance, and image artefacts
+can make different codewords unequally likely to be called.
+
+Use a fresh `output_dir_prefix` for every control seed, fraction, or decoder
+threshold sweep. Restart checkpoints are intentionally reused within an output
+directory and must not be mixed across parameter configurations.
+
 ## Starfish pixel-based decoding
 
 True pixel-based decoding is available with `decode_mode="PIXEL"`. This is
@@ -96,6 +141,8 @@ process_experiment(
         "max_area": 100,
         "norm_order": 2,
         "n_processes": 1,
+        "fake_barcode_fraction": 0.10,
+        "fake_barcode_seed": 0,
     },
 )
 ```
@@ -195,6 +242,8 @@ process_experiment(
         "batch_size": 15000,
         "device": "auto",  # CUDA on Ubuntu when available; otherwise CPU
         "set_seed": 1,
+        "fake_barcode_fraction": 0.10,
+        "fake_barcode_seed": 0,
     },
     # Optional: save the full posterior matrix and fitted model for every tile.
     save_postcode_artifacts=False,
@@ -224,8 +273,8 @@ different meanings:
 - `target`: accepted gene only; missing for rejected, background, infeasible,
   or NaN assignments.
 - `candidate_target`: highest-probability gene regardless of the winning class.
-- `assignment_class`: the raw winning class (`gene`, `background`,
-  `infeasible`, or `nan`).
+- `assignment_class`: the raw winning class (`gene`, `fake_barcode`,
+  `background`, `infeasible`, or `nan`).
 - `passes_thresholds`: true only when a gene wins and meets `prob_threshold`.
 - `assignment_probability`: posterior probability of the raw winning class.
 - `best_gene_probability`, `second_gene_probability`, and
@@ -294,11 +343,12 @@ not saved by default because they can be extremely large. The spot table stores
 `istdeco_intensity`, `istdeco_quality`, the actual intensity threshold, and the
 internal `istdeco_tile`; quality is the algorithm's filtering score, not a
 calibrated probability. When `fake_barcode_fraction` is greater than zero,
-unused one-hot codewords are generated in memory and appended only for the
-ISTDECO run; the SpaceTx codebook on disk is unchanged. A value of `0.10`
+unused one-hot codewords are generated in memory for the decoder; the SpaceTx
+codebook on disk is unchanged. A value of `0.10`
 requests controls equal to 10% of the true targets, rounded up. Calls assigned
 to these biologically absent controls have `assignment_class="fake_barcode"`
-and `istdeco_is_fake_barcode=True`, making them directly countable as empirical
+and `is_fake_barcode=True` (`istdeco_is_fake_barcode` remains as a compatibility
+alias), making them directly countable as empirical
 false-positive calls. Generated controls are unique, never duplicate a true
 barcode, and are reproducible under `fake_barcode_seed`.
 
@@ -339,6 +389,8 @@ process_experiment(
         "normalize_frames": True,
         "device": "auto",            # TensorFlow GPU when available
         "z_projection": "max",
+        "fake_barcode_fraction": 0.10,
+        "fake_barcode_seed": 0,
     },
 )
 ```
@@ -409,6 +461,8 @@ process_experiment(
         "verbose": True,
         "max_candidates": None,
         "max_component_size": None,
+        "fake_barcode_fraction": 0.10,
+        "fake_barcode_seed": 0,
     },
 )
 ```

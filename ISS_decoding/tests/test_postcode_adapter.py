@@ -175,6 +175,76 @@ def test_postcode_output_retains_starfish_coordinates_and_threshold():
     np.testing.assert_allclose(summary["gene_probability_margin"], [0.7, 0.1, 0.1])
 
 
+def test_postcode_fake_winner_is_marked_as_negative_control():
+    output = {
+        "class_probs": np.array([[0.1, 0.85, 0.03, 0.02]]),
+        "class_ind": {
+            "genes": np.array([0, 1]),
+            "bkg": 2,
+            "inf": 3,
+            "nan": np.empty(0, dtype=int),
+        },
+    }
+
+    summary = summarize_postcode_output(
+        output,
+        np.array(["gene_a", "__fake_barcode_0001"]),
+        probability_threshold=0.8,
+        fake_barcode_mask=np.array([False, True]),
+    )
+
+    assert summary.loc[0, "target"] == "__fake_barcode_0001"
+    assert summary.loc[0, "assignment_class"] == "fake_barcode"
+    assert bool(summary.loc[0, "is_fake_barcode"])
+    assert bool(summary.loc[0, "passes_thresholds"])
+
+
+def test_postcode_decoder_receives_augmented_controls(monkeypatch):
+    prepared = PostcodeInputs(
+        spot_intensities=np.ones((1, 2, 2), dtype=np.float32),
+        barcodes=np.array(
+            [
+                [[1, 1], [0, 0]],
+                [[0, 0], [1, 1]],
+            ],
+            dtype=np.float32,
+        ),
+        target_names=np.array(["gene_a", "gene_b"]),
+        intensity_table=make_intensity_table(np.ones((1, 2, 2), dtype=np.float32)),
+    )
+    monkeypatch.setattr(decoding, "prepare_postcode_inputs", lambda *_: prepared)
+
+    captured = {}
+
+    def fake_decode(spots, barcodes, **kwargs):
+        captured.update(spots=spots, barcodes=barcodes, kwargs=kwargs)
+        return {
+            "class_probs": np.array([[0.05, 0.05, 0.85, 0.03, 0.02]]),
+            "class_ind": {
+                "genes": np.array([0, 1, 2]),
+                "bkg": 3,
+                "inf": 4,
+                "nan": np.empty(0, dtype=int),
+            },
+        }
+
+    monkeypatch.setattr(decoding, "_load_postcode_decoding_function", lambda: fake_decode)
+    dataframe, raw = decoding.decode_spots_with_postcode(
+        object(),
+        object(),
+        prob_threshold=0.8,
+        postcode_kwargs={"fake_barcode_fraction": 0.5, "fake_barcode_seed": 7},
+        return_raw=True,
+    )
+
+    assert captured["barcodes"].shape == (3, 2, 2)
+    assert "fake_barcode_fraction" not in captured["kwargs"]
+    assert raw["fake_barcode_mask"].tolist() == [False, False, True]
+    assert dataframe.loc[0, "target"] == "__fake_barcode_0001"
+    assert dataframe.loc[0, "assignment_class"] == "fake_barcode"
+    assert bool(dataframe.loc[0, "is_fake_barcode"])
+
+
 def test_decode_spots_with_postcode_runs_the_pinned_decoder(monkeypatch):
     rng = np.random.default_rng(5)
     barcodes = np.array(
@@ -448,7 +518,7 @@ def test_process_experiment_writes_postcode_output_layout(monkeypatch, tmp_path)
     manifest_paths = list(output_dir.glob("decoding_run_*.json"))
     assert len(manifest_paths) == 1
     manifest = json.loads(manifest_paths[0].read_text())
-    assert manifest["schema_version"] == "1.0"
+    assert manifest["schema_version"] == decoding.POSTCODE_OUTPUT_SCHEMA_VERSION
     assert manifest["decoder"]["commit"] == decoding.POSTCODE_COMMIT
     assert manifest["tiles"] == {"done": 3, "remaining": 0, "total": 3}
     assert manifest["rows"] == 4

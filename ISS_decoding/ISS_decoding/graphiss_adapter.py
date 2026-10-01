@@ -9,6 +9,12 @@ import pandas as pd
 
 from starfish.types import Axes, Coordinates, Features
 
+from .barcode_controls import (
+    FAKE_BARCODE_DEFAULTS,
+    augment_one_hot_barcodes,
+    validate_fake_barcode_settings,
+)
+
 
 GRAPHISS_DEFAULT_KWARGS = {
     "h": 0.05,
@@ -27,6 +33,7 @@ GRAPHISS_DEFAULT_KWARGS = {
     "verbose": True,
     "max_candidates": None,
     "max_component_size": None,
+    **FAKE_BARCODE_DEFAULTS,
 }
 
 
@@ -125,7 +132,7 @@ def effective_graphiss_kwargs(overrides=None):
                     f"Graph-ISS '{name}' must be a positive integer or None."
                 )
             settings[name] = int(value)
-    return settings
+    return validate_fake_barcode_settings(settings, "Graph-ISS")
 
 
 def format_spacetx_codebook_for_graphiss(codebook):
@@ -227,6 +234,7 @@ def _empty_decoded_table():
         "graphiss_quality": "float64",
         "graphiss_search_mode": "object",
         "graphiss_path_candidate_indices": "object",
+        "is_fake_barcode": "bool",
         "decoder": "object",
         "spot_detector": "object",
     }
@@ -256,6 +264,13 @@ def decode_graphiss_array(images, barcodes, target_names, *, settings):
         raise ValueError("Graph-ISS images must contain finite, non-negative values.")
 
     settings = effective_graphiss_kwargs(settings)
+    true_barcode_count = len(barcodes)
+    barcodes, target_names, fake_barcode_mask = augment_one_hot_barcodes(
+        barcodes,
+        target_names,
+        fraction=settings["fake_barcode_fraction"],
+        seed=settings["fake_barcode_seed"],
+    )
     if settings["normalize_frames"]:
         images = _normalize_frames(images)
 
@@ -280,6 +295,11 @@ def decode_graphiss_array(images, barcodes, target_names, *, settings):
     if raw.empty:
         result = _empty_decoded_table()
         result.attrs["graphiss_diagnostics"] = diagnostics
+        result.attrs["graphiss_true_barcode_count"] = true_barcode_count
+        result.attrs["graphiss_fake_barcode_count"] = int(fake_barcode_mask.sum())
+        result.attrs["graphiss_fake_barcode_fraction"] = settings[
+            "fake_barcode_fraction"
+        ]
         return result
 
     result = pd.DataFrame(
@@ -327,20 +347,30 @@ def decode_graphiss_array(images, barcodes, target_names, *, settings):
 
     is_gene = result["target_id"] >= 0
     is_ambiguous = result["graphiss_ambiguous_target"]
+    target_indices = result["target_id"].to_numpy()
+    is_fake_barcode = np.zeros(len(result), dtype=bool)
+    valid_target = target_indices >= 0
+    is_fake_barcode[valid_target] = fake_barcode_mask[target_indices[valid_target]]
     passes &= is_gene & ~is_ambiguous
     result[Features.PASSES_THRESHOLDS] = passes
     result[Features.TARGET] = result["candidate_target"].where(passes)
     result["assignment_class"] = np.select(
-        [~is_gene, is_ambiguous, ~passes],
-        ["unexpected_sequence", "ambiguous_code", "low_confidence"],
+        [~is_gene, is_ambiguous, ~passes, is_fake_barcode],
+        ["unexpected_sequence", "ambiguous_code", "low_confidence", "fake_barcode"],
         default="gene",
     )
+    result["is_fake_barcode"] = is_fake_barcode
     result["decoder"] = "graphiss"
     result["spot_detector"] = "graphiss_joint"
     result["xc"] = np.nan
     result["yc"] = np.nan
     result["zc"] = np.nan
     result.attrs["graphiss_diagnostics"] = diagnostics
+    result.attrs["graphiss_true_barcode_count"] = true_barcode_count
+    result.attrs["graphiss_fake_barcode_count"] = int(fake_barcode_mask.sum())
+    result.attrs["graphiss_fake_barcode_fraction"] = settings[
+        "fake_barcode_fraction"
+    ]
     return result
 
 

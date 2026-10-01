@@ -1,5 +1,6 @@
 # Standard library
 import json
+from math import ceil
 import re
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
@@ -42,17 +43,24 @@ from .graphiss_adapter import (
     effective_graphiss_kwargs,
     installed_graphiss_version,
 )
+from .barcode_controls import (
+    FAKE_BARCODE_DEFAULTS,
+    augment_one_hot_barcodes,
+    augment_spacetx_codebook,
+    fake_name_set,
+    validate_fake_barcode_settings,
+)
 
 
 POSTCODE_COMMIT = "4db68cc5cc398128bcfd97a764bef3c98ee3c583"
-POSTCODE_OUTPUT_SCHEMA_VERSION = "1.0"
+POSTCODE_OUTPUT_SCHEMA_VERSION = "1.1"
 ISTDECO_COMMIT = "2200b4e969528e46588fbe75b6b039f72cd962eb"
-ISTDECO_OUTPUT_SCHEMA_VERSION = "1.0"
+ISTDECO_OUTPUT_SCHEMA_VERSION = "1.1"
 BARDENSR_COMMIT = "79cf8f9f1f28c8dbd00ab2dd948a214574948307"
-BARDENSR_OUTPUT_SCHEMA_VERSION = "1.0"
+BARDENSR_OUTPUT_SCHEMA_VERSION = "1.1"
 GRAPHISS_COMMIT = "cc3dbeb1aee785ab1f7c671c1296c62e6b34d42a"
-GRAPHISS_OUTPUT_SCHEMA_VERSION = "1.0"
-PIXEL_OUTPUT_SCHEMA_VERSION = "1.0"
+GRAPHISS_OUTPUT_SCHEMA_VERSION = "1.1"
+PIXEL_OUTPUT_SCHEMA_VERSION = "1.1"
 POSTCODE_DEFAULT_KWARGS = {
     "num_iter": 60,
     "batch_size": 15000,
@@ -64,7 +72,9 @@ POSTCODE_DEFAULT_KWARGS = {
     "print_training_progress": True,
     "set_seed": 1,
     "device": "auto",
+    **FAKE_BARCODE_DEFAULTS,
 }
+STARFISH_DEFAULT_KWARGS = dict(FAKE_BARCODE_DEFAULTS)
 SPOTIFLOW_DEFAULT_KWARGS = {
     "model": "hybiss",
     "probability_threshold": None,
@@ -82,6 +92,7 @@ PIXEL_DEFAULT_KWARGS = {
     "max_area": 100,
     "norm_order": 2,
     "n_processes": 1,
+    **FAKE_BARCODE_DEFAULTS,
 }
 
 
@@ -93,7 +104,18 @@ def effective_postcode_kwargs(overrides=None):
     """Return the complete pinned-decoder settings after applying user overrides."""
     settings = dict(POSTCODE_DEFAULT_KWARGS)
     settings.update(overrides or {})
-    return settings
+    return validate_fake_barcode_settings(settings, "PoSTcode")
+
+
+def effective_starfish_kwargs(overrides=None):
+    """Return validated shared settings for Starfish spot decoders."""
+    overrides = dict(overrides or {})
+    unknown = sorted(set(overrides) - set(STARFISH_DEFAULT_KWARGS))
+    if unknown:
+        raise ValueError(f"Unknown Starfish decoder setting(s): {unknown}")
+    settings = dict(STARFISH_DEFAULT_KWARGS)
+    settings.update(overrides)
+    return validate_fake_barcode_settings(settings, "Starfish")
 
 
 def normalize_spot_detection_mode(mode):
@@ -272,7 +294,7 @@ def effective_pixel_kwargs(overrides=None):
             )
         settings["n_processes"] = int(n_processes)
 
-    return settings
+    return validate_fake_barcode_settings(settings, "Starfish pixel decoding")
 
 
 def create_spot_detector(
@@ -409,6 +431,10 @@ def add_spot_identity(dataframe, region_name, tile_id):
         "candidate_target",
         "assignment_class",
         Features.PASSES_THRESHOLDS,
+        "is_fake_barcode",
+        "barcode_control_true_count",
+        "barcode_control_fake_count",
+        "barcode_control_fraction",
         "assignment_probability",
         "best_gene_probability",
         "background_probability",
@@ -492,6 +518,13 @@ def save_postcode_decoder_artifacts(
         "class_probs": _numpy_value(output["class_probs"]),
         "spot_uid": np.asarray(spot_uids, dtype=str),
         "target_names": np.asarray(output["target_names"], dtype=str),
+        "fake_barcode_mask": np.asarray(
+            output.get(
+                "fake_barcode_mask",
+                np.zeros(len(output["target_names"]), dtype=bool),
+            ),
+            dtype=bool,
+        ),
     }
     for class_name, indices in output["class_ind"].items():
         posterior_payload[f"class_indices_{class_name}"] = np.atleast_1d(
@@ -514,6 +547,13 @@ def save_postcode_decoder_artifacts(
             )
         ),
         "target_names": np.asarray(output["target_names"], dtype=str),
+        "fake_barcode_mask": np.asarray(
+            output.get(
+                "fake_barcode_mask",
+                np.zeros(len(output["target_names"]), dtype=bool),
+            ),
+            dtype=bool,
+        ),
     }
     if "barcodes" in output:
         model_payload["barcodes"] = _numpy_value(output["barcodes"])
@@ -616,6 +656,17 @@ def QC_score_calc(decoded):
     return df
 
 
+def _load_postcode_decoding_function():
+    try:
+        from postcode.decoding_functions import decoding_function
+    except ImportError as exc:
+        raise ImportError(
+            "PoSTcode is not installed. Install ISS_decoding with the 'postcode' extra "
+            "or create the environment from ISS_decoding.yml."
+        ) from exc
+    return decoding_function
+
+
 def decode_spots_with_postcode(
     spots,
     codebook,
@@ -624,15 +675,20 @@ def decode_spots_with_postcode(
     return_raw=False,
 ):
     """Decode Starfish spot traces with PoSTcode while retaining Starfish coordinates and QC."""
-    try:
-        from postcode.decoding_functions import decoding_function
-    except ImportError as exc:
-        raise ImportError(
-            "PoSTcode is not installed. Install ISS_decoding with the 'postcode' extra "
-            "or create the environment from ISS_decoding.yml."
-        ) from exc
-
     inputs = prepare_postcode_inputs(spots, codebook)
+    kwargs = effective_postcode_kwargs(postcode_kwargs)
+    true_barcode_count = len(inputs.barcodes)
+    barcode_settings = {
+        "fraction": kwargs.pop("fake_barcode_fraction"),
+        "seed": kwargs.pop("fake_barcode_seed"),
+    }
+    target_round_channel = np.swapaxes(inputs.barcodes, 1, 2)
+    target_round_channel, target_names, fake_barcode_mask = augment_one_hot_barcodes(
+        target_round_channel,
+        inputs.target_names,
+        **barcode_settings,
+    )
+    barcodes = np.swapaxes(target_round_channel, 1, 2)
     if inputs.spot_intensities.shape[0] == 0:
         empty = inputs.intensity_table.to_features_dataframe()
         empty_columns = {
@@ -657,32 +713,39 @@ def decode_spots_with_postcode(
             "second_peak_ratio_min": "float64",
             "second_peak_ratio_mean": "float64",
             "second_peak_ratio_all_bases": "object",
+            "is_fake_barcode": "bool",
         }
         for column, dtype in empty_columns.items():
             if column not in empty:
                 empty[column] = pd.Series(index=empty.index, dtype=dtype)
+        empty.attrs["postcode_true_barcode_count"] = true_barcode_count
+        empty.attrs["postcode_fake_barcode_count"] = int(fake_barcode_mask.sum())
+        empty.attrs["postcode_fake_barcode_fraction"] = barcode_settings["fraction"]
         return (empty, None) if return_raw else empty
 
-    kwargs = effective_postcode_kwargs(postcode_kwargs)
+    decoding_function = _load_postcode_decoding_function()
     output = decoding_function(
         inputs.spot_intensities,
-        inputs.barcodes,
+        barcodes,
         **kwargs,
     )
     output = dict(output)
-    output["target_names"] = inputs.target_names
-    output["barcodes"] = inputs.barcodes
-    output["postcode_kwargs"] = kwargs
+    output["target_names"] = target_names
+    output["barcodes"] = barcodes
+    output["fake_barcode_mask"] = fake_barcode_mask
+    output["postcode_kwargs"] = effective_postcode_kwargs(postcode_kwargs)
     decoded, probabilities, class_names = postcode_output_to_decoded_table(
         output,
         inputs.intensity_table,
-        inputs.target_names,
+        target_names,
         probability_threshold=prob_threshold,
+        fake_barcode_mask=fake_barcode_mask,
     )
     assignments = summarize_postcode_output(
         output,
-        inputs.target_names,
+        target_names,
         probability_threshold=prob_threshold,
+        fake_barcode_mask=fake_barcode_mask,
     )
     dataframe = QC_score_calc(decoded)
     for column in assignments.columns:
@@ -692,6 +755,9 @@ def decode_spots_with_postcode(
     dataframe["postcode_probability"] = probabilities
     dataframe["postcode_class"] = class_names
     dataframe["decoder"] = "postcode"
+    dataframe.attrs["postcode_true_barcode_count"] = true_barcode_count
+    dataframe.attrs["postcode_fake_barcode_count"] = int(fake_barcode_mask.sum())
+    dataframe.attrs["postcode_fake_barcode_fraction"] = barcode_settings["fraction"]
     return (dataframe, output) if return_raw else dataframe
 
 
@@ -797,11 +863,30 @@ def _empty_pixel_decoding_table():
         "pixel_magnitude_threshold": "float64",
         "pixel_min_area": "float64",
         "pixel_max_area": "float64",
+        "is_fake_barcode": "bool",
         "decoder": "object",
     }
     return pd.DataFrame(
         {name: pd.Series(dtype=dtype) for name, dtype in columns.items()}
     )
+
+
+def _annotate_starfish_fake_barcodes(dataframe, fake_names):
+    """Add consistent negative-control annotations to Starfish outputs."""
+    if "candidate_target" not in dataframe:
+        dataframe["candidate_target"] = dataframe[Features.TARGET]
+    candidates = dataframe["candidate_target"].astype(str)
+    is_fake = candidates.isin(fake_names)
+    dataframe["is_fake_barcode"] = is_fake.to_numpy(dtype=bool)
+    if Features.PASSES_THRESHOLDS not in dataframe:
+        dataframe[Features.PASSES_THRESHOLDS] = True
+    passes = dataframe[Features.PASSES_THRESHOLDS].astype(bool)
+    dataframe["assignment_class"] = np.select(
+        [~passes, is_fake],
+        ["low_confidence", "fake_barcode"],
+        default="gene",
+    )
+    return dataframe
 
 
 def ISS_pixel_pipeline(
@@ -825,8 +910,17 @@ def ISS_pixel_pipeline(
     )
 
     settings = effective_pixel_kwargs(pixel_kwargs)
-    n_processes = settings.pop("n_processes")
-    decoder = DetectPixels.PixelSpotDecoder(codebook=codebook, **settings)
+    decoder_settings = dict(settings)
+    n_processes = decoder_settings.pop("n_processes")
+    fraction = decoder_settings.pop("fake_barcode_fraction")
+    seed = decoder_settings.pop("fake_barcode_seed")
+    codebook, target_names, fake_barcode_mask = augment_spacetx_codebook(
+        codebook,
+        fraction=fraction,
+        seed=seed,
+    )
+    fake_names = fake_name_set(target_names, fake_barcode_mask)
+    decoder = DetectPixels.PixelSpotDecoder(codebook=codebook, **decoder_settings)
     print("Decoding every pixel with Starfish PixelSpotDecoder")
     try:
         decoded, connected_components = decoder.run(
@@ -839,7 +933,10 @@ def ISS_pixel_pipeline(
         if "not enough values to unpack" not in str(exc):
             raise
         print("No pixels survived the pixel-decoding thresholds")
-        return _empty_pixel_decoding_table()
+        result = _empty_pixel_decoding_table()
+        result.attrs["fake_barcode_count"] = int(fake_barcode_mask.sum())
+        result.attrs["fake_barcode_fraction"] = fraction
+        return result
 
     dataframe = QC_score_calc(decoded)
     properties = connected_components.region_properties
@@ -856,12 +953,13 @@ def ISS_pixel_pipeline(
     dataframe["pixel_min_area"] = settings["min_area"]
     dataframe["pixel_max_area"] = settings["max_area"]
     dataframe["candidate_target"] = dataframe[Features.TARGET]
-    dataframe["assignment_class"] = np.where(
-        dataframe[Features.PASSES_THRESHOLDS],
-        "gene",
-        "area_filtered",
-    )
+    dataframe = _annotate_starfish_fake_barcodes(dataframe, fake_names)
+    dataframe.loc[
+        ~dataframe[Features.PASSES_THRESHOLDS].astype(bool), "assignment_class"
+    ] = "area_filtered"
     dataframe["decoder"] = "starfish_pixel"
+    dataframe.attrs["fake_barcode_count"] = int(fake_barcode_mask.sum())
+    dataframe.attrs["fake_barcode_fraction"] = fraction
     return dataframe
 
 
@@ -964,6 +1062,7 @@ def ISS_pipeline(
     spot_detector=None,
     prob_threshold=None,
     postcode_kwargs=None,
+    starfish_kwargs=None,
     return_postcode_raw=False,
 ):
     decode_mode = decode_mode.upper()
@@ -981,6 +1080,17 @@ def ISS_pipeline(
         masking_radius=masking_radius,
         channel_normalization=channel_normalization,
     )
+
+    fake_names = set()
+    if decode_mode in {"PRMC", "MD"}:
+        starfish_settings = effective_starfish_kwargs(starfish_kwargs)
+        if starfish_settings["fake_barcode_fraction"] > 0:
+            codebook, target_names, fake_barcode_mask = augment_spacetx_codebook(
+                codebook,
+                fraction=starfish_settings["fake_barcode_fraction"],
+                seed=starfish_settings["fake_barcode_seed"],
+            )
+            fake_names = fake_name_set(target_names, fake_barcode_mask)
 
     if spot_detector is None:
         spot_detector = create_spot_detector(
@@ -1019,7 +1129,7 @@ def ISS_pipeline(
         decoder = make_decoder()
         print(f"Decoding with {decode_mode}")
         decoded = decoder.run(spots=spots)
-        return QC_score_calc(decoded)
+        return _annotate_starfish_fake_barcodes(QC_score_calc(decoded), fake_names)
 
     if dense:
         channels = list(primary_image.xarray.coords[Axes.CH].values)
@@ -1066,6 +1176,7 @@ def process_experiment(
     sigma_vals=(1, 10, 30),
     prob_threshold=None,
     postcode_kwargs=None,
+    starfish_kwargs=None,
     spotiflow_kwargs=None,
     save_postcode_artifacts=False,
     istdeco_kwargs=None,
@@ -1124,6 +1235,11 @@ def process_experiment(
     )
     graphiss_package_version = installed_graphiss_version() if is_graphiss else None
     pixel_settings = effective_pixel_kwargs(pixel_kwargs) if is_pixel else {}
+    starfish_settings = (
+        effective_starfish_kwargs(starfish_kwargs)
+        if decode_mode in {"PRMC", "MD"}
+        else {}
+    )
     starfish_package_version = distribution_version("starfish") if is_pixel else None
     print(f"Processing directory: {input_dir}")
 
@@ -1262,6 +1378,27 @@ def process_experiment(
         coordinate_units, coordinate_pixel_to_um = read_spacetx_coordinate_metadata(SpaceTX_dir)
 
         experiment = Experiment.from_json(str(SpaceTX_dir / "experiment.json"))
+        control_settings = (
+            postcode_settings
+            if is_postcode
+            else pixel_settings
+            if is_pixel
+            else istdeco_settings
+            if is_istdeco
+            else bardensr_settings
+            if is_bardensr
+            else graphiss_settings
+            if is_graphiss
+            else starfish_settings
+        )
+        control_fraction = float(control_settings.get("fake_barcode_fraction", 0.0))
+        codebook_sizes = getattr(experiment.codebook, "sizes", {})
+        control_true_count = int(codebook_sizes.get(Features.TARGET, 0))
+        control_fake_count = (
+            int(ceil(control_true_count * control_fraction))
+            if control_fraction > 0
+            else 0
+        )
         tiles = list(experiment.keys())
         tile_output_dir = decoded_dir / "tiles"
         tile_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1343,6 +1480,7 @@ def process_experiment(
                     spot_detector=shared_spot_detector,
                     prob_threshold=prob_threshold,
                     postcode_kwargs=postcode_kwargs,
+                    starfish_kwargs=starfish_settings,
                     return_postcode_raw=save_postcode_artifacts,
                 )
             if is_postcode and save_postcode_artifacts:
@@ -1354,6 +1492,9 @@ def process_experiment(
             if df is None:
                 continue
 
+            df["barcode_control_true_count"] = control_true_count
+            df["barcode_control_fake_count"] = control_fake_count
+            df["barcode_control_fraction"] = control_fraction
             df["tile"] = tile_id
             df["spot_detector"] = spot_detection_mode
             df["coordinate_units"] = coordinate_units
@@ -1446,6 +1587,18 @@ def process_experiment(
             )
             ET.SubElement(params_el, "postcode_kwargs").text = json.dumps(
                 postcode_settings, sort_keys=True, default=str
+            )
+            ET.SubElement(params_el, "starfish_kwargs").text = json.dumps(
+                starfish_settings, sort_keys=True, default=str
+            )
+            ET.SubElement(params_el, "barcode_control_true_count").text = str(
+                control_true_count
+            )
+            ET.SubElement(params_el, "barcode_control_fake_count").text = str(
+                control_fake_count
+            )
+            ET.SubElement(params_el, "barcode_control_fraction").text = str(
+                control_fraction
             )
             ET.SubElement(params_el, "save_postcode_artifacts").text = str(
                 save_postcode_artifacts
@@ -1625,6 +1778,9 @@ def process_experiment(
                         "postcode_kwargs": json.loads(
                             json.dumps(postcode_settings, default=str)
                         ),
+                        "starfish_kwargs": json.loads(
+                            json.dumps(starfish_settings, default=str)
+                        ),
                         "save_postcode_artifacts": save_postcode_artifacts,
                         "istdeco_kwargs": json.loads(
                             json.dumps(istdeco_settings, default=str)
@@ -1638,6 +1794,9 @@ def process_experiment(
                         "pixel_kwargs": json.loads(
                             json.dumps(pixel_settings, default=str)
                         ),
+                        "barcode_control_true_count": control_true_count,
+                        "barcode_control_fake_count": control_fake_count,
+                        "barcode_control_fraction": control_fraction,
                         "coordinate_units": coordinate_units,
                         "coordinate_pixel_to_um": coordinate_pixel_to_um,
                     },

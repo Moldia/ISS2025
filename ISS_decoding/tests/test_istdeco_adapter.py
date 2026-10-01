@@ -227,6 +227,7 @@ def test_fake_barcode_calls_are_marked_as_negative_controls(monkeypatch):
         istdeco_adapter.ISTDECO_FAKE_BARCODE_PREFIX
     )
     assert result.loc[0, "assignment_class"] == "fake_barcode"
+    assert bool(result.loc[0, "is_fake_barcode"])
     assert bool(result.loc[0, "istdeco_is_fake_barcode"])
     assert result.attrs["istdeco_true_barcode_count"] == 2
     assert result.attrs["istdeco_fake_barcode_count"] == 1

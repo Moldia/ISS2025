@@ -99,6 +99,7 @@ def summarize_postcode_output(
     output,
     target_names,
     probability_threshold=None,
+    fake_barcode_mask=None,
 ):
     """Return reversible per-spot assignments from PoSTcode posterior probabilities.
 
@@ -115,6 +116,11 @@ def summarize_postcode_output(
         raise ValueError("probability_threshold must be between 0 and 1.")
 
     target_names = np.asarray(target_names).astype(str)
+    if fake_barcode_mask is None:
+        fake_barcode_mask = np.zeros(len(target_names), dtype=bool)
+    fake_barcode_mask = np.asarray(fake_barcode_mask, dtype=bool)
+    if fake_barcode_mask.shape != target_names.shape:
+        raise ValueError("The fake barcode mask must align with target names.")
     gene_indices = np.atleast_1d(output["class_ind"]["genes"]).astype(int)
     if target_names.shape[0] != gene_indices.shape[0]:
         raise ValueError("The number of target names does not match the decoded genes.")
@@ -144,6 +150,7 @@ def summarize_postcode_output(
     best_gene_positions = gene_order[:, 0]
     best_gene_probability = gene_probs[row_indices, best_gene_positions]
     candidate_target = target_names[best_gene_positions]
+    is_fake_barcode = fake_barcode_mask[best_gene_positions]
 
     if gene_indices.size > 1:
         second_gene_positions = gene_order[:, 1]
@@ -160,6 +167,7 @@ def summarize_postcode_output(
     assignment_class = np.full(class_probs.shape[0], "unknown", dtype=object)
     gene_winner = np.isin(winning_indices, gene_indices)
     assignment_class[gene_winner] = "gene"
+    assignment_class[gene_winner & is_fake_barcode] = "fake_barcode"
     assignment_class[np.isin(winning_indices, background_indices)] = "background"
     assignment_class[np.isin(winning_indices, infeasible_indices)] = "infeasible"
     assignment_class[np.isin(winning_indices, nan_indices)] = "nan"
@@ -192,6 +200,7 @@ def summarize_postcode_output(
             "second_gene": second_gene,
             "second_gene_probability": second_gene_probability,
             "gene_probability_margin": gene_probability_margin,
+            "is_fake_barcode": is_fake_barcode,
         }
     )
 
@@ -201,6 +210,7 @@ def postcode_output_to_decoded_table(
     intensity_table,
     target_names,
     probability_threshold=None,
+    fake_barcode_mask=None,
 ):
     """Attach PoSTcode assignments to a Starfish ``DecodedIntensityTable``."""
     class_probs = np.asarray(output["class_probs"])
@@ -213,6 +223,7 @@ def postcode_output_to_decoded_table(
         output,
         target_names,
         probability_threshold=probability_threshold,
+        fake_barcode_mask=fake_barcode_mask,
     )
     probabilities = summary["assignment_probability"].to_numpy()
     class_names = summary["assignment_class"].to_numpy()

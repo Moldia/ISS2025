@@ -7,6 +7,29 @@ import pytest
 from ISS_decoding import decoding
 
 
+def test_starfish_control_settings_and_output_annotation():
+    settings = decoding.effective_starfish_kwargs(
+        {"fake_barcode_fraction": 0.2, "fake_barcode_seed": 9}
+    )
+    assert settings == {"fake_barcode_fraction": 0.2, "fake_barcode_seed": 9}
+
+    dataframe = pd.DataFrame(
+        {
+            "target": ["gene_a", "__fake_barcode_0001", "gene_b"],
+            "passes_thresholds": [True, True, False],
+        }
+    )
+    annotated = decoding._annotate_starfish_fake_barcodes(
+        dataframe, {"__fake_barcode_0001"}
+    )
+    assert annotated["is_fake_barcode"].tolist() == [False, True, False]
+    assert annotated["assignment_class"].tolist() == [
+        "gene",
+        "fake_barcode",
+        "low_confidence",
+    ]
+
+
 class FakeExperiment:
     codebook = object()
 

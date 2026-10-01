@@ -7,6 +7,7 @@ import pytest
 from starfish import Codebook, ImageStack
 
 from ISS_decoding import decoding
+from ISS_decoding.barcode_controls import augment_spacetx_codebook
 
 
 class FakeExperiment:
@@ -61,6 +62,45 @@ def test_pixel_pipeline_runs_starfish_pixel_decoder(monkeypatch):
     assert result.loc[0, "pixel_area"] == 64
     assert result.loc[0, "passes_thresholds"]
     assert result.loc[0, "decoder"] == "starfish_pixel"
+
+
+def test_pixel_pipeline_marks_fake_barcode_components(monkeypatch):
+    codebook = Codebook.from_numpy(
+        ["gene_a"],
+        n_round=2,
+        n_channel=2,
+        data=np.array([[[1, 0], [1, 0]]], dtype=np.uint8),
+    )
+    augmented, _names, fake_mask = augment_spacetx_codebook(
+        codebook, fraction=1.0, seed=4
+    )
+    fake_code = np.asarray(augmented.values[fake_mask][0], dtype=np.float32)
+    array = np.broadcast_to(
+        fake_code[:, :, None, None, None], (2, 2, 1, 8, 8)
+    ).copy()
+    stack = ImageStack.from_numpy(array)
+    monkeypatch.setattr(
+        decoding,
+        "preprocess_iss_tile",
+        lambda *_args, **_kwargs: (stack, stack),
+    )
+
+    result = decoding.ISS_pixel_pipeline(
+        object(),
+        codebook,
+        pixel_kwargs={
+            "min_area": 1,
+            "max_area": 1000,
+            "n_processes": 1,
+            "fake_barcode_fraction": 1.0,
+            "fake_barcode_seed": 4,
+        },
+    )
+
+    assert len(result) == 1
+    assert result.loc[0, "target"] == "__fake_barcode_0001"
+    assert result.loc[0, "assignment_class"] == "fake_barcode"
+    assert bool(result.loc[0, "is_fake_barcode"])
 
 
 def test_pixel_pipeline_returns_typed_empty_table_when_no_pixels_pass(monkeypatch):

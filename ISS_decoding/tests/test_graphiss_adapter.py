@@ -143,6 +143,44 @@ def test_graphiss_output_is_standardized_and_thresholds_are_retained(monkeypatch
     assert result.attrs["graphiss_diagnostics"] == {"candidate_count": 6}
 
 
+def test_graphiss_fake_calls_are_marked(monkeypatch):
+    def fake_decode(images, codebook, target_names, **_kwargs):
+        fake_index = len(target_names) - 1
+        return pd.DataFrame(
+            {
+                "spot_id": [0],
+                "x": [2.0],
+                "y": [3.0],
+                "z": [0.0],
+                "sequence": ["0-0-1"],
+                "target_id": [fake_index],
+                "target": [target_names[fake_index]],
+                "ambiguous_target": [False],
+                "signal_probability_sum": [2.7],
+                "signal_probability_mean": [0.9],
+                "signal_probability_min": [0.85],
+                "max_distance": [1.0],
+                "transition_probability_product": [0.8],
+                "spatial_quality": [0.8],
+                "quality": [2.16],
+                "path_candidate_indices": ["[0, 1, 2]"],
+            }
+        )
+
+    monkeypatch.setattr(graphiss_adapter, "_load_graphiss_decoder", lambda: fake_decode)
+    result = graphiss_adapter.decode_graphiss_array(
+        np.ones((3, 2, 8, 8), dtype=np.float32),
+        make_codebook().values,
+        np.array(["gene_a", "gene_b"]),
+        settings={"fake_barcode_fraction": 0.5, "fake_barcode_seed": 7},
+    )
+
+    assert result.loc[0, "target"] == "__fake_barcode_0001"
+    assert result.loc[0, "assignment_class"] == "fake_barcode"
+    assert bool(result.loc[0, "is_fake_barcode"])
+    assert result.attrs["graphiss_fake_barcode_count"] == 1
+
+
 def test_imagestack_decoder_adds_physical_coordinates(monkeypatch):
     monkeypatch.setattr(
         graphiss_adapter,
