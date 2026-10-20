@@ -1,0 +1,28 @@
+name: segger
+channels:
+  - conda-forge
+dependencies:
+  # Segger v0.3.0 currently supports this Linux/CUDA stack upstream. Its
+  # current Pixi definition installs RAPIDS as NVIDIA Python wheels; using the
+  # same wheels here avoids the unsatisfiable legacy Conda/RAPIDS recipe.
+  - python=3.11
+  - pip
+  - git
+  - pip:
+      - --extra-index-url https://pypi.nvidia.com
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - --find-links https://data.pyg.org/whl/torch-2.5.0+cu121.html
+      - "torch==2.5.*"
+      - "torchvision==0.20.*"
+      - lightning
+      - torch-geometric
+      - torch-scatter
+      - torch-sparse
+      - "cuspatial-cu12==24.10.*"
+      - "cudf-cu12==24.10.*"
+      - "cuml-cu12==24.10.*"
+      - "cugraph-cu12==24.10.*"
+      - "cupy-cuda12x>=12.2,<13.0"
+      - "spatialdata>=0.4,<0.5"
+      - "setuptools>=81,<82"
+      - git+https://github.com/dpeerlab/segger.git@v0.3.0

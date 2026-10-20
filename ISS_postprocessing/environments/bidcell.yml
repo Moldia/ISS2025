@@ -1,0 +1,27 @@
+name: bidcell
+channels:
+  - conda-forge
+dependencies:
+  # BIDCell's published installation uses Python 3.10 and recommends a GPU.
+  - python=3.10
+  - pip
+  - numpy=1.26
+  - scipy
+  - pandas
+  - h5py
+  - scikit-image
+  - tifffile
+  - matplotlib
+  - pillow
+  - pyyaml
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - "torch==2.1.2+cu118"
+      - "torchvision==0.16.2+cu118"
+      # BIDCell 1.0.3 calls the Cellpose 2/3 API; Cellpose 4 is incompatible.
+      - "numpy<2"
+      - "cellpose>=2.2.3,<4"
+      - "segmentation-models-pytorch==0.3.3"
+      - "opencv-python>=4.8,<4.11"
+      - "opencv-python-headless>=4.8,<4.11"
+      - "bidcell==1.0.3"

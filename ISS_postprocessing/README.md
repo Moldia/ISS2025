@@ -56,18 +56,22 @@ produce the same sparse `.npz` label-mask format used by the existing pipeline.
 
 These methods have different native runtimes and unavoidable method-specific
 inputs, so their heavy dependencies are intentionally not installed into the
-base ISS environment. See [SEGMENTATION_WRAPPERS.md](SEGMENTATION_WRAPPERS.md)
-and the method notebooks for setup, input requirements, and examples.
+base ISS environment. Cellpose and StarDist remain in the base environment;
+Proseg, Segger, and BIDCell each have a dedicated YAML under `environments/`.
+See [SEGMENTATION_WRAPPERS.md](SEGMENTATION_WRAPPERS.md) and the method
+notebooks for setup, input requirements, and examples.
 
-## Segmentation-free and spatial-domain analysis
+## Segmentation-free, spatial-domain, and topology analysis
 
 **SAINSC** support provides kernel-density maps and local-maxima cell proxies,
 with optional reference-based cell typing. **SFUMATO** support provides
 multi-resolution spatial-domain clustering with posterior uncertainty. These
 outputs are not cell-instance masks and are therefore kept separate from the
-segmentation dispatcher.
+segmentation dispatcher. **CellGPS/COSTE** support builds directed spatial
+topology StructureMaps from either annotated cell centroids in a spatial
+AnnData object or decoded transcript points labelled by gene.
 
-See [TRANSCRIPT_ANALYSIS.md](TRANSCRIPT_ANALYSIS.md) and the SAINSC and SFUMATO
+See [TRANSCRIPT_ANALYSIS.md](TRANSCRIPT_ANALYSIS.md) and the method-specific
 demo notebooks for environment setup, coordinate handling, outputs, and ISS
-parameter guidance. SFUMATO's clustering stage requires a CUDA GPU; preparing
-its input and configuration does not.
+parameter guidance. SFUMATO's clustering stage requires a CUDA GPU; SAINSC and
+both CellGPS workflows run on CPU.

@@ -1,22 +1,28 @@
-# Segmentation-free and spatial-domain analysis
+# Segmentation-free, spatial-domain, and topology analysis
 
-The ISS postprocessing package integrates two transcript-first workflows that
-do not create individual-cell segmentation masks:
+The ISS postprocessing package integrates transcript-first workflows and
+spatial-topology analysis that do not create individual-cell segmentation
+masks:
 
 - **SAINSC 0.4.0** estimates transcript kernel-density maps, optionally assigns
   reference cell types, and exports local maxima as cell proxies in AnnData.
 - **SFUMATO** performs multi-resolution Bayesian clustering of spatial bins and
   reports both hard domains and posterior uncertainty.
+- **CellGPS/COSTE 0.0.6** compares labelled spatial point sets and returns
+  normalized Searcher and Findee StructureMaps. It accepts either spatial cells
+  from AnnData or decoded transcript points labelled by gene.
 
 These methods intentionally live outside `run_transcript_segmentation()`.
 SAINSC cell-type maps and SFUMATO semantic domains must not be passed to code
-that expects every positive integer to identify one cell.
+that expects every positive integer to identify one cell. CellGPS matrices are
+topology summaries, not label images.
 
 ## Coordinate contract
 
-Both public adapters accept the decoded ISS defaults `target`, `xc`, and `yc`.
-Coordinates are assumed to be image pixels unless `coordinate_unit="um"` is
-selected. Always pass the physical image resolution as `pixel_size_um`.
+The transcript-table adapters accept the decoded ISS defaults `target`, `xc`,
+and `yc`. Coordinates are assumed to be image pixels unless
+`coordinate_unit="um"` is selected. SAINSC and SFUMATO additionally require the
+physical image resolution as `pixel_size_um`.
 
 - SAINSC retains source coordinates and constructs a grid at `grid_size_um`.
   Its exported AnnData stores image-pixel coordinates in `obsm["spatial"]`,
@@ -25,6 +31,9 @@ selected. Always pass the physical image resolution as `pixel_size_um`.
 - SFUMATO input is converted to micrometres before execution. Its standardized
   bin AnnData stores pixels in `obsm["spatial"]` and micrometres in
   `obsm["spatial_um"]`.
+- CellGPS uses the coordinate values as supplied. Uniformly converting all
+  coordinates from pixels to micrometres does not change its normalized
+  cophenetic StructureMaps, but the coordinate unit is recorded in metadata.
 
 ## SAINSC
 
@@ -129,6 +138,76 @@ Use `prepare_sfumato_analysis(...)` to generate the normalized CSV and config
 without invoking CUDA. This is useful for reviewing parameter sweeps or
 submitting the generated config to a GPU cluster.
 
+## CellGPS/COSTE
+
+CellGPS 0.0.6 and its scientific Python dependencies are available from
+conda-forge. Create the isolated CPU environment once:
+
+```bash
+conda env create -f ISS_postprocessing/environments/cellgps.yml
+```
+
+The adapter uses CellGPS's memory-optimized dataframe workflow and launches it
+through `conda run`, so the notebooks remain on the normal
+`ISS_postprocessing` kernel. No GPU is required.
+
+### Spatial AnnData input
+
+The AnnData route requires:
+
+- one row per segmented cell;
+- a cell-type or cluster label in `adata.obs[cluster_col]`; and
+- cell centroids in the first two columns of `adata.obsm[coordinate_key]`,
+  normally `adata.obsm["spatial"]`.
+
+A non-spatial scRNA-seq reference object alone is not a valid CellGPS input.
+The adapter omits unlabelled cells, filters groups below
+`min_cells_per_group`, and leaves the source AnnData object unchanged.
+
+```python
+import ISS_postprocessing.spatial_topology as TOPOLOGY
+
+outputs = TOPOLOGY.run_cellgps_from_h5ad(
+    "/data/All regions/postprocessing/segmentation/anndata_cellpose.h5ad",
+    region="all_regions",
+    cluster_col="norm_leiden_2",
+    coordinate_key="spatial",
+    output_dir="/data/All regions/postprocessing/spatial_topology/cellgps/cells",
+    cellgps_python=["conda", "run", "-n", "cellgps", "python"],
+)
+```
+
+### Decoded transcript-table input
+
+The transcript route accepts the same decoded ISS defaults as the other
+transcript-first methods: `target`, `xc`, and `yc`, with optional quality
+filtering. Here each gene is a labelled point set, so the resulting matrices
+describe **gene-distribution topology**, not cell-type topology and not cell
+segmentation. Low-count genes are removed with `min_transcripts_per_gene`.
+
+```python
+outputs = TOPOLOGY.run_cellgps_from_transcripts(
+    "/data/R1/decoding/2_decoded/R1_decoded.csv",
+    input_dir="/data",
+    region="R1",
+    min_transcripts_per_gene=5,
+    cellgps_python=["conda", "run", "-n", "cellgps", "python"],
+)
+```
+
+Both routes save the normalized point table, complete runner configuration,
+entity counts, Searcher and Findee matrices as CSV, both StructureMap plots as
+PDF, and a metadata JSON. The default locations are:
+
+```text
+<input_dir>/<region>/postprocessing/spatial_topology/cellgps/cells/
+<input_dir>/<region>/postprocessing/spatial_topology/cellgps/transcripts/
+```
+
+Use `prepare_cellgps_from_h5ad(...)` or
+`prepare_cellgps_from_transcripts(...)` to validate and inspect inputs without
+running CellGPS. The two CellGPS demo notebooks cover these paths separately.
+
 ## ISS parameter guidance
 
 ISS panels are often smaller and sparser than Xenium panels. Start with modest
@@ -140,6 +219,9 @@ SVD and cluster counts and inspect multiple physical scales:
   `min_transcripts_per_bin`.
 - SFUMATO niche-scale exploration: increase `bin_width_um` and smoothing, then
   compare adjacent `K` values and inspect `p1`, `p2`, and `compl_p1`.
+- CellGPS: inspect entity counts before interpreting topology. Very small cell
+  groups or low-count genes can produce unstable nearest-neighbour summaries;
+  raise the relevant minimum-count filter and compare sensitivity.
 
 The supplied notebooks are executable templates rather than universal default
 parameter claims. Physical scale and transcript density must be checked for

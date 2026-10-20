@@ -88,6 +88,8 @@ The notebooks have been reorganized into a more modular and user-friendly struct
   and transcript-aware (**Segger**, **Proseg**, and **BIDCell**) segmentation,
 - segmentation-free analysis with **SAINSC** and uncertainty-aware spatial
   domain analysis with **SFUMATO** are available as separate workflows,
+- **CellGPS/COSTE** spatial-topology workflows are provided separately for
+  annotated spatial AnnData objects and decoded transcript tables,
 - a dedicated notebook allows visualization of segmentation masks over the DAPI channel,
 - support for downstream analysis with **pciSeq** has been added
 
@@ -97,8 +99,9 @@ same sparse `.npz` mask format used elsewhere in the pipeline. Their heavy
 dependencies remain in method-specific environments; see
 `ISS_postprocessing/SEGMENTATION_WRAPPERS.md` for setup and limitations.
 
-SAINSC and SFUMATO consume the same decoded transcript tables but do not
-produce cell-instance masks. See
+SAINSC, SFUMATO, and the transcript-level CellGPS workflow consume the same
+decoded transcript tables but do not produce cell-instance masks. CellGPS can
+also analyze annotated cell centroids from a spatial `.h5ad` object. See
 `ISS_postprocessing/TRANSCRIPT_ANALYSIS.md` for their separate output contracts,
 environment files, and demo notebooks.
 

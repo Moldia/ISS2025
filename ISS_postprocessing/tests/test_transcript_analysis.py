@@ -7,7 +7,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from ISS_postprocessing import segmentation_free, spatial_domains
+from ISS_postprocessing import segmentation_free, spatial_domains, spatial_topology
 from ISS_postprocessing._sainsc_runner import _add_physical_coordinates
 
 
@@ -197,6 +197,99 @@ class SfumatoWrapperTests(unittest.TestCase):
                     pixel_size_um=0.25,
                     bin_width_um=7.5,
                 )
+
+
+class CellgpsWrapperTests(unittest.TestCase):
+    @staticmethod
+    def transcripts():
+        return pd.DataFrame(
+            {
+                "target": ["GeneA", "GeneA", "GeneA", "GeneB", "GeneB", "Rare"],
+                "xc": [0.0, 1.0, 2.0, 8.0, 9.0, 20.0],
+                "yc": [0.0, 1.0, 0.0, 8.0, 9.0, 20.0],
+                "quality": [0.9, 0.8, 0.7, 0.9, 0.8, 0.9],
+            }
+        )
+
+    def test_prepare_cellgps_from_transcripts_filters_rare_genes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = spatial_topology.prepare_cellgps_from_transcripts(
+                self.transcripts(),
+                region="R1",
+                output_dir=directory,
+                quality_col="quality",
+                min_quality=0.75,
+                min_transcripts_per_gene=2,
+            )
+
+            points = pd.read_csv(paths["points"])
+            self.assertEqual(set(points["celltype"]), {"GeneA", "GeneB"})
+            self.assertEqual(len(points), 4)
+            config = json.loads(paths["config"].read_text())
+            self.assertEqual(config["input_kind"], "transcript_table")
+            self.assertEqual(config["entity_kind"], "gene")
+            self.assertEqual(config["input_summary"]["n_entities"], 2)
+
+    def test_prepare_cellgps_from_h5ad_extracts_spatial_cell_groups(self):
+        import anndata as ad
+
+        adata = ad.AnnData(
+            X=np.ones((5, 1)),
+            obs=pd.DataFrame(
+                {"norm_leiden_2": ["0", "0", "1", "1", None]},
+                index=[f"cell-{i}" for i in range(5)],
+            ),
+            obsm={
+                "spatial": np.array(
+                    [[0, 0], [1, 0], [9, 9], [10, 9], [20, 20]],
+                    dtype=float,
+                )
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            paths = spatial_topology.prepare_cellgps_from_h5ad(
+                adata,
+                region="R1",
+                cluster_col="norm_leiden_2",
+                output_dir=directory,
+                min_cells_per_group=2,
+            )
+
+            points = pd.read_csv(paths["points"])
+            self.assertEqual(points.shape, (4, 3))
+            self.assertEqual(set(points["celltype"]), {0, 1})
+            config = json.loads(paths["config"].read_text())
+            self.assertEqual(config["input_kind"], "h5ad")
+            self.assertEqual(config["input_summary"]["n_input_cells"], 5)
+            self.assertEqual(config["input_summary"]["n_retained_cells"], 4)
+
+    def test_cellgps_runner_supports_external_environment_prefix(self):
+        commands = []
+
+        def fake_run(command, *, cwd=None, env=None):
+            commands.append(command)
+            config = json.loads(Path(command[-1]).read_text())
+            for output in config["outputs"].values():
+                path = Path(output)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("test")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            spatial_topology, "_run_command", fake_run
+        ):
+            paths = spatial_topology.run_cellgps_from_transcripts(
+                self.transcripts(),
+                region="R1",
+                output_dir=directory,
+                min_transcripts_per_gene=2,
+                cellgps_python=["conda", "run", "-n", "cellgps", "python"],
+            )
+
+            self.assertTrue(paths["searcher_matrix"].is_file())
+            self.assertEqual(
+                commands[0][:5],
+                ["conda", "run", "-n", "cellgps", "python"],
+            )
 
 
 if __name__ == "__main__":

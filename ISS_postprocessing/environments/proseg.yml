@@ -1,0 +1,7 @@
+name: proseg
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Proseg is a self-contained Rust executable. No Python runtime is needed.
+  - rust-proseg=3.2.0

@@ -1,0 +1,8 @@
+name: cellgps
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cell-gps=0.0.6
+  - anndata
+  - ipykernel

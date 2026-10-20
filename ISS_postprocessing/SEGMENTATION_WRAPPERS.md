@@ -50,31 +50,30 @@ define the output canvas. When Segger or Proseg receives an image but no
 `initial_mask`, the wrapper generates a Cellpose prior. Passing an existing
 mask is faster and more reproducible.
 
-## Why separate environments are supported
+## Isolated method environments
 
-The dependency stacks are different:
-
-- Proseg is a Rust executable and can be called directly from the normal ISS
-  notebook environment after `cargo install proseg`.
-- Segger currently requires Python 3.11+ and a CUDA/RAPIDS stack, while the ISS
-  environment uses Python 3.10 and CUDA 11.8-era packages. Keep Segger in its
-  upstream-recommended environment.
-- BIDCell has its own PyTorch environment and requires a single-cell reference
-  plus positive and negative marker files.
-
-The wrappers were integration-tested with Proseg 3.2.0, Segger 0.2.0, and
-BIDCell 1.0.3. BIDCell 1.0.3 still uses the Cellpose 3 API, while its package
-metadata does not currently cap Cellpose. Pin the compatible image stack in
-the BIDCell environment:
+Cellpose and StarDist run in the normal `ISS_postprocessing` environment. Only
+the three transcript-aware segmentation programs use isolated runtimes because
+their installation requirements conflict with, or are unrelated to, that
+environment. Create them from the repository root:
 
 ```bash
-python -m pip install "cellpose<4" "numpy<2" \
-    "opencv-python<4.11" "opencv-python-headless<4.11"
+conda env create -f ISS_postprocessing/environments/proseg.yml
+conda env create -f ISS_postprocessing/environments/segger.yml
+conda env create -f ISS_postprocessing/environments/bidcell.yml
 ```
 
-In particular, an unconstrained BIDCell install may otherwise select Cellpose
-4, where `cellpose.models.Cellpose` is no longer available. Keeping these pins
-inside the separate BIDCell environment avoids changing the ISS environment.
+- `proseg.yml` installs the self-contained `rust-proseg=3.2.0` executable from
+  Bioconda. It does not install a Rust toolchain or a second analysis stack.
+- `segger.yml` follows Segger v0.3.0's upstream Linux environment: Python 3.11,
+  CUDA 12.1, PyTorch 2.5, and RAPIDS 24.10. It requires Linux and an NVIDIA GPU.
+- `bidcell.yml` installs BIDCell 1.0.3 with Python 3.10, PyTorch/CUDA 11.8,
+  NumPy 1.26, Cellpose below 4, and OpenCV below 4.11. These pins prevent pip
+  from selecting the incompatible Cellpose 4 and NumPy 2 stacks.
+
+Keep the notebooks on the `ISS_postprocessing` kernel. The wrappers invoke the
+isolated executable or Python environment through `conda run`; those method
+dependencies are not imported into the notebook process.
 
 Commands are passed as argument lists and never through a shell. For example,
 Segger can be launched from an ISS notebook with:
@@ -97,11 +96,11 @@ resolution, and writes the standard sparse mask.
 
 ## Proseg
 
-The Rust executable is also distributed through Bioconda, so users do not
-need a Rust toolchain just to run the notebook:
+The Rust executable is distributed through Bioconda, so users do not need a
+Rust toolchain just to run the notebook:
 
 ```bash
-conda create -n proseg -c conda-forge -c bioconda rust-proseg=3.2.0
+conda env create -f ISS_postprocessing/environments/proseg.yml
 ```
 
 Pass the environment's executable directly or use a command prefix such as
@@ -121,6 +120,7 @@ labels, labels_coo = SEG.proseg_segmentation(
     region="R1",
     input_dir=input_dir,
     pixel_size_um=0.325,
+    proseg_command=["conda", "run", "-n", "proseg", "proseg"],
     nthreads=16,
     # Proseg-native options can be appended when needed:
     extra_args=["--voxel-size", "1.0", "--samples", "200"],
