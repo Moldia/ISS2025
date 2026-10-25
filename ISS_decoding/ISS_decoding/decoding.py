@@ -1,30 +1,570 @@
 # Standard library
-import math
+import json
+from math import ceil
 import re
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
-from typing import Mapping, Sequence, Tuple
+from typing import Mapping, Sequence
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
 # NOTE (provenance policy):
-#   - We ONLY write a decoding XML if this run actually writes the region-level CSV.
+#   - We ONLY write a decoding XML if this run actually writes the region-level outputs.
 #   - We NEVER overwrite existing XMLs: each productive run writes a uniquely-named XML.
 #   - Runs that skip because outputs already exist produce NO XML.
 
 # Third-party
 import numpy as np
 import pandas as pd
+from skimage.exposure import match_histograms
 
 # Starfish
-from starfish import Codebook, Experiment, FieldOfView
+from starfish import Experiment, FieldOfView
 from starfish.image import ApplyTransform, Filter, LearnTransform
-from starfish.spots import DecodeSpots, FindSpots
-from starfish.types import Axes, TraceBuildingStrategies, Levels
-from starfish.core.spots.DecodeSpots.trace_builders import build_spot_traces_exact_match
+from starfish.spots import DecodeSpots, DetectPixels, FindSpots
+from starfish.types import Axes, Features, TraceBuildingStrategies, Levels
+
+from .postcode_adapter import (
+    prepare_postcode_inputs,
+    postcode_output_to_decoded_table,
+    summarize_postcode_output,
+)
+from .istdeco_adapter import (
+    decode_imagestack_with_istdeco,
+    effective_istdeco_kwargs,
+    installed_istdeco_version,
+)
+from .bardensr_adapter import (
+    decode_imagestack_with_bardensr,
+    effective_bardensr_kwargs,
+    installed_bardensr_version,
+)
+from .graphiss_adapter import (
+    decode_imagestack_with_graphiss,
+    effective_graphiss_kwargs,
+    installed_graphiss_version,
+)
+from .barcode_controls import (
+    FAKE_BARCODE_DEFAULTS,
+    augment_one_hot_barcodes,
+    augment_spacetx_codebook,
+    fake_name_set,
+    validate_fake_barcode_settings,
+)
+
+
+POSTCODE_COMMIT = "4db68cc5cc398128bcfd97a764bef3c98ee3c583"
+POSTCODE_OUTPUT_SCHEMA_VERSION = "1.1"
+ISTDECO_COMMIT = "2200b4e969528e46588fbe75b6b039f72cd962eb"
+ISTDECO_OUTPUT_SCHEMA_VERSION = "1.1"
+BARDENSR_COMMIT = "79cf8f9f1f28c8dbd00ab2dd948a214574948307"
+BARDENSR_OUTPUT_SCHEMA_VERSION = "1.1"
+GRAPHISS_COMMIT = "cc3dbeb1aee785ab1f7c671c1296c62e6b34d42a"
+GRAPHISS_OUTPUT_SCHEMA_VERSION = "1.1"
+PIXEL_OUTPUT_SCHEMA_VERSION = "1.1"
+POSTCODE_DEFAULT_KWARGS = {
+    "num_iter": 60,
+    "batch_size": 15000,
+    "up_prc_to_remove": 99.95,
+    "modify_bkg_prior": True,
+    "estimate_bkg": True,
+    "estimate_additional_barcodes": None,
+    "add_remaining_barcodes_prior": 0.05,
+    "print_training_progress": True,
+    "set_seed": 1,
+    "device": "auto",
+    **FAKE_BARCODE_DEFAULTS,
+}
+STARFISH_DEFAULT_KWARGS = dict(FAKE_BARCODE_DEFAULTS)
+SPOTIFLOW_DEFAULT_KWARGS = {
+    "model": "hybiss",
+    "probability_threshold": None,
+    "min_distance": 2,
+    "n_tiles": None,
+    "measurement_type": "mean",
+}
+VALID_SPOT_DETECTION_MODES = {"starfish", "spotiflow"}
+SPOTIFLOW_PROBABILITY_COLUMN = "spotiflow_probability"
+PIXEL_DEFAULT_KWARGS = {
+    "metric": "euclidean",
+    "distance_threshold": 0.5,
+    "magnitude_threshold": 0.1,
+    "min_area": 2,
+    "max_area": 100,
+    "norm_order": 2,
+    "n_processes": 1,
+    **FAKE_BARCODE_DEFAULTS,
+}
+
 
 def timestamp_for_filename() -> str:
-    return datetime.now().strftime("%Y-%m-%d_%H-%M")
-    
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def effective_postcode_kwargs(overrides=None):
+    """Return the complete pinned-decoder settings after applying user overrides."""
+    settings = dict(POSTCODE_DEFAULT_KWARGS)
+    settings.update(overrides or {})
+    return validate_fake_barcode_settings(settings, "PoSTcode")
+
+
+def effective_starfish_kwargs(overrides=None):
+    """Return validated shared settings for Starfish spot decoders."""
+    overrides = dict(overrides or {})
+    unknown = sorted(set(overrides) - set(STARFISH_DEFAULT_KWARGS))
+    if unknown:
+        raise ValueError(f"Unknown Starfish decoder setting(s): {unknown}")
+    settings = dict(STARFISH_DEFAULT_KWARGS)
+    settings.update(overrides)
+    return validate_fake_barcode_settings(settings, "Starfish")
+
+
+def normalize_spot_detection_mode(mode):
+    """Return a validated, case-insensitive spot detector name."""
+    normalized = str(mode).strip().lower()
+    if normalized not in VALID_SPOT_DETECTION_MODES:
+        choices = ", ".join(sorted(VALID_SPOT_DETECTION_MODES))
+        raise ValueError(
+            f"Unknown spot_detection_mode: {mode!r}. Expected one of: {choices}."
+        )
+    return normalized
+
+
+def effective_spotiflow_kwargs(overrides=None):
+    """Return validated Spotiflow detector settings after applying overrides."""
+    overrides = dict(overrides or {})
+    unknown = sorted(set(overrides) - set(SPOTIFLOW_DEFAULT_KWARGS))
+    if unknown:
+        raise ValueError(f"Unknown Spotiflow setting(s): {unknown}")
+
+    settings = dict(SPOTIFLOW_DEFAULT_KWARGS)
+    settings.update(overrides)
+
+    model = settings["model"]
+    if model is None or (isinstance(model, str) and not model.strip()):
+        raise ValueError(
+            "Spotiflow 'model' must be a registered model name or model path."
+        )
+
+    probability_threshold = settings["probability_threshold"]
+    if probability_threshold is not None and not 0 <= probability_threshold <= 1:
+        raise ValueError("Spotiflow 'probability_threshold' must be between 0 and 1.")
+
+    if settings["min_distance"] <= 0:
+        raise ValueError("Spotiflow 'min_distance' must be greater than zero.")
+
+    n_tiles = settings["n_tiles"]
+    if n_tiles is not None:
+        if not isinstance(n_tiles, (list, tuple)) or len(n_tiles) != 2:
+            raise ValueError(
+                "Spotiflow 'n_tiles' must contain two positive integers for 2D detection."
+            )
+        normalized_n_tiles = tuple(int(value) for value in n_tiles)
+        if any(value < 1 for value in normalized_n_tiles) or any(
+            value != normalized
+            for value, normalized in zip(n_tiles, normalized_n_tiles)
+        ):
+            raise ValueError(
+                "Spotiflow 'n_tiles' must contain two positive integers for 2D detection."
+            )
+        settings["n_tiles"] = normalized_n_tiles
+
+    if settings["measurement_type"] not in {"mean", "max"}:
+        raise ValueError("Spotiflow 'measurement_type' must be 'mean' or 'max'.")
+
+    return settings
+
+
+def installed_spotiflow_version():
+    """Return the installed Spotiflow version without importing the optional package."""
+    try:
+        return distribution_version("spotiflow")
+    except PackageNotFoundError:
+        return None
+
+
+def _mean_sorted_histogram_reference(image_stack, group_by):
+    """Calculate Starfish's histogram reference without xarray MultiIndex operations."""
+    data = image_stack.xarray
+    group_dimensions = tuple(
+        dimension
+        for dimension in data.dims
+        if any(dimension == axis.value for axis in group_by)
+    )
+    if len(group_dimensions) != len(group_by):
+        missing = sorted(
+            {axis.value for axis in group_by} - set(group_dimensions)
+        )
+        raise ValueError(
+            "Cannot histogram-match an ImageStack without dimensions: "
+            + ", ".join(missing)
+        )
+
+    chunk_dimensions = tuple(
+        dimension for dimension in data.dims if dimension not in group_dimensions
+    )
+    ordered = np.asarray(
+        data.transpose(*group_dimensions, *chunk_dimensions).data
+    )
+    group_shape = ordered.shape[: len(group_dimensions)]
+    chunk_shape = ordered.shape[len(group_dimensions) :]
+    values_per_chunk = int(np.prod(chunk_shape, dtype=np.int64))
+    accumulator_dtype = np.result_type(ordered.dtype, np.float32)
+    reference = np.zeros(values_per_chunk, dtype=accumulator_dtype)
+
+    number_of_chunks = 0
+    for group_index in np.ndindex(group_shape):
+        sorted_chunk = np.sort(np.asarray(ordered[group_index]).reshape(-1))
+        np.add(reference, sorted_chunk, out=reference, casting="unsafe")
+        number_of_chunks += 1
+
+    if number_of_chunks == 0:
+        raise ValueError("Cannot histogram-match an empty ImageStack.")
+    reference /= number_of_chunks
+    return reference.reshape(chunk_shape)
+
+
+def _match_histogram_chunk(image, reference):
+    """Match one ImageStack chunk to a precomputed reference distribution."""
+    return match_histograms(np.asarray(image), reference=np.asarray(reference))
+
+
+def match_histograms_compatible(
+    image_stack,
+    *,
+    group_by=None,
+    n_processes=1,
+):
+    """Run Starfish-equivalent histogram matching without xarray stacking.
+
+    Starfish 0.3.x constructs two xarray MultiIndexes while calculating the
+    reference distribution.  That path can fail when old xarray releases are
+    combined with recent pandas releases, especially on large SpaceTx tiles.
+    Computing the same mean sorted distribution directly from the image values
+    avoids that dependency-sensitive indexing operation.
+    """
+    if group_by is None:
+        group_by = {Axes.CH, Axes.ROUND}
+    group_by = set(group_by)
+    reference = _mean_sorted_histogram_reference(image_stack, group_by)
+    return image_stack.apply(
+        _match_histogram_chunk,
+        reference,
+        group_by=group_by,
+        n_processes=n_processes,
+        in_place=False,
+    )
+
+
+def effective_pixel_kwargs(overrides=None):
+    """Return validated settings for Starfish ``PixelSpotDecoder``."""
+    overrides = dict(overrides or {})
+    unknown = sorted(set(overrides) - set(PIXEL_DEFAULT_KWARGS))
+    if unknown:
+        raise ValueError(f"Unknown Starfish pixel-decoding setting(s): {unknown}")
+
+    settings = dict(PIXEL_DEFAULT_KWARGS)
+    settings.update(overrides)
+
+    metric = settings["metric"]
+    if not isinstance(metric, str) or not metric.strip():
+        raise ValueError("Pixel-decoding 'metric' must be a non-empty string.")
+
+    if settings["distance_threshold"] <= 0:
+        raise ValueError(
+            "Pixel-decoding 'distance_threshold' must be greater than zero."
+        )
+    if settings["magnitude_threshold"] < 0:
+        raise ValueError("Pixel-decoding 'magnitude_threshold' cannot be negative.")
+    if settings["min_area"] < 1:
+        raise ValueError("Pixel-decoding 'min_area' must be at least one pixel.")
+    if settings["max_area"] <= settings["min_area"]:
+        raise ValueError("Pixel-decoding 'max_area' must be greater than 'min_area'.")
+    if settings["norm_order"] <= 0:
+        raise ValueError("Pixel-decoding 'norm_order' must be greater than zero.")
+
+    n_processes = settings["n_processes"]
+    if n_processes is not None:
+        if isinstance(n_processes, bool) or int(n_processes) != n_processes:
+            raise ValueError(
+                "Pixel-decoding 'n_processes' must be a positive integer or None."
+            )
+        if n_processes < 1:
+            raise ValueError(
+                "Pixel-decoding 'n_processes' must be a positive integer or None."
+            )
+        settings["n_processes"] = int(n_processes)
+
+    return validate_fake_barcode_settings(settings, "Starfish pixel decoding")
+
+
+def create_spot_detector(
+    spot_detection_mode,
+    *,
+    int_threshold=0.002,
+    sigma_vals=(1, 10, 30),
+    spotiflow_model=None,
+    spotiflow_kwargs=None,
+):
+    """Create a Starfish-compatible BlobDetector or Spotiflow detector."""
+    mode = normalize_spot_detection_mode(spot_detection_mode)
+    if mode == "starfish":
+        min_sigma, max_sigma, num_sigma = sigma_vals
+        return FindSpots.BlobDetector(
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigma=num_sigma,
+            threshold=int_threshold,
+            measurement_type="mean",
+        )
+
+    try:
+        from spotiflow.starfish import SpotiflowDetector
+    except ImportError as exc:
+        raise ImportError(
+            "Spotiflow is not installed. Install ISS_decoding with the 'spotiflow' "
+            "extra or create the environment from ISS_decoding.yml."
+        ) from exc
+
+    settings = effective_spotiflow_kwargs(spotiflow_kwargs)
+    model = spotiflow_model if spotiflow_model is not None else settings.pop("model")
+
+    class ProbabilityPreservingSpotiflowDetector(SpotiflowDetector):
+        """Preserve detector confidence when Starfish measures barcode intensities."""
+
+        def image_to_spots(self, data_image):
+            data_image = np.asarray(data_image)
+            if not self.is_volume:
+                # Starfish reference projections retain a singleton Z dimension.
+                # Spotiflow interprets any 3D 2D-model input as (Y, X, C), so
+                # passing (1, Y, X) would incorrectly treat X as the channels.
+                if data_image.ndim == 3 and data_image.shape[0] == 1:
+                    data_image = data_image[0]
+                if data_image.ndim != 2:
+                    raise ValueError(
+                        "Spotiflow 2D detection expected a (Y, X) image or a "
+                        "Starfish (1, Y, X) reference projection, but received "
+                        f"shape {data_image.shape}."
+                    )
+            results = super().image_to_spots(data_image)
+            spot_data = results.spot_attrs.data
+            spot_data[SPOTIFLOW_PROBABILITY_COLUMN] = spot_data[
+                Features.INTENSITY
+            ].to_numpy(copy=True)
+            return results
+
+    return ProbabilityPreservingSpotiflowDetector(
+        model=model,
+        is_volume=False,
+        subpix=False,
+        **settings,
+    )
+
+
+def decoding_output_subdir(decode_mode, dense, spot_detection_mode):
+    """Return an output directory that keeps detector alternatives separate."""
+    decode_mode = str(decode_mode).upper()
+    if decode_mode == "PIXEL":
+        return "2_decoded_pixel"
+    if decode_mode == "ISTDECO":
+        return "2_decoded_istdeco"
+    if decode_mode == "BARDENSR":
+        return "2_decoded_bardensr"
+    if decode_mode == "GRAPHISS":
+        return "2_decoded_graphiss"
+    mode = normalize_spot_detection_mode(spot_detection_mode)
+    base = (
+        "2_decoded_dense"
+        if dense
+        else "2_decoded_postcode" if decode_mode == "POSTCODE" else "2_decoded"
+    )
+    return f"{base}_spotiflow" if mode == "spotiflow" else base
+
+
+def add_spot_identity(dataframe, region_name, tile_id):
+    """Add deterministic region/tile spot identifiers and a stable column order."""
+    dataframe = dataframe.copy()
+    if Features.SPOT_ID not in dataframe.columns:
+        dataframe[Features.SPOT_ID] = np.arange(len(dataframe), dtype=int)
+
+    spot_ids = dataframe[Features.SPOT_ID].copy()
+    missing_spot_id = spot_ids.isna()
+    if missing_spot_id.any():
+        spot_ids = spot_ids.astype(object)
+        spot_ids.loc[missing_spot_id] = np.flatnonzero(missing_spot_id)
+        dataframe[Features.SPOT_ID] = spot_ids
+
+    def stable_id_part(value):
+        if isinstance(value, (float, np.floating)) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    id_parts = spot_ids.map(stable_id_part)
+    occurrence = id_parts.groupby(id_parts, sort=False).cumcount()
+    duplicated = id_parts.duplicated(keep=False)
+    if duplicated.any():
+        id_parts.loc[duplicated] = (
+            id_parts.loc[duplicated].astype(str)
+            + ":"
+            + occurrence.loc[duplicated].astype(str)
+        )
+
+    dataframe["spot_uid"] = (
+        str(region_name) + ":" + str(tile_id) + ":" + id_parts.astype(str)
+    )
+    dataframe["region"] = str(region_name)
+    dataframe["tile"] = str(tile_id)
+
+    leading_columns = [
+        "spot_uid",
+        "region",
+        "tile",
+        Features.SPOT_ID,
+        Axes.X.value,
+        Axes.Y.value,
+        Axes.ZPLANE.value,
+        "xc",
+        "yc",
+        "zc",
+        "coordinate_units",
+        "coordinate_pixel_to_um",
+        Features.TARGET,
+        "candidate_target",
+        "assignment_class",
+        Features.PASSES_THRESHOLDS,
+        "is_fake_barcode",
+        "barcode_control_true_count",
+        "barcode_control_fake_count",
+        "barcode_control_fraction",
+        "assignment_probability",
+        "best_gene_probability",
+        "background_probability",
+        "infeasible_probability",
+        "nan_probability",
+        "second_gene",
+        "second_gene_probability",
+        "gene_probability_margin",
+        "decoder",
+        "spot_detector",
+        SPOTIFLOW_PROBABILITY_COLUMN,
+        "target_id",
+        "istdeco_intensity",
+        "istdeco_quality",
+        "istdeco_intensity_threshold",
+        "istdeco_tile",
+        "istdeco_is_fake_barcode",
+        "bardensr_evidence",
+        "bardensr_peak_threshold",
+        "bardensr_tile_max",
+        "bardensr_tile",
+        "bardensr_method",
+        "graphiss_sequence",
+        "graphiss_ambiguous_target",
+        "graphiss_signal_probability_sum",
+        "graphiss_signal_probability_mean",
+        "graphiss_signal_probability_min",
+        "graphiss_max_distance",
+        "graphiss_transition_probability_product",
+        "graphiss_spatial_quality",
+        "graphiss_quality",
+        "graphiss_search_mode",
+        "graphiss_path_candidate_indices",
+        "pixel_area",
+        "pixel_distance",
+        "pixel_distance_threshold",
+        "pixel_magnitude_threshold",
+        "pixel_min_area",
+        "pixel_max_area",
+    ]
+    leading_columns = [column for column in leading_columns if column in dataframe]
+    remaining_columns = [
+        column for column in dataframe.columns if column not in leading_columns
+    ]
+    return dataframe.loc[:, leading_columns + remaining_columns]
+
+
+def _numpy_value(value):
+    """Convert NumPy/torch-compatible values into arrays safe for ``np.savez``."""
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    array = np.asarray(value)
+    if array.dtype == object:
+        array = array.astype(str)
+    return array
+
+
+def save_postcode_decoder_artifacts(
+    output,
+    decoded_dir,
+    tile_id,
+    spot_uids,
+    postcode_kwargs=None,
+):
+    """Save full posterior and fitted PoSTcode state for optional re-analysis."""
+    if output is None:
+        return None, None
+
+    decoded_dir = Path(decoded_dir)
+    posterior_dir = decoded_dir / "posteriors"
+    model_dir = decoded_dir / "models"
+    posterior_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    posterior_path = posterior_dir / f"{tile_id}.npz"
+    posterior_payload = {
+        "class_probs": _numpy_value(output["class_probs"]),
+        "spot_uid": np.asarray(spot_uids, dtype=str),
+        "target_names": np.asarray(output["target_names"], dtype=str),
+        "fake_barcode_mask": np.asarray(
+            output.get(
+                "fake_barcode_mask",
+                np.zeros(len(output["target_names"]), dtype=bool),
+            ),
+            dtype=bool,
+        ),
+    }
+    for class_name, indices in output["class_ind"].items():
+        posterior_payload[f"class_indices_{class_name}"] = np.atleast_1d(
+            indices
+        ).astype(int)
+    np.savez_compressed(posterior_path, **posterior_payload)
+
+    model_path = model_dir / f"{tile_id}.npz"
+    model_payload = {
+        "postcode_commit": np.asarray(POSTCODE_COMMIT),
+        "output_schema_version": np.asarray(POSTCODE_OUTPUT_SCHEMA_VERSION),
+        "postcode_kwargs_json": np.asarray(
+            json.dumps(
+                output.get(
+                    "postcode_kwargs",
+                    effective_postcode_kwargs(postcode_kwargs),
+                ),
+                sort_keys=True,
+                default=str,
+            )
+        ),
+        "target_names": np.asarray(output["target_names"], dtype=str),
+        "fake_barcode_mask": np.asarray(
+            output.get(
+                "fake_barcode_mask",
+                np.zeros(len(output["target_names"]), dtype=bool),
+            ),
+            dtype=bool,
+        ),
+    }
+    if "barcodes" in output:
+        model_payload["barcodes"] = _numpy_value(output["barcodes"])
+    for group_name in ("params", "norm_const"):
+        for name, value in output.get(group_name, {}).items():
+            model_payload[f"{group_name}_{name}"] = _numpy_value(value)
+    np.savez_compressed(model_path, **model_payload)
+    return posterior_path, model_path
+
+
 def read_spacetx_coordinate_metadata(SpaceTX_dir):
     """
     Read coordinate unit metadata written during SpaceTX generation.
@@ -117,21 +657,122 @@ def QC_score_calc(decoded):
     return df
 
 
-def ISS_pipeline(
-    tile,
+def _load_postcode_decoding_function():
+    try:
+        from postcode.decoding_functions import decoding_function
+    except ImportError as exc:
+        raise ImportError(
+            "PoSTcode is not installed. Install ISS_decoding with the 'postcode' extra "
+            "or create the environment from ISS_decoding.yml."
+        ) from exc
+    return decoding_function
+
+
+def decode_spots_with_postcode(
+    spots,
     codebook,
+    prob_threshold=None,
+    postcode_kwargs=None,
+    return_raw=False,
+):
+    """Decode Starfish spot traces with PoSTcode while retaining Starfish coordinates and QC."""
+    inputs = prepare_postcode_inputs(spots, codebook)
+    kwargs = effective_postcode_kwargs(postcode_kwargs)
+    true_barcode_count = len(inputs.barcodes)
+    barcode_settings = {
+        "fraction": kwargs.pop("fake_barcode_fraction"),
+        "seed": kwargs.pop("fake_barcode_seed"),
+    }
+    target_round_channel = np.swapaxes(inputs.barcodes, 1, 2)
+    target_round_channel, target_names, fake_barcode_mask = augment_one_hot_barcodes(
+        target_round_channel,
+        inputs.target_names,
+        **barcode_settings,
+    )
+    barcodes = np.swapaxes(target_round_channel, 1, 2)
+    if inputs.spot_intensities.shape[0] == 0:
+        empty = inputs.intensity_table.to_features_dataframe()
+        empty_columns = {
+            Features.TARGET: "object",
+            "candidate_target": "object",
+            "assignment_class": "object",
+            Features.PASSES_THRESHOLDS: "bool",
+            "assignment_probability": "float64",
+            "best_gene_probability": "float64",
+            "background_probability": "float64",
+            "infeasible_probability": "float64",
+            "nan_probability": "float64",
+            "second_gene": "object",
+            "second_gene_probability": "float64",
+            "gene_probability_margin": "float64",
+            "postcode_probability": "float64",
+            "postcode_class": "object",
+            "decoder": "object",
+            "quality_minimum": "float64",
+            "quality_mean": "float64",
+            "quality_all_bases": "object",
+            "second_peak_ratio_min": "float64",
+            "second_peak_ratio_mean": "float64",
+            "second_peak_ratio_all_bases": "object",
+            "is_fake_barcode": "bool",
+        }
+        for column, dtype in empty_columns.items():
+            if column not in empty:
+                empty[column] = pd.Series(index=empty.index, dtype=dtype)
+        empty.attrs["postcode_true_barcode_count"] = true_barcode_count
+        empty.attrs["postcode_fake_barcode_count"] = int(fake_barcode_mask.sum())
+        empty.attrs["postcode_fake_barcode_fraction"] = barcode_settings["fraction"]
+        return (empty, None) if return_raw else empty
+
+    decoding_function = _load_postcode_decoding_function()
+    output = decoding_function(
+        inputs.spot_intensities,
+        barcodes,
+        **kwargs,
+    )
+    output = dict(output)
+    output["target_names"] = target_names
+    output["barcodes"] = barcodes
+    output["fake_barcode_mask"] = fake_barcode_mask
+    output["postcode_kwargs"] = effective_postcode_kwargs(postcode_kwargs)
+    decoded, probabilities, class_names = postcode_output_to_decoded_table(
+        output,
+        inputs.intensity_table,
+        target_names,
+        probability_threshold=prob_threshold,
+        fake_barcode_mask=fake_barcode_mask,
+    )
+    assignments = summarize_postcode_output(
+        output,
+        target_names,
+        probability_threshold=prob_threshold,
+        fake_barcode_mask=fake_barcode_mask,
+    )
+    dataframe = QC_score_calc(decoded)
+    for column in assignments.columns:
+        dataframe[column] = assignments[column].to_numpy()
+
+    # Compatibility aliases retained for callers of the first PoSTcode integration.
+    dataframe["postcode_probability"] = probabilities
+    dataframe["postcode_class"] = class_names
+    dataframe["decoder"] = "postcode"
+    dataframe.attrs["postcode_true_barcode_count"] = true_barcode_count
+    dataframe.attrs["postcode_fake_barcode_count"] = int(fake_barcode_mask.sum())
+    dataframe.attrs["postcode_fake_barcode_fraction"] = barcode_settings["fraction"]
+    return (dataframe, output) if return_raw else dataframe
+
+
+def preprocess_iss_tile(
+    tile,
+    *,
     dense=False,
     register=True,
     register_dapi=True,
     masking_radius=15,
-    int_threshold=0.002,
-    sigma_vals=(1, 10, 30),
-    decode_mode="PRMC",
     channel_normalization="MH",
-    spot_detection_mode="starfish",
-    spotiflow_model=None,
-    prob_threshold=None,
+    filter_images=True,
 ):
+    """Load, optionally register, filter, and normalize one SpaceTx FOV."""
     print("Loading image planes")
     primary_image = tile.get_image(FieldOfView.PRIMARY_IMAGES)
     nuclei = tile.get_image("nuclei")
@@ -164,56 +805,301 @@ def ISS_pipeline(
         warp = ApplyTransform.Warp()
         registered = warp.run(primary_image, transforms_list=transforms_list, in_place=False, verbose=True)
 
-        filt = Filter.WhiteTophat(masking_radius, is_volume=False)
-        filtered = filt.run(registered, verbose=True, in_place=False)
+        if filter_images:
+            filt = Filter.WhiteTophat(masking_radius, is_volume=False)
+            filtered = filt.run(registered, verbose=True, in_place=False)
+        else:
+            filtered = registered
     else:
-        print("Not registering images, applying filter to raw data")
-        filt = Filter.WhiteTophat(masking_radius, is_volume=False)
-        filtered = filt.run(primary_image, verbose=True, in_place=False)
+        if filter_images:
+            print("Not registering images, applying filter to raw data")
+            filt = Filter.WhiteTophat(masking_radius, is_volume=False)
+            filtered = filt.run(primary_image, verbose=True, in_place=False)
+        else:
+            print("Not registering images; Graph-ISS will apply its own top-hat filter")
+            filtered = primary_image
 
     print("Normalizing channel intensities")
     if channel_normalization == "MH":
-        sbp = Filter.MatchHistograms({Axes.CH, Axes.ROUND})
+        scaled = match_histograms_compatible(
+            filtered,
+            group_by={Axes.CH, Axes.ROUND},
+            n_processes=1,
+        )
     else:
         sbp = Filter.ClipPercentileToZero(
             p_min=80,
             p_max=99.999,
             level_method=Levels.SCALE_BY_CHUNK,
         )
+        scaled = sbp.run(filtered, n_processes=1, in_place=False)
 
-    scaled = sbp.run(filtered, n_processes=1, in_place=False)
+    return primary_image, scaled
 
-    if spot_detection_mode == "starfish":
-        min_sigma, max_sigma, num_sigma = sigma_vals
-        detector = FindSpots.BlobDetector(
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            num_sigma=num_sigma,
-            threshold=int_threshold,
-            measurement_type="mean",
+
+def _empty_pixel_decoding_table():
+    """Return a typed checkpoint table when no pixels survive decoder thresholds."""
+    columns = {
+        Features.SPOT_ID: "int64",
+        Axes.X.value: "int64",
+        Axes.Y.value: "int64",
+        Axes.ZPLANE.value: "int64",
+        "xc": "float64",
+        "yc": "float64",
+        "zc": "float64",
+        Features.TARGET: "object",
+        "candidate_target": "object",
+        "assignment_class": "object",
+        Features.PASSES_THRESHOLDS: "bool",
+        Features.DISTANCE: "float64",
+        "quality_minimum": "float64",
+        "quality_mean": "float64",
+        "quality_all_bases": "object",
+        "second_peak_ratio_min": "float64",
+        "second_peak_ratio_mean": "float64",
+        "second_peak_ratio_all_bases": "object",
+        "pixel_area": "float64",
+        "pixel_distance": "float64",
+        "pixel_distance_threshold": "float64",
+        "pixel_magnitude_threshold": "float64",
+        "pixel_min_area": "float64",
+        "pixel_max_area": "float64",
+        "is_fake_barcode": "bool",
+        "decoder": "object",
+    }
+    return pd.DataFrame(
+        {name: pd.Series(dtype=dtype) for name, dtype in columns.items()}
+    )
+
+
+def _annotate_starfish_fake_barcodes(dataframe, fake_names):
+    """Add consistent negative-control annotations to Starfish outputs."""
+    if "candidate_target" not in dataframe:
+        dataframe["candidate_target"] = dataframe[Features.TARGET]
+    candidates = dataframe["candidate_target"].astype(str)
+    is_fake = candidates.isin(fake_names)
+    dataframe["is_fake_barcode"] = is_fake.to_numpy(dtype=bool)
+    if Features.PASSES_THRESHOLDS not in dataframe:
+        dataframe[Features.PASSES_THRESHOLDS] = True
+    passes = dataframe[Features.PASSES_THRESHOLDS].astype(bool)
+    dataframe["assignment_class"] = np.select(
+        [~passes, is_fake],
+        ["low_confidence", "fake_barcode"],
+        default="gene",
+    )
+    return dataframe
+
+
+def ISS_pixel_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    pixel_kwargs=None,
+):
+    """Preprocess and decode every pixel with Starfish ``PixelSpotDecoder``."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+
+    settings = effective_pixel_kwargs(pixel_kwargs)
+    decoder_settings = dict(settings)
+    n_processes = decoder_settings.pop("n_processes")
+    fraction = decoder_settings.pop("fake_barcode_fraction")
+    seed = decoder_settings.pop("fake_barcode_seed")
+    codebook, target_names, fake_barcode_mask = augment_spacetx_codebook(
+        codebook,
+        fraction=fraction,
+        seed=seed,
+    )
+    fake_names = fake_name_set(target_names, fake_barcode_mask)
+    decoder = DetectPixels.PixelSpotDecoder(codebook=codebook, **decoder_settings)
+    print("Decoding every pixel with Starfish PixelSpotDecoder")
+    try:
+        decoded, connected_components = decoder.run(
+            scaled,
+            n_processes=n_processes,
+        )
+    except ValueError as exc:
+        # Starfish 0.3.3 raises while unpacking an empty connected-component
+        # iterator when no pixels survive its magnitude and distance filters.
+        if "not enough values to unpack" not in str(exc):
+            raise
+        print("No pixels survived the pixel-decoding thresholds")
+        result = _empty_pixel_decoding_table()
+        result.attrs["fake_barcode_count"] = int(fake_barcode_mask.sum())
+        result.attrs["fake_barcode_fraction"] = fraction
+        return result
+
+    dataframe = QC_score_calc(decoded)
+    properties = connected_components.region_properties
+    if len(properties) != len(dataframe):
+        raise ValueError(
+            "Starfish pixel-decoding returned inconsistent component and table counts: "
+            f"{len(properties)} components versus {len(dataframe)} rows."
         )
 
-        def find_spots(reference_image):
-            return detector.run(reference_image=reference_image, image_stack=scaled)
+    dataframe["pixel_area"] = [float(prop.area) for prop in properties]
+    dataframe["pixel_distance"] = dataframe[Features.DISTANCE].astype(float)
+    dataframe["pixel_distance_threshold"] = settings["distance_threshold"]
+    dataframe["pixel_magnitude_threshold"] = settings["magnitude_threshold"]
+    dataframe["pixel_min_area"] = settings["min_area"]
+    dataframe["pixel_max_area"] = settings["max_area"]
+    dataframe["candidate_target"] = dataframe[Features.TARGET]
+    dataframe = _annotate_starfish_fake_barcodes(dataframe, fake_names)
+    dataframe.loc[
+        ~dataframe[Features.PASSES_THRESHOLDS].astype(bool), "assignment_class"
+    ] = "area_filtered"
+    dataframe["decoder"] = "starfish_pixel"
+    dataframe.attrs["fake_barcode_count"] = int(fake_barcode_mask.sum())
+    dataframe.attrs["fake_barcode_fraction"] = fraction
+    return dataframe
 
-    elif spot_detection_mode == "spotiflow":
-        if dense:
-            raise ValueError("spot_detection_mode='spotiflow' is not supported with dense=True")
-        from spotiflow.starfish import SpotiflowDetector
 
-        detector_kwargs = {"model": spotiflow_model or "general"}
-        if prob_threshold is not None:
-            detector_kwargs["probability_threshold"] = float(prob_threshold)
-        detector = SpotiflowDetector(**detector_kwargs)
+def ISS_istdeco_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    istdeco_kwargs=None,
+):
+    """Preprocess and jointly detect/decode one SpaceTx FOV with ISTDECO."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+    print("Joint spot detection and decoding with ISTDECO")
+    return decode_imagestack_with_istdeco(
+        scaled,
+        codebook,
+        istdeco_kwargs=istdeco_kwargs,
+    )
 
-        def find_spots(reference_image):
-            del reference_image
-            return detector.run(scaled, n_processes=1)
 
-    else:
+def ISS_bardensr_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    bardensr_kwargs=None,
+):
+    """Preprocess and jointly detect/decode one SpaceTx FOV with Bardensr."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+    print("Joint spot detection and decoding with Bardensr")
+    return decode_imagestack_with_bardensr(
+        scaled,
+        codebook,
+        bardensr_kwargs=bardensr_kwargs,
+    )
+
+
+def ISS_graphiss_pipeline(
+    tile,
+    codebook,
+    *,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    channel_normalization="MH",
+    graphiss_kwargs=None,
+):
+    """Preprocess and jointly detect/decode one SpaceTx FOV with Graph-ISS."""
+    _primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=False,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+        filter_images=False,
+    )
+    print("Joint spot detection and decoding with Graph-ISS")
+    return decode_imagestack_with_graphiss(
+        scaled,
+        codebook,
+        graphiss_kwargs=graphiss_kwargs,
+    )
+
+
+def ISS_pipeline(
+    tile,
+    codebook,
+    dense=False,
+    register=True,
+    register_dapi=True,
+    masking_radius=15,
+    int_threshold=0.002,
+    sigma_vals=(1, 10, 30),
+    decode_mode="PRMC",
+    channel_normalization="MH",
+    spot_detection_mode="starfish",
+    spotiflow_model=None,
+    spotiflow_kwargs=None,
+    spot_detector=None,
+    prob_threshold=None,
+    postcode_kwargs=None,
+    starfish_kwargs=None,
+    return_postcode_raw=False,
+):
+    decode_mode = decode_mode.upper()
+    spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
+    if decode_mode in {"PIXEL", "ISTDECO", "BARDENSR", "GRAPHISS"}:
         raise ValueError(
-            "spot_detection_mode must be 'starfish' or 'spotiflow', got "
-            f"{spot_detection_mode!r}"
+            f"{decode_mode} is a joint image-level detector/decoder. Use its "
+            f"dedicated pipeline or process_experiment(decode_mode='{decode_mode}')."
+        )
+    primary_image, scaled = preprocess_iss_tile(
+        tile,
+        dense=dense,
+        register=register,
+        register_dapi=register_dapi,
+        masking_radius=masking_radius,
+        channel_normalization=channel_normalization,
+    )
+
+    fake_names = set()
+    if decode_mode in {"PRMC", "MD"}:
+        starfish_settings = effective_starfish_kwargs(starfish_kwargs)
+        if starfish_settings["fake_barcode_fraction"] > 0:
+            codebook, target_names, fake_barcode_mask = augment_spacetx_codebook(
+                codebook,
+                fraction=starfish_settings["fake_barcode_fraction"],
+                seed=starfish_settings["fake_barcode_seed"],
+            )
+            fake_names = fake_name_set(target_names, fake_barcode_mask)
+
+    if spot_detector is None:
+        spot_detector = create_spot_detector(
+            spot_detection_mode,
+            int_threshold=int_threshold,
+            sigma_vals=sigma_vals,
+            spotiflow_model=spotiflow_model,
+            spotiflow_kwargs=spotiflow_kwargs,
         )
 
     def make_decoder():
@@ -231,38 +1117,49 @@ def ISS_pipeline(
         else:
             raise ValueError(f"Unknown decode_mode: {decode_mode}")
 
+    def decode_detected_spots(spots):
+        if decode_mode == "POSTCODE":
+            print("Decoding with PoSTcode")
+            return decode_spots_with_postcode(
+                spots,
+                codebook,
+                prob_threshold=prob_threshold,
+                postcode_kwargs=postcode_kwargs,
+                return_raw=return_postcode_raw,
+            )
+        decoder = make_decoder()
+        print(f"Decoding with {decode_mode}")
+        decoded = decoder.run(spots=spots)
+        return _annotate_starfish_fake_barcodes(QC_score_calc(decoded), fake_names)
+
     if dense:
         channels = list(primary_image.xarray.coords[Axes.CH].values)
-        decoder = make_decoder()
         per_channel_qc = []
 
         for ch in channels:
-            channel_ref = primary_image.sel({Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0})
-            print(f"Locating spots for channel {ch}")
-            spots = find_spots(channel_ref)
+            channel_ref = primary_image.sel(
+                {Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0}
+            )
+            print(f"Locating spots for channel {ch} with {spot_detection_mode}")
+            spots = spot_detector.run(reference_image=channel_ref, image_stack=scaled)
 
-            decoded = decoder.run(spots=spots)
-            df_qc = QC_score_calc(decoded)
+            df_qc = decode_detected_spots(spots)
             df_qc["channel"] = ch
             per_channel_qc.append(df_qc)
 
-            _ = build_spot_traces_exact_match(spots)
-
-        return pd.concat(per_channel_qc, ignore_index=True) if per_channel_qc else pd.DataFrame()
+        return (
+            pd.concat(per_channel_qc, ignore_index=True)
+            if per_channel_qc
+            else pd.DataFrame()
+        )
 
     dots = primary_image.reduce({Axes.CH, Axes.ROUND}, func="max")
     dots_max = dots.reduce({Axes.ZPLANE}, func="max")
 
-    print("Locating spots in reference image")
-    spots = find_spots(dots_max)
+    print(f"Locating spots in reference image with {spot_detection_mode}")
+    spots = spot_detector.run(reference_image=dots_max, image_stack=scaled)
 
-    decoder = make_decoder()
-    print(f"Decoding with {decode_mode}")
-    decoded = decoder.run(spots=spots)
-
-    _ = build_spot_traces_exact_match(spots)
-
-    return QC_score_calc(decoded)
+    return decode_detected_spots(spots)
 
 
 def process_experiment(
@@ -277,11 +1174,21 @@ def process_experiment(
     dense=False,
     spot_detection_mode="starfish",
     int_threshold=0.002,
-    sigma_vals=[1, 10, 30],
+    sigma_vals=(1, 10, 30),
     prob_threshold=None,
+    postcode_kwargs=None,
+    starfish_kwargs=None,
+    spotiflow_kwargs=None,
+    save_postcode_artifacts=False,
+    istdeco_kwargs=None,
+    bardensr_kwargs=None,
+    graphiss_kwargs=None,
+    pixel_kwargs=None,
     spacetx_dirs: Mapping[str, str | Path] | None = None,
     decoded_dirs: Mapping[str, str | Path] | None = None,
+    tile_output_dirs: Mapping[str, str | Path] | None = None,
     final_csv_files: Mapping[str, str | Path] | None = None,
+    final_parquet_files: Mapping[str, str | Path] | None = None,
     region_names: Sequence[str] | None = None,
     overwrite: bool = False,
 ):
@@ -289,23 +1196,80 @@ def process_experiment(
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
 
     Coordinate units are read from the SpaceTX XML metadata written during
-    SpaceTX generation. They are recorded in the decoded CSV and decoding XML.
+    SpaceTX generation. They are recorded in the decoded Parquet/CSV tables and
+    decoding metadata.
 
-    ``spacetx_dirs``, ``decoded_dirs``, and ``final_csv_files`` are per-region
-    independent overrides. Explicit paths are used exactly as supplied. With
-    all required overrides, ``input_dir`` may be ``None``. Existing per-FOV and
-    final outputs are reused by default; ``overwrite=True`` recomputes every
-    FOV and replaces the requested final CSV.
+    The path mappings are independent per-region overrides. Explicit paths are
+    used exactly as supplied. With all required overrides, ``input_dir`` may be
+    ``None``. Existing per-FOV and final outputs are reused by default;
+    ``overwrite=True`` recomputes every FOV and replaces final outputs.
     """
 
     input_dir = Path(input_dir) if input_dir is not None else None
+    decode_mode = decode_mode.upper()
+    is_pixel = decode_mode == "PIXEL"
+    is_istdeco = decode_mode == "ISTDECO"
+    is_bardensr = decode_mode == "BARDENSR"
+    is_graphiss = decode_mode == "GRAPHISS"
+    is_joint_decoder = is_pixel or is_istdeco or is_bardensr or is_graphiss
+    if is_joint_decoder:
+        requested_detector = str(spot_detection_mode).strip().lower()
+        if requested_detector != "starfish":
+            raise ValueError(
+                f"decode_mode='{decode_mode}' performs joint spot detection and decoding; "
+                "do not combine it with spot_detection_mode."
+            )
+        spot_detection_mode = (
+            "starfish_pixel"
+            if is_pixel
+            else (
+                "istdeco_joint"
+                if is_istdeco
+                else "bardensr_joint" if is_bardensr else "graphiss_joint"
+            )
+        )
+    else:
+        spot_detection_mode = normalize_spot_detection_mode(spot_detection_mode)
+    spotiflow_settings = (
+        effective_spotiflow_kwargs(spotiflow_kwargs)
+        if spot_detection_mode == "spotiflow"
+        else {}
+    )
+    spotiflow_package_version = (
+        installed_spotiflow_version() if spot_detection_mode == "spotiflow" else None
+    )
+    istdeco_settings = effective_istdeco_kwargs(istdeco_kwargs) if is_istdeco else {}
+    istdeco_package_version = installed_istdeco_version() if is_istdeco else None
+    bardensr_settings = (
+        effective_bardensr_kwargs(bardensr_kwargs) if is_bardensr else {}
+    )
+    bardensr_package_version = installed_bardensr_version() if is_bardensr else None
+    graphiss_settings = (
+        effective_graphiss_kwargs(graphiss_kwargs) if is_graphiss else {}
+    )
+    graphiss_package_version = installed_graphiss_version() if is_graphiss else None
+    pixel_settings = effective_pixel_kwargs(pixel_kwargs) if is_pixel else {}
+    starfish_settings = (
+        effective_starfish_kwargs(starfish_kwargs)
+        if decode_mode in {"PRMC", "MD"}
+        else {}
+    )
+    starfish_package_version = distribution_version("starfish") if is_pixel else None
     print(f"Processing directory: {input_dir if input_dir is not None else 'explicit paths'}")
 
     run_id = timestamp_for_filename()
 
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
-    if decoded_dirs is not None or final_csv_files is not None:
+    if any(
+        mapping is not None
+        for mapping in (
+            decoded_dirs,
+            tile_output_dirs,
+            final_csv_files,
+            final_parquet_files,
+        )
+    ):
         print("[INFO] Using explicit decoded output mappings")
         if output_dir_prefix is not None:
             print(f"[INFO] Unmapped outputs fall back to: {output_dir_prefix.resolve()}")
@@ -314,12 +1278,19 @@ def process_experiment(
     else:
         print("[INFO] Using default output location under each region directory")
 
+    if dense and is_joint_decoder:
+        raise ValueError(f"dense=True is not supported with decode_mode='{decode_mode}'.")
     if dense:
         print("DENSE (per-channel) decoding")
 
     if dense and decode_mode != "PRMC":
         print(f"dense=True → overriding decode_mode='{decode_mode}' to 'PRMC'")
         decode_mode = "PRMC"
+
+    if save_postcode_artifacts and decode_mode != "POSTCODE":
+        raise ValueError(
+            "save_postcode_artifacts=True is only valid with decode_mode='POSTCODE'."
+        )
 
     region_pattern = re.compile(r"^R(\d+)$")
     available_paths: dict[str, Path] = {}
@@ -334,7 +1305,13 @@ def process_experiment(
             available_paths[path.name] = path
 
     explicit_names = []
-    for mapping in (spacetx_dirs, decoded_dirs, final_csv_files):
+    for mapping in (
+        spacetx_dirs,
+        decoded_dirs,
+        tile_output_dirs,
+        final_csv_files,
+        final_parquet_files,
+    ):
         if mapping:
             explicit_names.extend(str(name) for name in mapping)
     if region_names is not None:
@@ -375,42 +1352,39 @@ def process_experiment(
     if skipped_regions:
         print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
 
-    SPOTIFLOW_MODEL = None
-    if spot_detection_mode == "spotiflow":
-        from spotiflow.model import Spotiflow
-
-        SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
-    elif spot_detection_mode != "starfish":
-        raise ValueError(
-            "spot_detection_mode must be 'starfish' or 'spotiflow', got "
-            f"{spot_detection_mode!r}"
-        )
-
+    shared_spot_detector = None
     for region_name in selected_regions:
         region_directory = available_paths.get(region_name)
+        is_postcode = decode_mode == "POSTCODE"
+        postcode_settings = (
+            effective_postcode_kwargs(postcode_kwargs) if is_postcode else {}
+        )
+        decoded_subdir = decoding_output_subdir(
+            decode_mode,
+            dense,
+            spot_detection_mode,
+        )
 
         if decoded_dirs is not None and region_name in decoded_dirs:
             decoded_dir = Path(decoded_dirs[region_name])
         elif final_csv_files is not None and region_name in final_csv_files:
             decoded_dir = Path(final_csv_files[region_name]).parent
+        elif final_parquet_files is not None and region_name in final_parquet_files:
+            decoded_dir = Path(final_parquet_files[region_name]).parent
+        elif tile_output_dirs is not None and region_name in tile_output_dirs:
+            decoded_dir = Path(tile_output_dirs[region_name]).parent
         elif output_dir_prefix is None:
             if region_directory is None:
                 raise ValueError(
                     f"No decoded output path supplied for {region_name}; pass "
-                    "decoded_dirs, final_csv_files, output_dir_prefix, or input_dir"
+                    "decoded_dirs, final output mappings, output_dir_prefix, or input_dir"
                 )
-            decoded_dir = region_directory / "decoding" / ("2_decoded_dense" if dense else "2_decoded")
+            decoded_dir = region_directory / "decoding" / decoded_subdir
         else:
-            decoded_dir = output_dir_prefix / region_name / "decoding" / (
-                "2_decoded_dense" if dense else "2_decoded"
-            )
+            decoded_dir = output_dir_prefix / region_name / "decoding" / decoded_subdir
 
-        if final_csv_files is not None and region_name in final_csv_files:
-            final_csv = Path(final_csv_files[region_name])
-        else:
-            final_csv = decoded_dir / f"{region_name}_decoded.csv"
-
-        if spacetx_dirs is not None and region_name in spacetx_dirs:
+        has_explicit_spacetx = spacetx_dirs is not None and region_name in spacetx_dirs
+        if has_explicit_spacetx:
             SpaceTX_dir = Path(spacetx_dirs[region_name])
         elif output_dir_prefix is None:
             if region_directory is None:
@@ -422,91 +1396,259 @@ def process_experiment(
             SpaceTX_dir = output_dir_prefix / region_name / "decoding" / "1_SpaceTX_format"
         SpaceTX_dir = SpaceTX_dir.resolve()
         experiment_json = SpaceTX_dir / "experiment.json"
-        if not experiment_json.is_file():
-            source = "Explicit SpaceTX" if spacetx_dirs and region_name in spacetx_dirs else "SpaceTX"
-            raise FileNotFoundError(f"{source} experiment.json not found: {experiment_json}")
+        if has_explicit_spacetx and not experiment_json.is_file():
+            raise FileNotFoundError(
+                f"Explicit SpaceTX experiment.json not found: {experiment_json}"
+            )
 
         print("=" * 60)
         print(f"\033[1mProcessing region {region_name}\033[0m")
         print(f"Output decoded directory: {decoded_dir}")
 
+        final_stem = (
+            f"{region_name}_decoded_postcode"
+            if is_postcode
+            else f"{region_name}_decoded_pixel"
+            if is_pixel
+            else f"{region_name}_decoded_istdeco"
+            if is_istdeco
+            else f"{region_name}_decoded_bardensr"
+            if is_bardensr
+            else f"{region_name}_decoded_graphiss"
+            if is_graphiss
+            else f"{region_name}_decoded"
+        )
+        explicit_csv = (
+            Path(final_csv_files[region_name])
+            if final_csv_files is not None and region_name in final_csv_files
+            else None
+        )
+        explicit_parquet = (
+            Path(final_parquet_files[region_name])
+            if final_parquet_files is not None and region_name in final_parquet_files
+            else None
+        )
+        if explicit_csv is not None and explicit_parquet is None:
+            final_csv = explicit_csv
+            final_parquet = explicit_csv.with_suffix(".parquet")
+        elif explicit_parquet is not None and explicit_csv is None:
+            final_parquet = explicit_parquet
+            final_csv = explicit_parquet.with_suffix(".csv")
+        else:
+            final_csv = explicit_csv or decoded_dir / f"{final_stem}.csv"
+            final_parquet = explicit_parquet or decoded_dir / f"{final_stem}.parquet"
+
+        if final_parquet.exists() and not overwrite:
+            if not final_csv.exists():
+                final_csv.parent.mkdir(parents=True, exist_ok=True)
+                pd.read_parquet(final_parquet).to_csv(final_csv, index=False)
+                print(f"[{region_name}] Restored missing CSV compatibility copy.")
+            print(f"[{region_name}] Skipping: canonical output already exists.")
+            print(f"  ✔ {final_parquet}")
+            continue
         if final_csv.exists() and not overwrite:
-            print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
+            print(
+                f"[{region_name}] Skipping: legacy CSV output {final_csv.name} "
+                "already exists."
+            )
             print(f"  ✔ {final_csv}")
             continue
 
         decoded_dir.mkdir(parents=True, exist_ok=True)
         final_csv.parent.mkdir(parents=True, exist_ok=True)
-        if overwrite and final_csv.exists():
-            final_csv.unlink()
+        final_parquet.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite:
+            for final_path in (final_csv, final_parquet):
+                if final_path.exists():
+                    final_path.unlink()
 
         coordinate_units, coordinate_pixel_to_um = read_spacetx_coordinate_metadata(SpaceTX_dir)
 
         experiment = Experiment.from_json(str(experiment_json))
+        control_settings = (
+            postcode_settings
+            if is_postcode
+            else pixel_settings
+            if is_pixel
+            else istdeco_settings
+            if is_istdeco
+            else bardensr_settings
+            if is_bardensr
+            else graphiss_settings
+            if is_graphiss
+            else starfish_settings
+        )
+        control_fraction = float(control_settings.get("fake_barcode_fraction", 0.0))
+        codebook_sizes = getattr(experiment.codebook, "sizes", {})
+        control_true_count = int(codebook_sizes.get(Features.TARGET, 0))
+        control_fake_count = (
+            int(ceil(control_true_count * control_fraction))
+            if control_fraction > 0
+            else 0
+        )
         tiles = list(experiment.keys())
+        tile_output_dir = (
+            Path(tile_output_dirs[region_name])
+            if tile_output_dirs is not None and region_name in tile_output_dirs
+            else decoded_dir / "tiles"
+        )
+        tile_output_dir.mkdir(parents=True, exist_ok=True)
+        if is_postcode and save_postcode_artifacts:
+            (decoded_dir / "posteriors").mkdir(parents=True, exist_ok=True)
+            (decoded_dir / "models").mkdir(parents=True, exist_ok=True)
+        tile_suffix = ".parquet"
+        tile_files = sorted(tile_output_dir.glob(f"fov_*{tile_suffix}"))
+        print(f"Found {len(tile_files)} completed tile outputs")
 
-        csv_files = sorted(decoded_dir.glob("fov_*.csv"))
-        print(f"Found {len(csv_files)} output files")
-
-        tiles_done = [f.stem for f in csv_files]
+        if overwrite:
+            for tile_file in tile_files:
+                tile_file.unlink()
+            tile_files = []
+        tiles_done = [path.stem for path in tile_files]
         not_done = sorted(tiles if overwrite else set(tiles) - set(tiles_done))
         print(f"-> {len(not_done)} tiles left to process")
 
         for tile_id in not_done:
             tile = experiment[tile_id]
-            tile_csv = decoded_dir / f"{tile_id}.csv"
-            if overwrite and tile_csv.exists():
-                tile_csv.unlink()
             print(f"\033[1;90mProcessing tile {tile_id[-3:]} \033[0m")
 
-            df = ISS_pipeline(
-                tile,
-                experiment.codebook,
-                dense=dense,
-                register=register,
-                register_dapi=register_dapi,
-                masking_radius=masking_radius,
-                int_threshold=int_threshold,
-                sigma_vals=sigma_vals,
-                decode_mode=decode_mode,
-                channel_normalization=normalization_method,
-                spot_detection_mode=spot_detection_mode,
-                spotiflow_model=SPOTIFLOW_MODEL,
-                prob_threshold=prob_threshold,
-            )
+            if spot_detection_mode == "spotiflow" and shared_spot_detector is None:
+                shared_spot_detector = create_spot_detector(
+                    "spotiflow",
+                    spotiflow_kwargs=spotiflow_settings,
+                )
 
-            if df is None or df.empty:
+            if is_pixel:
+                pipeline_result = ISS_pixel_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    pixel_kwargs=pixel_settings,
+                )
+            elif is_istdeco:
+                pipeline_result = ISS_istdeco_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    istdeco_kwargs=istdeco_settings,
+                )
+            elif is_bardensr:
+                pipeline_result = ISS_bardensr_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    bardensr_kwargs=bardensr_settings,
+                )
+            elif is_graphiss:
+                pipeline_result = ISS_graphiss_pipeline(
+                    tile,
+                    experiment.codebook,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    channel_normalization=normalization_method,
+                    graphiss_kwargs=graphiss_settings,
+                )
+            else:
+                pipeline_result = ISS_pipeline(
+                    tile,
+                    experiment.codebook,
+                    dense=dense,
+                    register=register,
+                    register_dapi=register_dapi,
+                    masking_radius=masking_radius,
+                    int_threshold=int_threshold,
+                    sigma_vals=sigma_vals,
+                    decode_mode=decode_mode,
+                    channel_normalization=normalization_method,
+                    spot_detection_mode=spot_detection_mode,
+                    spotiflow_kwargs=spotiflow_settings,
+                    spot_detector=shared_spot_detector,
+                    prob_threshold=prob_threshold,
+                    postcode_kwargs=postcode_kwargs,
+                    starfish_kwargs=starfish_settings,
+                    return_postcode_raw=save_postcode_artifacts,
+                )
+            if is_postcode and save_postcode_artifacts:
+                df, raw_postcode_output = pipeline_result
+            else:
+                df = pipeline_result
+                raw_postcode_output = None
+
+            if df is None:
                 continue
 
+            df["barcode_control_true_count"] = control_true_count
+            df["barcode_control_fake_count"] = control_fake_count
+            df["barcode_control_fraction"] = control_fraction
             df["tile"] = tile_id
+            df["spot_detector"] = spot_detection_mode
             df["coordinate_units"] = coordinate_units
             df["coordinate_pixel_to_um"] = coordinate_pixel_to_um
 
-            print(f"Saving per-tile CSV: {tile_csv}")
-            df.to_csv(tile_csv, index=False)
+            if is_postcode or is_joint_decoder:
+                df = add_spot_identity(df, region_name, tile_id)
+                if df["spot_uid"].duplicated().any():
+                    raise ValueError(f"Duplicate spot_uid values detected in tile {tile_id}.")
+                if save_postcode_artifacts:
+                    save_postcode_decoder_artifacts(
+                        raw_postcode_output,
+                        decoded_dir,
+                        tile_id,
+                        df["spot_uid"].to_numpy(),
+                        postcode_kwargs=postcode_kwargs,
+                    )
+            tile_path = tile_output_dir / f"{tile_id}.parquet"
+            print(f"Saving per-tile Parquet: {tile_path}")
+            df.to_parquet(tile_path, index=False)
 
-        print(f"\nWriting region-level concatenated CSV for {region_name!r} ...")
+        print(
+            f"\nWriting region-level concatenated Parquet and CSV for {region_name!r} ..."
+        )
 
-        wrote_region_csv = False
-        csv_paths = sorted(decoded_dir.glob("fov_*.csv"))
-
-        if not csv_paths:
-            print(f" No tile CSVs matching 'fov*.csv' found in {decoded_dir}; nothing to concatenate.")
+        tile_paths = sorted(tile_output_dir.glob(f"fov*{tile_suffix}"))
+        wrote_region_output = False
+        if not tile_paths:
+            print(f" No tile outputs found in {tile_output_dir}; nothing to concatenate.")
         else:
             dfs = []
-            for p in csv_paths:
-                df = pd.read_csv(p)
+            for path in tile_paths:
+                df = pd.read_parquet(path)
                 dfs.append(df)
-                print(f"  • Loaded {p.name} ({len(df)} rows)")
+                print(f"  • Loaded {path.name} ({len(df)} rows)")
 
             concat = pd.concat(dfs, ignore_index=True)
-            concat.insert(0, "cont. spot ids", np.arange(len(concat), dtype=int))
-
+            if is_postcode or is_joint_decoder:
+                if concat["spot_uid"].duplicated().any():
+                    duplicates = concat.loc[
+                        concat["spot_uid"].duplicated(keep=False), "spot_uid"
+                    ].unique()
+                    raise ValueError(
+                        "Duplicate spot_uid values detected across region output: "
+                        f"{duplicates[:5].tolist()}"
+                    )
+            else:
+                concat.insert(0, "cont. spot ids", np.arange(len(concat), dtype=int))
+            concat.to_parquet(final_parquet, index=False)
             concat.to_csv(final_csv, index=False)
-            wrote_region_csv = True
-            print(f" → Wrote {len(concat)} total rows to {final_csv}")
+            print(f" → Wrote {len(concat)} rows to {final_parquet.name}")
+            print(f" → Wrote CSV compatibility copy to {final_csv.name}")
+            wrote_region_output = True
 
-        if wrote_region_csv:
+        if wrote_region_output:
+            completed_tile_files = sorted(tile_output_dir.glob(f"fov*{tile_suffix}"))
+            completed_tile_count = len(completed_tile_files)
+            remaining_tile_count = len(set(tiles) - {p.stem for p in completed_tile_files})
+
             xml_path = decoded_dir / f"decoding_run_{run_id}.xml"
             root = ET.Element("ISSDecodingRun", attrib={"region": str(region_name)})
             root.set("run_id", str(run_id))
@@ -516,6 +1658,7 @@ def process_experiment(
             ET.SubElement(paths_el, "SpaceTXDir").text = str(SpaceTX_dir)
             ET.SubElement(paths_el, "ExperimentJSON").text = str(SpaceTX_dir / "experiment.json")
             ET.SubElement(paths_el, "FinalCSV").text = str(final_csv)
+            ET.SubElement(paths_el, "FinalParquet").text = str(final_parquet)
 
             params_el = ET.SubElement(root, "Parameters")
             ET.SubElement(params_el, "dense").text = str(dense)
@@ -525,20 +1668,95 @@ def process_experiment(
             ET.SubElement(params_el, "normalization_method").text = str(normalization_method)
             ET.SubElement(params_el, "decode_mode").text = str(decode_mode)
             ET.SubElement(params_el, "spot_detection_mode").text = str(spot_detection_mode)
+            if spot_detection_mode == "spotiflow":
+                ET.SubElement(params_el, "spotiflow_version").text = str(
+                    spotiflow_package_version
+                )
+                ET.SubElement(params_el, "spotiflow_kwargs").text = json.dumps(
+                    spotiflow_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "int_threshold").text = str(int_threshold)
             ET.SubElement(params_el, "sigma_vals").text = ",".join([str(x) for x in sigma_vals])
             ET.SubElement(params_el, "prob_threshold").text = (
                 "None" if prob_threshold is None else str(prob_threshold)
             )
+            ET.SubElement(params_el, "postcode_kwargs").text = json.dumps(
+                postcode_settings, sort_keys=True, default=str
+            )
+            ET.SubElement(params_el, "starfish_kwargs").text = json.dumps(
+                starfish_settings, sort_keys=True, default=str
+            )
+            ET.SubElement(params_el, "barcode_control_true_count").text = str(
+                control_true_count
+            )
+            ET.SubElement(params_el, "barcode_control_fake_count").text = str(
+                control_fake_count
+            )
+            ET.SubElement(params_el, "barcode_control_fraction").text = str(
+                control_fraction
+            )
+            ET.SubElement(params_el, "save_postcode_artifacts").text = str(
+                save_postcode_artifacts
+            )
+            if is_postcode:
+                ET.SubElement(params_el, "postcode_commit").text = POSTCODE_COMMIT
+                ET.SubElement(params_el, "output_schema_version").text = (
+                    POSTCODE_OUTPUT_SCHEMA_VERSION
+                )
+            if is_istdeco:
+                ET.SubElement(params_el, "istdeco_version").text = str(
+                    istdeco_package_version
+                )
+                ET.SubElement(params_el, "istdeco_commit").text = ISTDECO_COMMIT
+                ET.SubElement(params_el, "istdeco_output_schema_version").text = (
+                    ISTDECO_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "istdeco_kwargs").text = json.dumps(
+                    istdeco_settings, sort_keys=True, default=str
+                )
+            if is_bardensr:
+                ET.SubElement(params_el, "bardensr_version").text = str(
+                    bardensr_package_version
+                )
+                ET.SubElement(params_el, "bardensr_commit").text = BARDENSR_COMMIT
+                ET.SubElement(params_el, "bardensr_output_schema_version").text = (
+                    BARDENSR_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "bardensr_kwargs").text = json.dumps(
+                    bardensr_settings, sort_keys=True, default=str
+                )
+            if is_graphiss:
+                ET.SubElement(params_el, "graphiss_version").text = str(
+                    graphiss_package_version
+                )
+                ET.SubElement(params_el, "graphiss_commit").text = GRAPHISS_COMMIT
+                ET.SubElement(params_el, "graphiss_output_schema_version").text = (
+                    GRAPHISS_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "graphiss_kwargs").text = json.dumps(
+                    graphiss_settings, sort_keys=True, default=str
+                )
+            if is_pixel:
+                ET.SubElement(params_el, "starfish_version").text = str(
+                    starfish_package_version
+                )
+                ET.SubElement(params_el, "pixel_output_schema_version").text = (
+                    PIXEL_OUTPUT_SCHEMA_VERSION
+                )
+                ET.SubElement(params_el, "pixel_kwargs").text = json.dumps(
+                    pixel_settings, sort_keys=True, default=str
+                )
             ET.SubElement(params_el, "coordinate_units").text = str(coordinate_units)
             ET.SubElement(params_el, "coordinate_pixel_to_um").text = (
-                "None" if coordinate_pixel_to_um is None else str(coordinate_pixel_to_um)
+                "None"
+                if coordinate_pixel_to_um is None
+                else str(coordinate_pixel_to_um)
             )
 
             tiles_el = ET.SubElement(root, "Tiles")
             ET.SubElement(tiles_el, "tiles_total").text = str(len(tiles))
-            ET.SubElement(tiles_el, "tiles_done").text = str(len(tiles_done))
-            ET.SubElement(tiles_el, "tiles_remaining").text = str(len(not_done))
+            ET.SubElement(tiles_el, "tiles_done").text = str(completed_tile_count)
+            ET.SubElement(tiles_el, "tiles_remaining").text = str(remaining_tile_count)
 
             tree = ET.ElementTree(root)
             try:
@@ -548,3 +1766,144 @@ def process_experiment(
 
             tree.write(xml_path, encoding="utf-8", xml_declaration=True)
             print(f"[{region_name}] Decoding XML written to: {xml_path}")
+
+            if is_postcode or is_joint_decoder:
+                manifest_path = decoded_dir / f"decoding_run_{run_id}.json"
+                manifest = {
+                    "schema_version": (
+                        POSTCODE_OUTPUT_SCHEMA_VERSION
+                        if is_postcode
+                        else (
+                            PIXEL_OUTPUT_SCHEMA_VERSION
+                            if is_pixel
+                            else (
+                                ISTDECO_OUTPUT_SCHEMA_VERSION
+                                if is_istdeco
+                                else (
+                                    BARDENSR_OUTPUT_SCHEMA_VERSION
+                                    if is_bardensr
+                                    else GRAPHISS_OUTPUT_SCHEMA_VERSION
+                                )
+                            )
+                        )
+                    ),
+                    "run_id": run_id,
+                    "created_at": datetime.now().astimezone().isoformat(),
+                    "region": region_name,
+                    "decoder": {
+                        "name": (
+                            "postcode"
+                            if is_postcode
+                            else (
+                                "starfish_pixel"
+                                if is_pixel
+                                else (
+                                    "istdeco"
+                                    if is_istdeco
+                                    else "bardensr" if is_bardensr else "graphiss"
+                                )
+                            )
+                        ),
+                        "commit": (
+                            POSTCODE_COMMIT
+                            if is_postcode
+                            else (
+                                None
+                                if is_pixel
+                                else (
+                                    ISTDECO_COMMIT
+                                    if is_istdeco
+                                    else (
+                                        BARDENSR_COMMIT
+                                        if is_bardensr
+                                        else GRAPHISS_COMMIT
+                                    )
+                                )
+                            )
+                        ),
+                        "version": (
+                            starfish_package_version
+                            if is_pixel
+                            else (
+                                None
+                                if is_postcode
+                                else (
+                                    istdeco_package_version
+                                    if is_istdeco
+                                    else (
+                                        bardensr_package_version
+                                        if is_bardensr
+                                        else graphiss_package_version
+                                    )
+                                )
+                            )
+                        ),
+                    },
+                    "paths": {
+                        "decoded_dir": str(decoded_dir),
+                        "spacetx_dir": str(SpaceTX_dir),
+                        "experiment_json": str(SpaceTX_dir / "experiment.json"),
+                        "final_parquet": str(final_parquet),
+                        "final_csv": str(final_csv),
+                        "tile_tables": str(tile_output_dir),
+                        "posteriors": (
+                            str(decoded_dir / "posteriors")
+                            if save_postcode_artifacts
+                            else None
+                        ),
+                        "models": (
+                            str(decoded_dir / "models")
+                            if save_postcode_artifacts
+                            else None
+                        ),
+                    },
+                    "parameters": {
+                        "register": register,
+                        "register_dapi": register_dapi,
+                        "masking_radius": masking_radius,
+                        "normalization_method": normalization_method,
+                        "spot_detection_mode": spot_detection_mode,
+                        "spotiflow_version": spotiflow_package_version,
+                        "spotiflow_kwargs": json.loads(
+                            json.dumps(spotiflow_settings, default=str)
+                        ),
+                        "int_threshold": int_threshold,
+                        "sigma_vals": list(sigma_vals),
+                        "prob_threshold": prob_threshold,
+                        "postcode_kwargs": json.loads(
+                            json.dumps(postcode_settings, default=str)
+                        ),
+                        "starfish_kwargs": json.loads(
+                            json.dumps(starfish_settings, default=str)
+                        ),
+                        "save_postcode_artifacts": save_postcode_artifacts,
+                        "istdeco_kwargs": json.loads(
+                            json.dumps(istdeco_settings, default=str)
+                        ),
+                        "bardensr_kwargs": json.loads(
+                            json.dumps(bardensr_settings, default=str)
+                        ),
+                        "graphiss_kwargs": json.loads(
+                            json.dumps(graphiss_settings, default=str)
+                        ),
+                        "pixel_kwargs": json.loads(
+                            json.dumps(pixel_settings, default=str)
+                        ),
+                        "barcode_control_true_count": control_true_count,
+                        "barcode_control_fake_count": control_fake_count,
+                        "barcode_control_fraction": control_fraction,
+                        "coordinate_units": coordinate_units,
+                        "coordinate_pixel_to_um": coordinate_pixel_to_um,
+                    },
+                    "tiles": {
+                        "total": len(tiles),
+                        "done": completed_tile_count,
+                        "remaining": remaining_tile_count,
+                    },
+                    "rows": len(concat),
+                }
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"[{region_name}] Decoding JSON written to: {manifest_path}")

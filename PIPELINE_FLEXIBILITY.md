@@ -12,7 +12,8 @@ path. External inputs must still satisfy the existing data contracts:
 - preprocessing images are TIFFs with the established tile/channel filename
   pattern and TileScanInfo XML schema;
 - SpaceTX tile directories contain `Cycle*_s*_ch*.tif` plus one coordinate CSV;
-- decoded transcript CSVs contain the columns required by the selected stage;
+- decoded transcript CSV or Parquet tables contain the columns required by the
+  selected stage;
 - segmentation labels are SciPy sparse `.npz` label images;
 - AnnData inputs use the documented `.h5ad` conventions.
 
@@ -108,23 +109,30 @@ make_spacetx_format(
 )
 ```
 
-Decoding input, per-FOV cache, and final CSV can be placed independently. The
-final filename is used exactly as supplied:
+Every decoder backend uses the same path contract: Starfish PRMC/MD, Spotiflow,
+PoSTcode, pixel decoding, ISTDECO, Bardensr, and Graph-ISS. SpaceTX input,
+decoded metadata, per-FOV Parquet cache, and final CSV/Parquet outputs can be
+placed independently. Final filenames are used exactly as supplied:
 
 ```python
 process_experiment(
     input_dir=None,
     region_names=["sample-five"],
     spacetx_dirs={"sample-five": exports / "spacetx"},
-    decoded_dirs={"sample-five": scratch / "fov-cache"},
+    decoded_dirs={"sample-five": scratch / "metadata"},
+    tile_output_dirs={"sample-five": scratch / "fov-cache"},
     final_csv_files={"sample-five": exports / "transcripts.custom.csv"},
+    final_parquet_files={"sample-five": exports / "transcripts.custom.parquet"},
+    decode_mode="ISTDECO",
     overwrite=True,
 )
 ```
 
-Without `overwrite`, an existing final CSV is reused. With it, every FOV is
-recomputed. Detector settings including `spot_detection_mode` and
-`prob_threshold` now reach `ISS_pipeline`.
+Without `overwrite`, an existing final CSV or Parquet output is reused and
+completed per-FOV checkpoints resume an interrupted run. With it, every FOV in
+the selected region is recomputed. Decoder- and detector-specific settings are
+forwarded without changing path behavior. Joint image decoders keep their own
+output schemas and provenance while sharing the same override rules.
 
 ## Segmentation and AnnData from external files
 

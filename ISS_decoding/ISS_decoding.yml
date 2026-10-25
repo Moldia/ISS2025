@@ -9,8 +9,9 @@ dependencies:
   - wheel
 
   # Arrays / data
-  - numpy
+  - numpy>=1.26,<2
   - pandas
+  - pyarrow>=10
 
   # Imaging & plotting
   - scikit-image
@@ -38,8 +39,5 @@ dependencies:
       - regional
       - showit
 
-      # Spotiflow (your script imports Spotiflow and SpotiflowDetector)
-      - spotiflow==0.5.8
-
-      # Install current project (non-editable)
-      - .
+      # Install the current project with all optional decoding integrations
+      - ".[postcode,spotiflow,istdeco,bardensr,graphiss]"

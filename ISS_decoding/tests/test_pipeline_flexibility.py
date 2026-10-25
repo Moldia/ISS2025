@@ -55,8 +55,9 @@ class DecodingPathOverrideTests(unittest.TestCase):
                     prob_threshold=0.7,
                 )
 
-            self.assertTrue((decoded_dir / "fov_000.csv").is_file())
+            self.assertTrue((decoded_dir / "tiles" / "fov_000.parquet").is_file())
             self.assertTrue(final_csv.is_file())
+            self.assertTrue(final_csv.with_suffix(".parquet").is_file())
             self.assertEqual(pd.read_csv(final_csv)["target"].tolist(), ["GeneA"])
             self.assertEqual(pipeline.call_args.kwargs["spot_detection_mode"], "starfish")
             self.assertEqual(pipeline.call_args.kwargs["prob_threshold"], 0.7)
@@ -80,9 +81,10 @@ class DecodingPathOverrideTests(unittest.TestCase):
             root = Path(tmp)
             spacetx = self._experiment_dir(root)
             decoded_dir = root / "decoded"
-            decoded_dir.mkdir()
-            pd.DataFrame({"target": ["old"]}).to_csv(
-                decoded_dir / "fov_000.csv", index=False
+            tile_dir = decoded_dir / "tiles"
+            tile_dir.mkdir(parents=True)
+            pd.DataFrame({"target": ["old"]}).to_parquet(
+                tile_dir / "fov_000.parquet", index=False
             )
             final_csv = root / "result.csv"
             final_csv.write_text("old\nvalue\n", encoding="utf-8")
@@ -110,6 +112,10 @@ class DecodingPathOverrideTests(unittest.TestCase):
                 )
 
             pipeline.assert_called_once()
+            self.assertEqual(
+                pd.read_parquet(tile_dir / "fov_000.parquet")["target"].tolist(),
+                ["GeneA"],
+            )
             self.assertEqual(pd.read_csv(final_csv)["target"].tolist(), ["GeneA"])
 
     def test_legacy_paths_remain_the_default(self):
@@ -136,6 +142,59 @@ class DecodingPathOverrideTests(unittest.TestCase):
 
             expected = root / "R1" / "decoding" / "2_decoded" / "R1_decoded.csv"
             self.assertTrue(expected.is_file())
+
+    def test_explicit_paths_apply_to_every_decoder_backend(self):
+        backends = {
+            "PRMC": "ISS_pipeline",
+            "POSTCODE": "ISS_pipeline",
+            "PIXEL": "ISS_pixel_pipeline",
+            "ISTDECO": "ISS_istdeco_pipeline",
+            "BARDENSR": "ISS_bardensr_pipeline",
+            "GRAPHISS": "ISS_graphiss_pipeline",
+        }
+
+        for decode_mode, pipeline_name in backends.items():
+            with self.subTest(decode_mode=decode_mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                spacetx = self._experiment_dir(root)
+                decoded_dir = root / "metadata"
+                tile_dir = root / "cache" / decode_mode.lower()
+                final_csv = root / "published" / f"{decode_mode.lower()}.custom.csv"
+                final_parquet = root / "canonical" / f"{decode_mode.lower()}.custom.parquet"
+
+                frame = pd.DataFrame(
+                    {
+                        "spot_id": [0],
+                        "target": ["GeneA"],
+                        "xc": [1.0],
+                        "yc": [2.0],
+                    }
+                )
+                with (
+                    patch.object(decoding.Experiment, "from_json", return_value=_FakeExperiment()),
+                    patch.object(
+                        decoding,
+                        "read_spacetx_coordinate_metadata",
+                        return_value=("microns", 0.2),
+                    ),
+                    patch.object(decoding, pipeline_name, return_value=frame) as pipeline,
+                ):
+                    decoding.process_experiment(
+                        input_dir=None,
+                        region_names=["sample-a"],
+                        spacetx_dirs={"sample-a": spacetx},
+                        decoded_dirs={"sample-a": decoded_dir},
+                        tile_output_dirs={"sample-a": tile_dir},
+                        final_csv_files={"sample-a": final_csv},
+                        final_parquet_files={"sample-a": final_parquet},
+                        decode_mode=decode_mode,
+                    )
+
+                pipeline.assert_called_once()
+                self.assertTrue((tile_dir / "fov_000.parquet").is_file())
+                self.assertTrue(final_csv.is_file())
+                self.assertTrue(final_parquet.is_file())
+                self.assertTrue(any(decoded_dir.glob("decoding_run_*.xml")))
 
 
 if __name__ == "__main__":

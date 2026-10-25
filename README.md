@@ -66,7 +66,14 @@ Please refer to the preprocessing notebook for usage details.
 
 # decoding module:
 
-The major update in the decoding module is the introduction of the **dense mode**.
+The decoding module now supports several interchangeable workflows over the
+same SpaceTx inputs: Starfish PRMC/metric-distance decoding, Spotiflow
+detection, PoSTcode, Starfish pixel decoding, ISTDECO, Bardensr, and Graph-ISS.
+Each backend has separate restartable outputs and provenance, while sharing the
+same optional per-region path overrides. Existing directory conventions remain
+the default.
+
+The module also provides a **dense mode** for the Starfish spot-decoding path.
 
 In this modality, spot detection is performed independently for each channel, rather than using a pseudoanchor image (maximum projection across channels) as in the standard mode. While this significantly increases computation time, it improves detection performance in **crowded or high-density samples**, where pseudoanchor-based detection can underestimate spot counts.
 

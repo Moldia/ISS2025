@@ -6,22 +6,45 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="ISS_decoding",
-    version="0.0.23",
+    version="0.0.36",
     author="Marco Grillo",
     author_email="marco.grillo@scilifelab.se",
     description="Decode preprocessed ISS images, including SpaceTx formatting and plotting",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(exclude=("tests", "docs", "*.ipynb_checkpoints")),
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     install_requires=[
-        "numpy>=1.22",
+        "numpy>=1.22,<2",
         "pandas>=1.4",
+        "pyarrow>=10",
         "xarray>=0.20",
         "scikit-image>=0.19",
         "slicedimage>=3",
         "starfish>=0.3",  # add other dependencies you use
     ],
+    extras_require={
+        "postcode": [
+            "torch>=2.1,<3",
+            "pyro-ppl>=1.9.1,<2",
+            "postcode @ git+https://github.com/mgcizzu/postcode.git@4db68cc5cc398128bcfd97a764bef3c98ee3c583",
+        ],
+        "spotiflow": [
+            "spotiflow==0.6.5",
+        ],
+        "istdeco": [
+            "torch>=2.1,<3",
+            "istdeco @ git+https://github.com/mgcizzu/istdeco.git@2200b4e969528e46588fbe75b6b039f72cd962eb",
+        ],
+        "bardensr": [
+            "tensorflow[and-cuda]>=2.16,<3; platform_system == 'Linux'",
+            "tensorflow>=2.16,<3; platform_system != 'Linux'",
+            "bardensr @ git+https://github.com/mgcizzu/bardensr.git@79cf8f9f1f28c8dbd00ab2dd948a214574948307",
+        ],
+        "graphiss": [
+            "graph-iss @ git+https://github.com/mgcizzu/graph-iss.git@cc3dbeb1aee785ab1f7c671c1296c62e6b34d42a",
+        ],
+    },
     keywords=[
         "python", "spatial transcriptomics",
         "spatially resolved transcriptomics",
