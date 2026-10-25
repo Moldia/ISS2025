@@ -9,6 +9,11 @@ It provides utilities for:
 - Aggregation and formatting for downstream analysis  
 - Visualization of processed spatial transcriptomics results  
 
+Cellpose, StarDist, AnnData creation, and PCIseq now accept exact input/output
+paths in addition to the conventional region tree. See
+[`../PIPELINE_FLEXIBILITY.md`](../PIPELINE_FLEXIBILITY.md) for partial override,
+independent-stage, and recomputation examples.
+
 ---
 
 # Installation & Updating (Users)

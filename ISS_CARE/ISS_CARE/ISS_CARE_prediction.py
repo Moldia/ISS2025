@@ -827,16 +827,27 @@ def process_one_cycle(
     tiles_subpath: str,
     axes: str,
     out_dtype: str,
+    input_tile_dir: Path | str | None = None,
+    output_tile_dir: Path | str | None = None,
 ) -> None:
     del preprocessing_relpath
 
-    in_tile_dir = cycle_dir / tiles_subpath
+    in_tile_dir = (
+        Path(input_tile_dir)
+        if input_tile_dir is not None
+        else cycle_dir / tiles_subpath
+    )
     if not in_tile_dir.exists():
+        if input_tile_dir is not None:
+            raise FileNotFoundError(f"Explicit CARE input tile directory not found: {in_tile_dir}")
         print_warn(f"{region_name}/{cycle_name}: missing tile folder, skipping: {in_tile_dir}")
         return
 
-    out_tile_dir = out_cycle_dir / tiles_subpath / "CARE"
-    out_tile_dir.mkdir(parents=True, exist_ok=True)
+    out_tile_dir = (
+        Path(output_tile_dir)
+        if output_tile_dir is not None
+        else out_cycle_dir / tiles_subpath / "CARE"
+    )
 
     in_tifs = sorted(
         [p for p in in_tile_dir.iterdir() if p.is_file() and p.suffix.lower() in (".tif", ".tiff")],
@@ -844,8 +855,14 @@ def process_one_cycle(
     )
 
     if not in_tifs:
+        if input_tile_dir is not None:
+            raise FileNotFoundError(
+                f"Explicit CARE input tile directory contains no TIFFs: {in_tile_dir}"
+            )
         print_warn(f"{region_name}/{cycle_name}: no TIFFs found, skipping.")
         return
+
+    out_tile_dir.mkdir(parents=True, exist_ok=True)
 
     print_info(f"{region_name}/{cycle_name}: {len(in_tifs)} TIFF(s) found")
 
@@ -989,19 +1006,30 @@ def ISS_CARE_predict(
     debug_prints: bool = True,
     debug_print_limit: int = 3,
     overwrite: bool = False,
+    cycle_directories: dict[tuple[str, str], Path | str] | None = None,
+    input_tile_dirs: dict[tuple[str, str], Path | str] | None = None,
+    output_tile_dirs: dict[tuple[str, str], Path | str] | None = None,
+    preprocessing_relpath: str = "preprocessing",
+    tiles_subpath: str = "4_retiled",
 ):
-    
-    preprocessing_relpath = "preprocessing"
-    tiles_subpath = "4_retiled"
+    """Run CARE prediction with conventional discovery or explicit cycle paths.
+
+    Mapping keys are ``(region_name, cycle_name)``. ``cycle_directories`` can
+    bypass the standard region/cycle tree; ``input_tile_dirs`` and
+    ``output_tile_dirs`` then independently override the directories actually
+    consumed and written by each cycle.
+    """
     axes = "YX"
     out_dtype = "uint16"
     
-    input_dir = Path(input_dir)
+    input_dir = Path(input_dir) if input_dir is not None else None
     model_dir = Path(model_dir)
     
     print_section("CARE prediction setup")
     
-    print_info(f"Processing directory: {input_dir.resolve()}")
+    print_info(
+        f"Processing directory: {input_dir.resolve() if input_dir is not None else 'explicit paths'}"
+    )
     print_info(f"Model base directory: {model_dir.resolve()}")
     print_info(f"Model name: {model_name}")
     
@@ -1061,7 +1089,11 @@ def ISS_CARE_predict(
     
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
-        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+    if output_tile_dirs is not None:
+        print_info("Output location: explicit per-cycle output_tile_dirs")
+        if output_dir_prefix is not None:
+            print_info(f"Unmapped outputs fall back to: {output_dir_prefix.resolve()}")
+    elif output_dir_prefix is not None:
         print_info(f"Output location: {output_dir_prefix.resolve()}")
     else:
         print_info("Output location: default CARE folder inside each cycle directory")
@@ -1071,10 +1103,37 @@ def ISS_CARE_predict(
     
     print_subsection("Region discovery")
     
-    available_numbers, available_map = discover_regions(input_dir)
+    explicit_cycles_by_region: dict[str, list[tuple[int, Path]]] = {}
+    if cycle_directories is not None:
+        for (region_name, cycle_name), path in cycle_directories.items():
+            region_match = re.fullmatch(r"R(\d+)", str(region_name))
+            cycle_match = re.fullmatch(r"Cycle(\d+)", str(cycle_name))
+            if region_match is None or cycle_match is None:
+                raise ValueError(
+                    "cycle_directories keys must look like ('R1', 'Cycle1')"
+                )
+            cycle_path = Path(path)
+            if not cycle_path.is_dir():
+                raise FileNotFoundError(f"Explicit CARE cycle directory not found: {cycle_path}")
+            explicit_cycles_by_region.setdefault(str(region_name), []).append(
+                (int(cycle_match.group(1)), cycle_path)
+            )
+        available_numbers = sorted(
+            int(re.fullmatch(r"R(\d+)", name).group(1))
+            for name in explicit_cycles_by_region
+        )
+        available_map = {
+            number: (input_dir / f"R{number}" if input_dir is not None else Path(f"R{number}"))
+            for number in available_numbers
+        }
+    else:
+        if input_dir is None:
+            raise ValueError("input_dir or cycle_directories is required")
+        available_numbers, available_map = discover_regions(input_dir)
+
     all_regions = [f"R{n}" for n in available_numbers]
-    print_info(f"Regions found on disk ({len(all_regions)}): {all_regions}")
-    
+    print_info(f"Regions found ({len(all_regions)}): {all_regions}")
+
     region_numbers, region_directories = select_region_directories(
         available_numbers=available_numbers,
         available_map=available_map,
@@ -1096,20 +1155,23 @@ def ISS_CARE_predict(
         region_name = region_directory.name
         print_section(f"Region: {region_name}", color=T.CYAN)
 
-        preprocessing_root = region_directory / preprocessing_relpath
-        if not preprocessing_root.exists():
-            print_warn(f"{region_name}: missing preprocessing folder, skipping: {preprocessing_root}")
-            continue
-
-        cycles_found = discover_cycles(preprocessing_root)
+        if cycle_directories is not None:
+            cycles_found = sorted(explicit_cycles_by_region[region_name])
+        else:
+            preprocessing_root = region_directory / preprocessing_relpath
+            if not preprocessing_root.exists():
+                print_warn(f"{region_name}: missing preprocessing folder, skipping: {preprocessing_root}")
+                continue
+            cycles_found = discover_cycles(preprocessing_root)
         if not cycles_found:
             print_warn(f"{region_name}: no Cycle* folders found under: {preprocessing_root}")
             continue
 
         print_info(f"{region_name}: cycles found -> {[c.name for _, c in cycles_found]}")
 
-        for _, cycle_dir in cycles_found:
-            cycle_name = cycle_dir.name
+        for cycle_number, cycle_dir in cycles_found:
+            cycle_name = f"Cycle{cycle_number}"
+            cycle_key = (region_name, cycle_name)
             print_subsection(f"{region_name} / {cycle_name}", color=T.BLUE)
 
             if output_dir_prefix is None:
@@ -1148,6 +1210,16 @@ def ISS_CARE_predict(
                 tiles_subpath=tiles_subpath,
                 axes=axes,
                 out_dtype=out_dtype,
+                input_tile_dir=(
+                    input_tile_dirs.get(cycle_key)
+                    if input_tile_dirs is not None
+                    else None
+                ),
+                output_tile_dir=(
+                    output_tile_dirs.get(cycle_key)
+                    if output_tile_dirs is not None
+                    else None
+                ),
             )
 
     print_section("CARE prediction complete", color=T.GREEN)

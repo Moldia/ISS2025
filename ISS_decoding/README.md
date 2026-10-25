@@ -10,6 +10,12 @@ The module includes utilities to:
 - **Decode** the SpaceTx images to extract spots / barcodes (transcripts).
 - **Visualize and filter** decoding results for downstream analysis and QC.
 
+Both `make_spacetx_format` and `process_experiment` support explicit per-region
+input/output mappings. This allows SpaceTX creation and decoding to run on
+compatible external files without recreating the standard repository tree. See
+[`../PIPELINE_FLEXIBILITY.md`](../PIPELINE_FLEXIBILITY.md) for examples and
+overwrite/reuse semantics.
+
 ---
 
 # Installation & Updating (Users)

@@ -1,5 +1,9 @@
 # ISS_preprocessing
 
+Pipeline stages can be run together with the standard region layout or
+independently with explicit MIP, metadata, OME-TIFF, stitched-image, and retiled
+output paths. See [`../PIPELINE_FLEXIBILITY.md`](../PIPELINE_FLEXIBILITY.md).
+
 `ISS_preprocessing` converts raw microscope output into aligned 2D image tiles ready for decoding.
 
 Microscope acquisitions are 3D Z-stacks, while the decoding pipeline operates on 2D images.  

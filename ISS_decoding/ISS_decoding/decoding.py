@@ -2,7 +2,7 @@
 import math
 import re
 from pathlib import Path
-from typing import Tuple
+from typing import Mapping, Sequence, Tuple
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -183,14 +183,38 @@ def ISS_pipeline(
 
     scaled = sbp.run(filtered, n_processes=1, in_place=False)
 
-    min_sigma, max_sigma, num_sigma = sigma_vals
-    bd = FindSpots.BlobDetector(
-        min_sigma=min_sigma,
-        max_sigma=max_sigma,
-        num_sigma=num_sigma,
-        threshold=int_threshold,
-        measurement_type="mean",
-    )
+    if spot_detection_mode == "starfish":
+        min_sigma, max_sigma, num_sigma = sigma_vals
+        detector = FindSpots.BlobDetector(
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigma=num_sigma,
+            threshold=int_threshold,
+            measurement_type="mean",
+        )
+
+        def find_spots(reference_image):
+            return detector.run(reference_image=reference_image, image_stack=scaled)
+
+    elif spot_detection_mode == "spotiflow":
+        if dense:
+            raise ValueError("spot_detection_mode='spotiflow' is not supported with dense=True")
+        from spotiflow.starfish import SpotiflowDetector
+
+        detector_kwargs = {"model": spotiflow_model or "general"}
+        if prob_threshold is not None:
+            detector_kwargs["probability_threshold"] = float(prob_threshold)
+        detector = SpotiflowDetector(**detector_kwargs)
+
+        def find_spots(reference_image):
+            del reference_image
+            return detector.run(scaled, n_processes=1)
+
+    else:
+        raise ValueError(
+            "spot_detection_mode must be 'starfish' or 'spotiflow', got "
+            f"{spot_detection_mode!r}"
+        )
 
     def make_decoder():
         if decode_mode == "PRMC":
@@ -215,7 +239,7 @@ def ISS_pipeline(
         for ch in channels:
             channel_ref = primary_image.sel({Axes.ROUND: 0, Axes.CH: ch, Axes.ZPLANE: 0})
             print(f"Locating spots for channel {ch}")
-            spots = bd.run(reference_image=channel_ref, image_stack=scaled)
+            spots = find_spots(channel_ref)
 
             decoded = decoder.run(spots=spots)
             df_qc = QC_score_calc(decoded)
@@ -230,7 +254,7 @@ def ISS_pipeline(
     dots_max = dots.reduce({Axes.ZPLANE}, func="max")
 
     print("Locating spots in reference image")
-    spots = bd.run(reference_image=dots_max, image_stack=scaled)
+    spots = find_spots(dots_max)
 
     decoder = make_decoder()
     print(f"Decoding with {decode_mode}")
@@ -242,7 +266,7 @@ def ISS_pipeline(
 
 
 def process_experiment(
-    input_dir,
+    input_dir=None,
     regions_to_process=None,
     output_dir_prefix=None,
     register=False,
@@ -255,22 +279,37 @@ def process_experiment(
     int_threshold=0.002,
     sigma_vals=[1, 10, 30],
     prob_threshold=None,
+    spacetx_dirs: Mapping[str, str | Path] | None = None,
+    decoded_dirs: Mapping[str, str | Path] | None = None,
+    final_csv_files: Mapping[str, str | Path] | None = None,
+    region_names: Sequence[str] | None = None,
+    overwrite: bool = False,
 ):
     """
     Run spot finding and decoding on all tiles/FOVs in each region of an ISS/SpaceTx experiment.
 
-    Coordinate units are read from the SpaceTX XML metadata written during SpaceTX generation.
-    They are recorded in the decoded CSV and decoding XML.
+    Coordinate units are read from the SpaceTX XML metadata written during
+    SpaceTX generation. They are recorded in the decoded CSV and decoding XML.
+
+    ``spacetx_dirs``, ``decoded_dirs``, and ``final_csv_files`` are per-region
+    independent overrides. Explicit paths are used exactly as supplied. With
+    all required overrides, ``input_dir`` may be ``None``. Existing per-FOV and
+    final outputs are reused by default; ``overwrite=True`` recomputes every
+    FOV and replaces the requested final CSV.
     """
 
-    input_dir = Path(input_dir)
-    print(f"Processing directory: {input_dir}")
+    input_dir = Path(input_dir) if input_dir is not None else None
+    print(f"Processing directory: {input_dir if input_dir is not None else 'explicit paths'}")
 
     run_id = timestamp_for_filename()
 
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
-        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+    if decoded_dirs is not None or final_csv_files is not None:
+        print("[INFO] Using explicit decoded output mappings")
+        if output_dir_prefix is not None:
+            print(f"[INFO] Unmapped outputs fall back to: {output_dir_prefix.resolve()}")
+    elif output_dir_prefix is not None:
         print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
     else:
         print("[INFO] Using default output location under each region directory")
@@ -283,46 +322,52 @@ def process_experiment(
         decode_mode = "PRMC"
 
     region_pattern = re.compile(r"^R(\d+)$")
+    available_paths: dict[str, Path] = {}
+    if input_dir is not None:
+        if not input_dir.is_dir():
+            raise FileNotFoundError(f"Input directory not found: {input_dir}")
+        discovered = []
+        for path in input_dir.iterdir():
+            if path.is_dir() and (match := region_pattern.match(path.name)):
+                discovered.append((int(match.group(1)), path))
+        for _, path in sorted(discovered):
+            available_paths[path.name] = path
 
-    regions_found = []
-    for r in input_dir.iterdir():
-        if not r.is_dir():
-            continue
-        m = region_pattern.match(r.name)
-        if m:
-            regions_found.append((int(m.group(1)), r))
+    explicit_names = []
+    for mapping in (spacetx_dirs, decoded_dirs, final_csv_files):
+        if mapping:
+            explicit_names.extend(str(name) for name in mapping)
+    if region_names is not None:
+        available_names = [str(name) for name in region_names]
+    else:
+        available_names = list(available_paths)
+        available_names.extend(name for name in explicit_names if name not in available_names)
 
-    regions_found.sort(key=lambda t: t[0])
-
-    if not regions_found:
-        raise RuntimeError(f"No regions found in {input_dir} (expected folders like R1, R2, ...)")
-
-    available_numbers = [n for n, _ in regions_found]
-    available_map = {n: p for n, p in regions_found}
+    if not available_names:
+        raise RuntimeError(
+            "No regions found. Pass input_dir with R* folders or explicit "
+            "region_names/path mappings."
+        )
 
     if regions_to_process is not None:
         if not isinstance(regions_to_process, (list, tuple)):
             raise TypeError("regions_to_process must be a list of 1-based ints, e.g. [1, 2].")
-
-        wanted = [int(x) for x in regions_to_process]
-        if any(x < 1 for x in wanted):
-            raise ValueError(f"regions_to_process contains invalid region numbers: {regions_to_process}")
-
-        missing = [n for n in wanted if n not in available_map]
+        wanted_numbers = [int(value) for value in regions_to_process]
+        if any(value < 1 for value in wanted_numbers):
+            raise ValueError(
+                f"regions_to_process contains invalid region numbers: {regions_to_process}"
+            )
+        wanted_names = [f"R{value}" for value in wanted_numbers]
+        missing = [name for name in wanted_names if name not in available_names]
         if missing:
             raise FileNotFoundError(
-                f"Requested region(s) not found: {[f'R{n}' for n in missing]}. "
-                f"Available regions: {[f'R{n}' for n in available_numbers]}"
+                f"Requested region(s) not found: {missing}. Available regions: {available_names}"
             )
-
-        region_numbers = wanted
-        region_directories = [available_map[n] for n in wanted]
+        selected_regions = wanted_names
     else:
-        region_numbers = available_numbers
-        region_directories = [available_map[n] for n in available_numbers]
+        selected_regions = available_names
 
-    all_regions = [f"R{n}" for n in available_numbers]
-    selected_regions = [f"R{n}" for n in region_numbers]
+    all_regions = available_names
     skipped_regions = [r for r in all_regions if r not in selected_regions]
 
     print(f"[INFO] Regions found on disk ({len(all_regions)}): {all_regions}")
@@ -331,57 +376,87 @@ def process_experiment(
         print(f"[INFO] Regions skipped ({len(skipped_regions)}): {skipped_regions}")
 
     SPOTIFLOW_MODEL = None
-    SpotiflowDetector = None
-
     if spot_detection_mode == "spotiflow":
         from spotiflow.model import Spotiflow
-        from spotiflow.starfish import SpotiflowDetector
 
         SPOTIFLOW_MODEL = Spotiflow.from_pretrained("general")
+    elif spot_detection_mode != "starfish":
+        raise ValueError(
+            "spot_detection_mode must be 'starfish' or 'spotiflow', got "
+            f"{spot_detection_mode!r}"
+        )
 
-    for region_directory in region_directories:
-        region_name = region_directory.name
+    for region_name in selected_regions:
+        region_directory = available_paths.get(region_name)
 
-        if output_dir_prefix is None:
+        if decoded_dirs is not None and region_name in decoded_dirs:
+            decoded_dir = Path(decoded_dirs[region_name])
+        elif final_csv_files is not None and region_name in final_csv_files:
+            decoded_dir = Path(final_csv_files[region_name]).parent
+        elif output_dir_prefix is None:
+            if region_directory is None:
+                raise ValueError(
+                    f"No decoded output path supplied for {region_name}; pass "
+                    "decoded_dirs, final_csv_files, output_dir_prefix, or input_dir"
+                )
             decoded_dir = region_directory / "decoding" / ("2_decoded_dense" if dense else "2_decoded")
         else:
-            decoded_dir = output_dir_prefix / region_directory.name / "decoding" / (
+            decoded_dir = output_dir_prefix / region_name / "decoding" / (
                 "2_decoded_dense" if dense else "2_decoded"
             )
 
-        decoded_dir.mkdir(parents=True, exist_ok=True)
+        if final_csv_files is not None and region_name in final_csv_files:
+            final_csv = Path(final_csv_files[region_name])
+        else:
+            final_csv = decoded_dir / f"{region_name}_decoded.csv"
+
+        if spacetx_dirs is not None and region_name in spacetx_dirs:
+            SpaceTX_dir = Path(spacetx_dirs[region_name])
+        elif output_dir_prefix is None:
+            if region_directory is None:
+                raise ValueError(
+                    f"No SpaceTX input supplied for {region_name}; pass spacetx_dirs or input_dir"
+                )
+            SpaceTX_dir = region_directory / "decoding" / "1_SpaceTX_format"
+        else:
+            SpaceTX_dir = output_dir_prefix / region_name / "decoding" / "1_SpaceTX_format"
+        SpaceTX_dir = SpaceTX_dir.resolve()
+        experiment_json = SpaceTX_dir / "experiment.json"
+        if not experiment_json.is_file():
+            source = "Explicit SpaceTX" if spacetx_dirs and region_name in spacetx_dirs else "SpaceTX"
+            raise FileNotFoundError(f"{source} experiment.json not found: {experiment_json}")
 
         print("=" * 60)
         print(f"\033[1mProcessing region {region_name}\033[0m")
         print(f"Output decoded directory: {decoded_dir}")
 
-        final_csv = decoded_dir / f"{region_name}_decoded.csv"
-        if final_csv.exists():
+        if final_csv.exists() and not overwrite:
             print(f"[{region_name}] Skipping: {final_csv.name} already exists.")
             print(f"  ✔ {final_csv}")
             continue
 
-        if output_dir_prefix is None:
-            SpaceTX_dir = (region_directory / "decoding" / "1_SpaceTX_format").resolve()
-        else:
-            SpaceTX_dir = (
-                output_dir_prefix / region_directory.name / "decoding" / "1_SpaceTX_format"
-            ).resolve()
+        decoded_dir.mkdir(parents=True, exist_ok=True)
+        final_csv.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite and final_csv.exists():
+            final_csv.unlink()
 
         coordinate_units, coordinate_pixel_to_um = read_spacetx_coordinate_metadata(SpaceTX_dir)
 
-        experiment = Experiment.from_json(str(SpaceTX_dir / "experiment.json"))
+        experiment = Experiment.from_json(str(experiment_json))
         tiles = list(experiment.keys())
 
         csv_files = sorted(decoded_dir.glob("fov_*.csv"))
         print(f"Found {len(csv_files)} output files")
 
         tiles_done = [f.stem for f in csv_files]
-        not_done = sorted(set(tiles) - set(tiles_done))
+        not_done = sorted(tiles if overwrite else set(tiles) - set(tiles_done))
         print(f"-> {len(not_done)} tiles left to process")
 
         for tile_id in not_done:
             tile = experiment[tile_id]
+            tile_csv = decoded_dir / f"{tile_id}.csv"
+            if overwrite and tile_csv.exists():
+                tile_csv.unlink()
             print(f"\033[1;90mProcessing tile {tile_id[-3:]} \033[0m")
 
             df = ISS_pipeline(
@@ -395,6 +470,9 @@ def process_experiment(
                 sigma_vals=sigma_vals,
                 decode_mode=decode_mode,
                 channel_normalization=normalization_method,
+                spot_detection_mode=spot_detection_mode,
+                spotiflow_model=SPOTIFLOW_MODEL,
+                prob_threshold=prob_threshold,
             )
 
             if df is None or df.empty:
@@ -404,13 +482,13 @@ def process_experiment(
             df["coordinate_units"] = coordinate_units
             df["coordinate_pixel_to_um"] = coordinate_pixel_to_um
 
-            print(f"Saving per-tile CSV: {decoded_dir / f'{tile_id}.csv'}")
-            df.to_csv(decoded_dir / f"{tile_id}.csv", index=False)
+            print(f"Saving per-tile CSV: {tile_csv}")
+            df.to_csv(tile_csv, index=False)
 
         print(f"\nWriting region-level concatenated CSV for {region_name!r} ...")
 
         wrote_region_csv = False
-        csv_paths = sorted(decoded_dir.glob("fov*.csv"))
+        csv_paths = sorted(decoded_dir.glob("fov_*.csv"))
 
         if not csv_paths:
             print(f" No tile CSVs matching 'fov*.csv' found in {decoded_dir}; nothing to concatenate.")
@@ -424,10 +502,9 @@ def process_experiment(
             concat = pd.concat(dfs, ignore_index=True)
             concat.insert(0, "cont. spot ids", np.arange(len(concat), dtype=int))
 
-            out_file = decoded_dir / f"{region_name}_decoded.csv"
-            concat.to_csv(out_file, index=False)
+            concat.to_csv(final_csv, index=False)
             wrote_region_csv = True
-            print(f" → Wrote {len(concat)} total rows to {out_file.name}")
+            print(f" → Wrote {len(concat)} total rows to {final_csv}")
 
         if wrote_region_csv:
             xml_path = decoded_dir / f"decoding_run_{run_id}.xml"
@@ -438,7 +515,7 @@ def process_experiment(
             ET.SubElement(paths_el, "DecodedDir").text = str(decoded_dir)
             ET.SubElement(paths_el, "SpaceTXDir").text = str(SpaceTX_dir)
             ET.SubElement(paths_el, "ExperimentJSON").text = str(SpaceTX_dir / "experiment.json")
-            ET.SubElement(paths_el, "FinalCSV").text = str(decoded_dir / f"{region_name}_decoded.csv")
+            ET.SubElement(paths_el, "FinalCSV").text = str(final_csv)
 
             params_el = ET.SubElement(root, "Parameters")
             ET.SubElement(params_el, "dense").text = str(dense)

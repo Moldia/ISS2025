@@ -1,5 +1,9 @@
 The code in this repository is a major update of the original pipeline described in Lee et al., 2024.
 
+Filesystem conventions are defaults rather than requirements. See
+[PIPELINE_FLEXIBILITY.md](PIPELINE_FLEXIBILITY.md) for independent-stage usage,
+exact input/output overrides, cache controls, and examples using external data.
+
 The original implementation can be found at https://github.com/Moldia/Lee_2023. However, a substantial update was required to move away from outdated and unmaintained dependencies, improve robustness, and incorporate new features.
 
 This repository is therefore a heavily modified and modernized fork of the original code. The Lee_2023 repository is maintained in a frozen state for reproducibility purposes, but users are strongly encouraged to use this updated version.

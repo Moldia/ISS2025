@@ -1,5 +1,9 @@
 `ISS_Care` module uses CARE (The Content Aware Image Restoration - a ML-based method for image denoising). When appropriately trained, it can be used as a very fast alternative to image deconvolution. The main advantage is that it can work directly on projected images, significantly reducing the computing requirements. This speeds up the denoising process considerably, although we acknowledge it is likely less accurate than "true" deconvolution. From our benchmarking, CARE seems to be the way to go for most experiments. We advise the user to do a test run on a small sample with both Redlionfish and CARE, compare the results and proceed using CARE only if the results are satisfyingly similar.
 
+CARE prediction also accepts explicit per-cycle input and output directories in
+addition to standard `R*/preprocessing/Cycle*/4_retiled` discovery. See
+[`../PIPELINE_FLEXIBILITY.md`](../PIPELINE_FLEXIBILITY.md).
+
 You can find the examples on how to use it in the folder "Notebooks".
 
 You can find the pretrained models in the folder "models"

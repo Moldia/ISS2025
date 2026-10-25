@@ -3,7 +3,7 @@ import re
 import numpy as np
 import tifffile
 from pathlib import Path
-from typing import Mapping, Tuple, Union
+from typing import Mapping, Sequence, Tuple, Union
 from skimage.io import imread
 from slicedimage import ImageFormat
 from starfish import Codebook
@@ -63,7 +63,7 @@ class ISSTile2D(FetchedTile):
 
 # Fetcher for primary image tiles
 class ISS2DPrimaryTileFetcher(TileFetcher):
-    def __init__(self, region_directory, cycle_names, channel_order, tilexy, tile_dims, pixel_to_um, tiles_subdir):
+    def __init__(self, region_directory, cycle_names, channel_order, tilexy, tile_dims, pixel_to_um, tiles_subdir, tile_directories=None):
         self.region_directory = region_directory
         self.cycle_names = cycle_names
         self.channel_order = channel_order
@@ -71,11 +71,16 @@ class ISS2DPrimaryTileFetcher(TileFetcher):
         self.tile_dims = tile_dims
         self.pixel_to_um = pixel_to_um
         self.tiles_subdir = tiles_subdir  # <-- ADDED
+        self.tile_directories = tile_directories
 
     # Returns an ISSTile2D object for a given tile, cycle, channel, and z-plane
     def get_tile(self, tile: int, c: int, ch: int, z: int) -> FetchedTile:
         cycle = self.cycle_names[c]
-        path = self.region_directory / "preprocessing" / cycle / self.tiles_subdir  # <-- CHANGED
+        path = (
+            self.tile_directories[cycle]
+            if self.tile_directories is not None and cycle in self.tile_directories
+            else self.region_directory / "preprocessing" / cycle / self.tiles_subdir
+        )
         file_path = path / f"{cycle}_s{tile}_ch{self.channel_order[ch]}.tif"
         #print(f"Fetching primary tile: {file_path}")
         return ISSTile2D(file_path, tile, self.tilexy[cycle], self.tile_dims, self.pixel_to_um)
@@ -83,7 +88,7 @@ class ISS2DPrimaryTileFetcher(TileFetcher):
 
 # Fetcher for auxiliary tiles 
 class ISS2DAuxTileFetcher(TileFetcher):
-    def __init__(self, region_directory, cycle_names, nuclei_channel, tilexy, tile_dims, pixel_to_um, tiles_subdir):
+    def __init__(self, region_directory, cycle_names, nuclei_channel, tilexy, tile_dims, pixel_to_um, tiles_subdir, tile_directories=None):
         self.region_directory = region_directory
         self.cycle_names = cycle_names
         self.nuclei_channel = nuclei_channel
@@ -91,27 +96,38 @@ class ISS2DAuxTileFetcher(TileFetcher):
         self.tile_dims = tile_dims
         self.pixel_to_um = pixel_to_um
         self.tiles_subdir = tiles_subdir  # <-- ADDED
+        self.tile_directories = tile_directories
 
     # Returns an ISSTile2D object for a given tile, cycle, and z-plane (fixed nuclei channel)
     def get_tile(self, tile: int, c: int, ch: int, z: int) -> FetchedTile:
         nuclei_ch = self.nuclei_channel -1 # change to 0-indexed
         cycle = self.cycle_names[c]
-        path = self.region_directory / "preprocessing" / cycle / self.tiles_subdir  # <-- CHANGED
+        path = (
+            self.tile_directories[cycle]
+            if self.tile_directories is not None and cycle in self.tile_directories
+            else self.region_directory / "preprocessing" / cycle / self.tiles_subdir
+        )
         file_path = path / f"{cycle}_s{tile}_ch{nuclei_ch}.tif"
         #print(f"Fetching aux tile: {file_path}")
         return ISSTile2D(file_path, tile, self.tilexy[cycle], self.tile_dims, self.pixel_to_um)
 
 
 # Main function to create SpaceTx-compatible experiment and codebook files for a region
-def make_spacetx_format(input_dir, 
-                        codebook_csv,
+def make_spacetx_format(input_dir=None,
+                        codebook_csv=None,
                         regions_to_process=None,
                         output_dir_prefix=None,
                         pixel_to_um=1,
                         channels=["DAPI", "Cy3", "Cy5", "AF750", "AF488"],
                         DO_decorators=["AF750", "Cy5", "Cy3", "AF488"],
                         nuclei_channel="DAPI",
-                        CARE = False):
+                        CARE=False,
+                        region_directories: Mapping[str, str | Path] | Sequence[str | Path] | None = None,
+                        tile_directories: Mapping[str, Mapping[str, str | Path]] | None = None,
+                        cycle_names_by_region: Mapping[str, Sequence[str]] | None = None,
+                        output_dirs: Mapping[str, str | Path] | None = None,
+                        tiles_subdir_override: str | Path | None = None,
+                        overwrite: bool = False):
     """
     Create the experiment directory, tile fetchers, and codebook JSON files used for downstream decoding.
 
@@ -136,6 +152,15 @@ def make_spacetx_format(input_dir,
         DO_decorators (list[str]): RNA channel names used for decoding (subset of `channels`).
         nuclei_channel (str): Name of the nuclei channel (must be present in `channels`).
         CARE (bool): If True, use denoised tiles from 4_retiled/CARE. If False, use 4_retiled.
+        region_directories: Optional explicit region-name to directory mapping,
+            or an ordered sequence of region directories. This bypasses discovery.
+        tile_directories: Optional nested mapping ``region -> cycle -> directory``.
+            Entries override the standard preprocessing tile folder independently.
+        cycle_names_by_region: Optional explicit cycle order per region.
+        output_dirs: Optional exact SpaceTX output directory per region.
+        tiles_subdir_override: Alternative relative tile subdirectory used for
+            paths that are not explicitly mapped.
+        overwrite: Rebuild existing experiment/codebook JSON when true.
 
     Behavior:
         - Discovers region folders matching R\\d+ under input_dir.
@@ -146,8 +171,8 @@ def make_spacetx_format(input_dir,
     """
 
 
-    input_dir = Path(input_dir)
-    print(f"[INFO] Processing directory: {input_dir}")
+    input_dir = Path(input_dir) if input_dir is not None else None
+    print(f"[INFO] Processing directory: {input_dir if input_dir is not None else 'explicit paths'}")
 
     # Generate one run_id per function invocation.
     # Each region that actually gets written will produce one XML with this run_id.
@@ -156,7 +181,11 @@ def make_spacetx_format(input_dir,
     # Select which retiled directory to read tiles from.
     # CARE=False -> preprocessing/<cycle>/4_retiled
     # CARE=True  -> preprocessing/<cycle>/4_retiled/CARE
-    tiles_subdir = "4_retiled/CARE" if CARE else "4_retiled"
+    tiles_subdir = str(
+        tiles_subdir_override
+        if tiles_subdir_override is not None
+        else ("4_retiled/CARE" if CARE else "4_retiled")
+    )
 
     # Single, explicit log line for reproducibility in pipeline logs.
     print(
@@ -169,13 +198,21 @@ def make_spacetx_format(input_dir,
     # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
-        output_dir_prefix.mkdir(parents=True, exist_ok=True)
+    if output_dirs is not None:
+        print("[INFO] Using explicit per-region output_dirs")
+        if output_dir_prefix is not None:
+            print(f"[INFO] Unmapped outputs fall back to: {output_dir_prefix.resolve()}")
+    elif output_dir_prefix is not None:
         print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
     else:
         print("[INFO] Using default output location under each region directory")
     
 
+    if codebook_csv is None:
+        raise ValueError("codebook_csv is required")
     codebook_csv = Path(codebook_csv)
+    if not codebook_csv.is_file():
+        raise FileNotFoundError(f"Codebook CSV not found: {codebook_csv}")
     print('[INFO] Codebook: ', codebook_csv) 
 
     if pixel_to_um == 1:
@@ -184,18 +221,37 @@ def make_spacetx_format(input_dir,
         print(f"[INFO] Spatial units: coordinates will be reported in microns (µm); pixel_to_um = {pixel_to_um}")
 
 
-    nuclei_channel = channels.index("DAPI") + 1 # 1-indexed
+    if nuclei_channel not in channels:
+        raise ValueError(f"nuclei_channel {nuclei_channel!r} is not in channels")
+    nuclei_channel_index = channels.index(nuclei_channel) + 1 # 1-indexed
 
     # --- Step 1: Find/select region directories matching R\d+ ---
     region_pattern = re.compile(r"^R(\d+)$")
     
     regions_found = []
-    for r in input_dir.iterdir():
-        if not r.is_dir():
-            continue
-        m = region_pattern.match(r.name)
-        if m:
-            regions_found.append((int(m.group(1)), r))
+    if region_directories is not None:
+        if isinstance(region_directories, Mapping):
+            region_items = [(str(name), Path(path)) for name, path in region_directories.items()]
+        else:
+            region_items = [(Path(path).name, Path(path)) for path in region_directories]
+        for name, path in region_items:
+            match = region_pattern.match(name)
+            if match is None:
+                raise ValueError(f"Explicit region name must match R<integer>: {name!r}")
+            if not path.is_dir():
+                raise FileNotFoundError(f"Explicit region directory not found: {path}")
+            regions_found.append((int(match.group(1)), path))
+    else:
+        if input_dir is None:
+            raise ValueError("input_dir or region_directories is required")
+        if not input_dir.is_dir():
+            raise FileNotFoundError(f"Input directory not found: {input_dir}")
+        for r in input_dir.iterdir():
+            if not r.is_dir():
+                continue
+            m = region_pattern.match(r.name)
+            if m:
+                regions_found.append((int(m.group(1)), r))
     
     regions_found.sort(key=lambda t: t[0])  # R1, R2, R10 correctly
     
@@ -239,16 +295,29 @@ def make_spacetx_format(input_dir,
     print("[INFO] Regions to be processed:", selected_regions)
 
     
-    for region_directory in region_directories:
-        region_name = region_directory.name
+    for region_number, region_directory in zip(region_numbers, region_directories):
+        region_name = f"R{region_number}"
+
+        # Explicit inputs are validated before output-cache reuse so a typo is
+        # never hidden by stale JSON from an earlier run.
+        if tile_directories is not None and region_name in tile_directories:
+            for cycle_name, directory in tile_directories[region_name].items():
+                directory = Path(directory)
+                if not directory.is_dir():
+                    raise FileNotFoundError(
+                        f"Explicit tile directory not found for "
+                        f"{region_name}/{cycle_name}: {directory}"
+                    )
 
         # Create output directory for this region
-        if output_dir_prefix is None:
+        if output_dirs is not None and region_name in output_dirs:
+            SpaceTX_dir = Path(output_dirs[region_name])
+        elif output_dir_prefix is None:
             # Original behavior: write under each region folder
             SpaceTX_dir = region_directory / "decoding" / "1_SpaceTX_format"
         else:
             # New behavior: write under output_dir_prefix, mirroring region name
-            SpaceTX_dir = Path(output_dir_prefix) / region_directory.name / "decoding" / "1_SpaceTX_format"
+            SpaceTX_dir = Path(output_dir_prefix) / region_name / "decoding" / "1_SpaceTX_format"
         
         SpaceTX_dir.mkdir(parents=True, exist_ok=True)
 
@@ -260,17 +329,22 @@ def make_spacetx_format(input_dir,
         codebook_json_path = SpaceTX_dir / "codebook.json"
         
         # If both key outputs already exist, skip and write NO XML for this region.
-        if experiment_json_path.exists() and codebook_json_path.exists():
+        if experiment_json_path.exists() and codebook_json_path.exists() and not overwrite:
             print(f"[{region_name}] Skipping: experiment.json and codebook.json already exist.")
             print(f"  ✔ {experiment_json_path}")
             print(f"  ✔ {codebook_json_path}")
             continue
                 
         # Find all cycles for this region (Cycle1, Cycle2, ...)
-        cycle_names = sorted([
-            c.name for c in (region_directory / "preprocessing").glob("Cycle*")
-            if c.is_dir() and re.fullmatch(r"Cycle\d+", c.name)
-        ])
+        if cycle_names_by_region is not None and region_name in cycle_names_by_region:
+            cycle_names = [str(cycle) for cycle in cycle_names_by_region[region_name]]
+        elif tile_directories is not None and region_name in tile_directories:
+            cycle_names = list(tile_directories[region_name])
+        else:
+            cycle_names = sorted([
+                c.name for c in (region_directory / "preprocessing").glob("Cycle*")
+                if c.is_dir() and re.fullmatch(r"Cycle\d+", c.name)
+            ])
 
         if not cycle_names:
             print(f"Warning: No cycles found in {region_directory}, skipping...")
@@ -286,13 +360,30 @@ def make_spacetx_format(input_dir,
         tile_counts = {}
         tilexy_per_cycle = {}
         tile_dims = None
+        resolved_tile_directories = {}
         
         # --- Step 2: Gather tile information and positions for all cycles ---
         for cycle_index, cycle in enumerate(cycle_names):
-            cycle_dir = region_directory / "preprocessing" / cycle / tiles_subdir
+            if (
+                tile_directories is not None
+                and region_name in tile_directories
+                and cycle in tile_directories[region_name]
+            ):
+                cycle_dir = Path(tile_directories[region_name][cycle])
+                if not cycle_dir.is_dir():
+                    raise FileNotFoundError(
+                        f"Explicit tile directory not found for {region_name}/{cycle}: {cycle_dir}"
+                    )
+            else:
+                cycle_dir = region_directory / "preprocessing" / cycle / tiles_subdir
+            resolved_tile_directories[cycle] = cycle_dir
 
             # Find all tile files for this cycle
             tif_files = sorted(cycle_dir.glob("*_ch0.tif"))
+            if not tif_files:
+                raise FileNotFoundError(
+                    f"No channel-0 tile TIFFs matching '*_ch0.tif' in {cycle_dir}"
+                )
             retiled_files.extend(tif_files)
             tile_counts[cycle] = len(tif_files)
             #print(f"Number of tiles to be processed: {len(tif_files)}")
@@ -319,10 +410,12 @@ def make_spacetx_format(input_dir,
         
         # Create primary and auxiliary tile fetchers
         primary_fetcher = ISS2DPrimaryTileFetcher(
-            region_directory, cycle_names, channel_order, tilexy_per_cycle, tile_dims, pixel_to_um, tiles_subdir
+            region_directory, cycle_names, channel_order, tilexy_per_cycle, tile_dims, pixel_to_um, tiles_subdir,
+            tile_directories=resolved_tile_directories,
         )
         aux_fetcher = ISS2DAuxTileFetcher(
-            region_directory, cycle_names, nuclei_channel, tilexy_per_cycle, tile_dims, pixel_to_um, tiles_subdir
+            region_directory, cycle_names, nuclei_channel_index, tilexy_per_cycle, tile_dims, pixel_to_um, tiles_subdir,
+            tile_directories=resolved_tile_directories,
         )
         
         # Hook to add codebook reference to experiment.json
@@ -400,7 +493,7 @@ def make_spacetx_format(input_dir,
         ch_el = ET.SubElement(root, "Channels")
         ET.SubElement(ch_el, "All").text = ",".join([str(x) for x in channels])
         ET.SubElement(ch_el, "Decoding").text = ",".join([str(x) for x in DO_decorators])
-        ET.SubElement(ch_el, "Nuclei").text = "DAPI"
+        ET.SubElement(ch_el, "Nuclei").text = str(nuclei_channel)
 
         tiles_el = ET.SubElement(root, "Tiles")
         ET.SubElement(tiles_el, "fov_count").text = str(next(iter(tile_counts.values())))

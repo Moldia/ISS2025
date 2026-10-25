@@ -177,34 +177,59 @@ def validate_input_image_type(input_image_type):
         )
 
 
-def get_retiled_dir(input_dir, region):
+def get_retiled_dir(input_dir, region, cycle=1, retiled_dir=None):
     """
     Return:
     {input_dir}/{region}/preprocessing/Cycle1/4_retiled/
     """
-    return Path(input_dir) / region / "preprocessing" / "Cycle1" / "4_retiled"
+    if retiled_dir is not None:
+        return Path(retiled_dir)
+    if input_dir is None or region is None:
+        raise ValueError("input_dir and region are required when retiled_dir is not supplied")
+    return Path(input_dir) / region / "preprocessing" / f"Cycle{cycle}" / "4_retiled"
 
 
-def get_stitched_dir(input_dir, region):
+def get_stitched_dir(input_dir, region, cycle=1, stitched_dir=None):
     """
     Return:
     {input_dir}/{region}/preprocessing/Cycle1/3_stitched/
     """
-    return Path(input_dir) / region / "preprocessing" / "Cycle1" / "3_stitched"
+    if stitched_dir is not None:
+        return Path(stitched_dir)
+    if input_dir is None or region is None:
+        raise ValueError("input_dir and region are required when stitched_dir is not supplied")
+    return Path(input_dir) / region / "preprocessing" / f"Cycle{cycle}" / "3_stitched"
 
 
-def get_stitched_image_path(input_dir, region, DAPI_ch=4):
+def get_stitched_image_path(
+    input_dir,
+    region,
+    DAPI_ch=4,
+    cycle=1,
+    stitched_image_path=None,
+):
     """
     Return the stitched DAPI image path:
     {input_dir}/{region}/preprocessing/Cycle1/3_stitched/Cycle1_ch{DAPI_ch}.tif
     """
-    image_path = get_stitched_dir(input_dir, region) / f"Cycle1_ch{int(DAPI_ch)}.tif"
+    if stitched_image_path is not None:
+        image_path = Path(stitched_image_path)
+    else:
+        image_path = get_stitched_dir(input_dir, region, cycle=cycle) / (
+            f"Cycle{cycle}_ch{int(DAPI_ch)}.tif"
+        )
     if not image_path.is_file():
         raise FileNotFoundError(f"Stitched image not found: {image_path}")
     return image_path
 
 
-def get_segmentation_dir(input_dir, region, output_dir_prefix=None):
+def get_segmentation_dir(
+    input_dir,
+    region,
+    output_dir_prefix=None,
+    output_dir=None,
+    create=True,
+):
     """
     Determine where segmentation outputs should be written.
 
@@ -214,27 +239,106 @@ def get_segmentation_dir(input_dir, region, output_dir_prefix=None):
     If output_dir_prefix is provided:
         {output_dir_prefix}/{region}/postprocessing/segmentation/
     """
-    if output_dir_prefix is not None:
-        output_dir = Path(output_dir_prefix) / region / "postprocessing" / "segmentation"
+    if output_dir is not None:
+        resolved = Path(output_dir)
+    elif output_dir_prefix is not None:
+        if region is None:
+            raise ValueError("region is required when output_dir_prefix is used")
+        resolved = Path(output_dir_prefix) / region / "postprocessing" / "segmentation"
     else:
-        output_dir = Path(input_dir) / region / "postprocessing" / "segmentation"
+        if input_dir is None or region is None:
+            raise ValueError(
+                "input_dir and region are required when output_dir is not supplied"
+            )
+        resolved = Path(input_dir) / region / "postprocessing" / "segmentation"
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
-def get_coords_csv(input_dir, region):
+def _resolve_segmentation_output(
+    method,
+    *,
+    input_dir,
+    region,
+    input_image_type,
+    output_dir_prefix=None,
+    output_dir=None,
+    output_file=None,
+):
+    """Resolve an exact final output path while retaining legacy defaults."""
+    if output_file is not None:
+        final_path = Path(output_file)
+        tile_output_dir = Path(output_dir) if output_dir is not None else final_path.parent
+    else:
+        if region is None:
+            raise ValueError("region is required when output_file is not supplied")
+        tile_output_dir = get_segmentation_dir(
+            input_dir,
+            region,
+            output_dir_prefix=output_dir_prefix,
+            output_dir=output_dir,
+            create=False,
+        )
+        final_path = (
+            tile_output_dir
+            / f"{region}_{method}_{input_image_type}_expanded.npz"
+        )
+    return tile_output_dir, final_path
+
+
+def _validate_segmentation_input_overrides(
+    *,
+    input_image_type,
+    stitched_image_path=None,
+    retiled_image_paths=None,
+    coords_path=None,
+    retiled_dir=None,
+):
+    """Validate only explicit inputs, including before cached-output reuse."""
+    if input_image_type == "stitched" and stitched_image_path is not None:
+        path = Path(stitched_image_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Explicit stitched image not found: {path}")
+    if input_image_type == "retiled":
+        if retiled_dir is not None and not Path(retiled_dir).is_dir():
+            raise FileNotFoundError(f"Explicit retiled directory not found: {retiled_dir}")
+        if retiled_image_paths is not None:
+            missing = [str(path) for path in map(Path, retiled_image_paths) if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(f"Explicit retiled image file(s) not found: {missing}")
+        if coords_path is not None and not Path(coords_path).is_file():
+            raise FileNotFoundError(f"Explicit coordinate CSV not found: {coords_path}")
+
+
+def get_coords_csv(input_dir, region, cycle=1, coords_path=None, retiled_dir=None):
     """
     Return:
     {input_dir}/{region}/preprocessing/Cycle1/4_retiled/Cycle1_retiled_coords.csv
     """
-    csv_path = get_retiled_dir(input_dir, region) / "Cycle1_retiled_coords.csv"
+    if coords_path is not None:
+        csv_path = Path(coords_path)
+    else:
+        csv_path = get_retiled_dir(
+            input_dir,
+            region,
+            cycle=cycle,
+            retiled_dir=retiled_dir,
+        ) / f"Cycle{cycle}_retiled_coords.csv"
     if not csv_path.is_file():
         raise FileNotFoundError(f"Retiled coords CSV not found: {csv_path}")
     return csv_path
 
 
-def get_retiled_images(input_dir, region, DAPI_ch=4):
+def get_retiled_images(
+    input_dir,
+    region,
+    DAPI_ch=4,
+    cycle=1,
+    retiled_dir=None,
+    image_paths=None,
+):
     """
     Find all retiled images for one channel.
 
@@ -249,11 +353,28 @@ def get_retiled_images(input_dir, region, DAPI_ch=4):
     list[Path]
         Sorted by section number s0, s1, s2, ...
     """
-    retiled_dir = get_retiled_dir(input_dir, region)
+    if image_paths is not None:
+        images = [Path(path) for path in image_paths]
+        missing = [str(path) for path in images if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Retiled image file(s) not found: {missing}")
+        if not images:
+            raise ValueError("image_paths must contain at least one image")
+        return images
+
+    retiled_dir = get_retiled_dir(
+        input_dir,
+        region,
+        cycle=cycle,
+        retiled_dir=retiled_dir,
+    )
     if not retiled_dir.is_dir():
         raise FileNotFoundError(f"Retiled directory not found: {retiled_dir}")
 
-    pattern = re.compile(rf"^Cycle1_s(\d+)_ch{int(DAPI_ch)}\.tif$", re.IGNORECASE)
+    pattern = re.compile(
+        rf"^Cycle{int(cycle)}_s(\d+)_ch{int(DAPI_ch)}\.tif$",
+        re.IGNORECASE,
+    )
 
     images = []
     for p in retiled_dir.iterdir():
@@ -270,7 +391,13 @@ def get_retiled_images(input_dir, region, DAPI_ch=4):
     return images
 
 
-def read_retiled_coords(input_dir, region):
+def read_retiled_coords(
+    input_dir,
+    region,
+    cycle=1,
+    coords_path=None,
+    retiled_dir=None,
+):
     """
     Read Cycle1_retiled_coords.csv.
 
@@ -287,7 +414,16 @@ def read_retiled_coords(input_dir, region):
         coords[:, 0] = x
         coords[:, 1] = y
     """
-    coords_df = pd.read_csv(get_coords_csv(input_dir, region), header=None)
+    coords_df = pd.read_csv(
+        get_coords_csv(
+            input_dir,
+            region,
+            cycle=cycle,
+            coords_path=coords_path,
+            retiled_dir=retiled_dir,
+        ),
+        header=None,
+    )
 
     if coords_df.shape[1] < 2:
         raise ValueError(
@@ -320,8 +456,8 @@ def normalize_percentile(x, pmin=1, pmax=99.8, clip=True):
 # StarDist
 # -----------------------------------------------------------------------------
 def stardist_segmentation(
-    input_dir,
-    region,
+    input_dir=None,
+    region=None,
     output_dir_prefix=None,
     DAPI_ch=4,
     input_image_type="retiled",
@@ -330,6 +466,14 @@ def stardist_segmentation(
     n_tiles=(4, 4),
     expanded_distance=20,
     auto_select_gpu=True,
+    cycle=1,
+    stitched_image_path=None,
+    retiled_image_paths=None,
+    coords_path=None,
+    retiled_dir=None,
+    output_dir=None,
+    output_file=None,
+    overwrite=True,
 ):
     """
     Segment DAPI images with StarDist.
@@ -360,25 +504,52 @@ def stardist_segmentation(
         Label expansion distance.
     auto_select_gpu : bool
         Automatically select a free GPU.
+    cycle : int
+        Cycle used by legacy path inference. Ignored by explicit paths.
+    stitched_image_path, retiled_image_paths, coords_path : path-like, optional
+        Exact input overrides. For retiled mode, image order must match the
+        rows of ``coords_path``.
+    output_dir, output_file : path-like, optional
+        Exact output directory/final sparse mask overrides. ``output_file`` is
+        never renamed or relocated.
+    overwrite : bool
+        Preserve the historical overwrite behavior by default. If false, a
+        valid existing final sparse mask is loaded and returned.
     """
     validate_input_image_type(input_image_type)
 
-    print(f"\n\033[1mProcessing region: {region} (StarDist)\033[0m")
+    display_region = region if region is not None else "custom inputs"
+    print(f"\n\033[1mProcessing region: {display_region} (StarDist)\033[0m")
     print(f"[INFO] input_image_type = {input_image_type}")
 
     # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
-        output_dir_prefix.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
     else:
         print("[INFO] Using default output location under each region directory")
 
-    output_dir = get_segmentation_dir(
-        input_dir,
-        region,
+    output_dir, final_out = _resolve_segmentation_output(
+        "stardist",
+        input_dir=input_dir,
+        region=region,
+        input_image_type=input_image_type,
         output_dir_prefix=output_dir_prefix,
+        output_dir=output_dir,
+        output_file=output_file,
     )
+    _validate_segmentation_input_overrides(
+        input_image_type=input_image_type,
+        stitched_image_path=stitched_image_path,
+        retiled_image_paths=retiled_image_paths,
+        coords_path=coords_path,
+        retiled_dir=retiled_dir,
+    )
+
+    if final_out.is_file() and not overwrite:
+        print(f"[INFO] Reusing existing segmentation: {final_out}")
+        expanded_coo = load_npz(final_out).tocoo()
+        return expanded_coo.toarray().astype(np.uint32), expanded_coo
 
     if auto_select_gpu:
         print("[INFO] Attempting automatic GPU selection")
@@ -402,8 +573,21 @@ def stardist_segmentation(
     # Mode 1: retiled input
     # -------------------------------------------------------------------------
     if input_image_type == "retiled":
-        image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
-        coords = read_retiled_coords(input_dir, region)
+        image_paths = get_retiled_images(
+            input_dir,
+            region,
+            DAPI_ch=DAPI_ch,
+            cycle=cycle,
+            retiled_dir=retiled_dir,
+            image_paths=retiled_image_paths,
+        )
+        coords = read_retiled_coords(
+            input_dir,
+            region,
+            cycle=cycle,
+            coords_path=coords_path,
+            retiled_dir=retiled_dir,
+        )
 
         print(f"Found {len(image_paths)} retiled images for channel ch{int(DAPI_ch)}")
         print(f"Found {len(coords)} coordinate rows")
@@ -413,6 +597,7 @@ def stardist_segmentation(
                 f"Number of tiles ({len(image_paths)}) does not match coordinate rows ({len(coords)})"
             )
 
+        output_dir.mkdir(parents=True, exist_ok=True)
         tile_arrays = []
         running_offset = 0
 
@@ -451,7 +636,7 @@ def stardist_segmentation(
         expanded = stitch_tiles_from_coords(tile_arrays, coords)
         expanded_coo = coo_matrix(expanded)
 
-        final_out = output_dir / f"{region}_stardist_retiled_expanded.npz"
+        final_out.parent.mkdir(parents=True, exist_ok=True)
         save_npz(final_out, expanded_coo, compressed=True)
 
         print(f"Saved final retiled segmentation to: {final_out}\n")
@@ -460,7 +645,13 @@ def stardist_segmentation(
     # -------------------------------------------------------------------------
     # Mode 2: stitched input
     # -------------------------------------------------------------------------
-    image_path = get_stitched_image_path(input_dir, region, DAPI_ch=DAPI_ch)
+    image_path = get_stitched_image_path(
+        input_dir,
+        region,
+        DAPI_ch=DAPI_ch,
+        cycle=cycle,
+        stitched_image_path=stitched_image_path,
+    )
     print("[INFO] Running StarDist on stitched image")
     print(f"[INFO] Using stitched image: {image_path}")
 
@@ -494,7 +685,7 @@ def stardist_segmentation(
     expanded = expanded.astype(np.uint32)
     expanded_coo = coo_matrix(expanded)
 
-    final_out = output_dir / f"{region}_stardist_stitched_expanded.npz"
+    final_out.parent.mkdir(parents=True, exist_ok=True)
     save_npz(final_out, expanded_coo, compressed=True)
 
     print(f"Saved stitched segmentation to: {final_out}\n")
@@ -666,12 +857,33 @@ def stitch_raw_tiles_from_coords(tile_arrays, coords):
     return stitched
 
 
-def load_stitched_dapi_image(input_dir, region, DAPI_ch=4):
+def load_stitched_dapi_image(
+    input_dir,
+    region,
+    DAPI_ch=4,
+    cycle=1,
+    retiled_image_paths=None,
+    coords_path=None,
+    retiled_dir=None,
+):
     """
     Reconstruct the stitched raw DAPI image from retiled tiles.
     """
-    image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
-    coords = read_retiled_coords(input_dir, region)
+    image_paths = get_retiled_images(
+        input_dir,
+        region,
+        DAPI_ch=DAPI_ch,
+        cycle=cycle,
+        retiled_dir=retiled_dir,
+        image_paths=retiled_image_paths,
+    )
+    coords = read_retiled_coords(
+        input_dir,
+        region,
+        cycle=cycle,
+        coords_path=coords_path,
+        retiled_dir=retiled_dir,
+    )
 
     if len(image_paths) != len(coords):
         raise ValueError(
@@ -683,7 +895,17 @@ def load_stitched_dapi_image(input_dir, region, DAPI_ch=4):
     return stitched
 
 
-def load_reference_dapi_image(input_dir, region, DAPI_ch=4, input_image_type="stitched"):
+def load_reference_dapi_image(
+    input_dir,
+    region,
+    DAPI_ch=4,
+    input_image_type="stitched",
+    cycle=1,
+    stitched_image_path=None,
+    retiled_image_paths=None,
+    coords_path=None,
+    retiled_dir=None,
+):
     """
     Load the raw DAPI image used for QC overlays.
 
@@ -696,26 +918,48 @@ def load_reference_dapi_image(input_dir, region, DAPI_ch=4, input_image_type="st
     validate_input_image_type(input_image_type)
 
     if input_image_type == "stitched":
-        stitched_path = get_stitched_image_path(input_dir, region, DAPI_ch=DAPI_ch)
+        stitched_path = get_stitched_image_path(
+            input_dir,
+            region,
+            DAPI_ch=DAPI_ch,
+            cycle=cycle,
+            stitched_image_path=stitched_image_path,
+        )
         print(f"[INFO] Using stitched DAPI image: {stitched_path}")
         return imread(str(stitched_path))
 
     print("[INFO] Reconstructing stitched DAPI image from retiled tiles")
-    return load_stitched_dapi_image(input_dir, region, DAPI_ch=DAPI_ch)
+    return load_stitched_dapi_image(
+        input_dir,
+        region,
+        DAPI_ch=DAPI_ch,
+        cycle=cycle,
+        retiled_image_paths=retiled_image_paths,
+        coords_path=coords_path,
+        retiled_dir=retiled_dir,
+    )
 
 
 # -----------------------------------------------------------------------------
 # Main Cellpose batch function
 # -----------------------------------------------------------------------------
 def cell_pose_segmentation_to_coo(
-    input_dir,
-    region,
+    input_dir=None,
+    region=None,
     output_dir_prefix=None,
     DAPI_ch=4,
     input_image_type="retiled",
     diameter=None,
     expanded_distance=20,
     auto_select_gpu=True,
+    cycle=1,
+    stitched_image_path=None,
+    retiled_image_paths=None,
+    coords_path=None,
+    retiled_dir=None,
+    output_dir=None,
+    output_file=None,
+    overwrite=True,
 ):
     """
     Segment DAPI images with Cellpose.
@@ -753,6 +997,16 @@ def cell_pose_segmentation_to_coo(
         Label expansion distance in pixels after watershed refinement.
     auto_select_gpu : bool, optional
         If True, try to select a relatively free GPU before model creation.
+    cycle : int, optional
+        Cycle used by legacy path inference. Ignored by explicit paths.
+    stitched_image_path, retiled_image_paths, coords_path : path-like, optional
+        Exact input overrides. For retiled mode, image order must match the
+        coordinate rows.
+    output_dir, output_file : path-like, optional
+        Exact output directory/final sparse mask overrides.
+    overwrite : bool, optional
+        Preserve the historical overwrite behavior by default. If false, an
+        existing final sparse mask is loaded instead of recomputing it.
 
     Outputs
     -------
@@ -775,22 +1029,38 @@ def cell_pose_segmentation_to_coo(
     """
     validate_input_image_type(input_image_type)
 
-    print(f"\n\033[1mProcessing region: {region}\033[0m")
+    display_region = region if region is not None else "custom inputs"
+    print(f"\n\033[1mProcessing region: {display_region}\033[0m")
     print(f"[INFO] input_image_type = {input_image_type}")
 
     # --- Output directory prefix handling ---
     if output_dir_prefix is not None:
         output_dir_prefix = Path(output_dir_prefix)
-        output_dir_prefix.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
     else:
         print("[INFO] Using default output location under each region directory")
 
-    output_dir = get_segmentation_dir(
-        input_dir,
-        region,
+    output_dir, final_out = _resolve_segmentation_output(
+        "cellpose",
+        input_dir=input_dir,
+        region=region,
+        input_image_type=input_image_type,
         output_dir_prefix=output_dir_prefix,
+        output_dir=output_dir,
+        output_file=output_file,
     )
+    _validate_segmentation_input_overrides(
+        input_image_type=input_image_type,
+        stitched_image_path=stitched_image_path,
+        retiled_image_paths=retiled_image_paths,
+        coords_path=coords_path,
+        retiled_dir=retiled_dir,
+    )
+
+    if final_out.is_file() and not overwrite:
+        print(f"[INFO] Reusing existing segmentation: {final_out}")
+        expanded_coo = load_npz(final_out).tocoo()
+        return expanded_coo.toarray().astype(np.uint32), expanded_coo
 
     if auto_select_gpu:
         print("[INFO] Attempting automatic GPU selection")
@@ -803,8 +1073,21 @@ def cell_pose_segmentation_to_coo(
     # Mode 1: retiled input
     # -------------------------------------------------------------------------
     if input_image_type == "retiled":
-        image_paths = get_retiled_images(input_dir, region, DAPI_ch=DAPI_ch)
-        coords = read_retiled_coords(input_dir, region)
+        image_paths = get_retiled_images(
+            input_dir,
+            region,
+            DAPI_ch=DAPI_ch,
+            cycle=cycle,
+            retiled_dir=retiled_dir,
+            image_paths=retiled_image_paths,
+        )
+        coords = read_retiled_coords(
+            input_dir,
+            region,
+            cycle=cycle,
+            coords_path=coords_path,
+            retiled_dir=retiled_dir,
+        )
 
         print(f"Found {len(image_paths)} retiled images for channel ch{int(DAPI_ch)}")
         print(f"Found {len(coords)} coordinate rows")
@@ -815,6 +1098,7 @@ def cell_pose_segmentation_to_coo(
             )
 
         # Step 1: segment each tile and save sparse output
+        output_dir.mkdir(parents=True, exist_ok=True)
         tile_arrays = []
         running_offset = 0
 
@@ -847,7 +1131,7 @@ def cell_pose_segmentation_to_coo(
         # touching cells and lose original label identity.
         expanded_coo = coo_matrix(expanded)
 
-        final_out = output_dir / f"{region}_cellpose_retiled_expanded.npz"
+        final_out.parent.mkdir(parents=True, exist_ok=True)
         save_npz(final_out, expanded_coo, compressed=True)
 
         print(f"Saved final retiled segmentation to: {final_out}\n")
@@ -856,7 +1140,13 @@ def cell_pose_segmentation_to_coo(
     # -------------------------------------------------------------------------
     # Mode 2: stitched input
     # -------------------------------------------------------------------------
-    image_path = get_stitched_image_path(input_dir, region, DAPI_ch=DAPI_ch)
+    image_path = get_stitched_image_path(
+        input_dir,
+        region,
+        DAPI_ch=DAPI_ch,
+        cycle=cycle,
+        stitched_image_path=stitched_image_path,
+    )
     print(f"[INFO] Running Cellpose on stitched image")
     print(f"[INFO] Using stitched image: {image_path}")
     print("[WARNING] Stitched images can require a lot of GPU memory.")
@@ -883,7 +1173,7 @@ def cell_pose_segmentation_to_coo(
         print("[HINT] Try rerunning with input_image_type='retiled'.")
         raise
 
-    final_out = output_dir / f"{region}_cellpose_stitched_expanded.npz"
+    final_out.parent.mkdir(parents=True, exist_ok=True)
     save_npz(final_out, expanded_coo, compressed=True)
 
     print(f"Saved stitched segmentation to: {final_out}\n")
@@ -1013,6 +1303,7 @@ def resolve_segmentation_mask_path(
         input_dir,
         region,
         output_dir_prefix=output_dir_prefix,
+        create=False,
     )
 
     if input_image_type == "retiled":
@@ -1040,6 +1331,13 @@ def inspect_and_work_with_segmentation(
     input_image_type="stitched",
     DAPI_ch=4,
     crop_coords=None,
+    cycle=1,
+    stitched_image_path=None,
+    retiled_image_paths=None,
+    coords_path=None,
+    retiled_dir=None,
+    output_dir=None,
+    contour_output_file=None,
 ):
     """
     Load a segmentation mask, load the matching raw DAPI image, plot an overlay,
@@ -1108,6 +1406,11 @@ def inspect_and_work_with_segmentation(
         region,
         DAPI_ch=DAPI_ch,
         input_image_type=input_image_type,
+        cycle=cycle,
+        stitched_image_path=stitched_image_path,
+        retiled_image_paths=retiled_image_paths,
+        coords_path=coords_path,
+        retiled_dir=retiled_dir,
     )
 
     # Sanity check
@@ -1135,9 +1438,17 @@ def inspect_and_work_with_segmentation(
         input_dir,
         region,
         output_dir_prefix=output_dir_prefix,
+        output_dir=output_dir,
     )
 
-    save_contour_mask(
+    if contour_output_file is not None:
+        contour_path = Path(contour_output_file)
+        contour_path.parent.mkdir(parents=True, exist_ok=True)
+        imwrite(contour_path, contour_image.astype(np.uint8))
+        print(f"Contour mask saved to: {contour_path}")
+        return contour_path
+
+    return save_contour_mask(
         contour_dir,
         region,
         f"{segmentation_method}_{input_image_type}",

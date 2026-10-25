@@ -6,7 +6,7 @@ from scipy.sparse import load_npz
 from scipy import ndimage as ndi
 from skimage import measure
 import scanpy as sc
-from typing import Iterable
+from typing import Iterable, Mapping
 from math import ceil
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -52,9 +52,9 @@ def Diff(li1, li2):
 # AnnData creation
 # -----------------------------
 def create_anndata_obj(
-    input_dir: str,
-    region: str,
-    segmentation_method: str,
+    input_dir: str | Path | None = None,
+    region: str | None = None,
+    segmentation_method: str = "cellpose",
     dense: bool = True,
     filter_data: bool = True,
     metric: str = "quality_minimum",
@@ -62,20 +62,71 @@ def create_anndata_obj(
     value: float = 0.5,
     convert_coords: bool = True,
     conversion_factor: float = 0.1625,
+    spots_path: str | Path | None = None,
+    segmentation_path: str | Path | None = None,
+    output_file: str | Path | None = None,
+    overwrite: bool = False,
 ) -> sc.AnnData:
-    """Create AnnData from decoded spots and segmentation labels."""
-    print(f"\n\033[1mProcessing region: {region}\033[0m")
+    """Create AnnData from a decoded transcript table and sparse label mask.
+
+    ``spots_path``, ``segmentation_path``, and ``output_file`` are independent
+    overrides.  Any path that is not supplied is inferred from the legacy
+    ``input_dir``/``region`` layout.  Explicit paths are used exactly as given.
+    Existing output is reloaded by default; pass ``overwrite=True`` to
+    recompute it.  The transcript CSV must contain ``target``, ``xc``, and
+    ``yc`` and the mask must be a SciPy sparse ``.npz`` label image.
+    """
+    display_region = region if region is not None else "custom inputs"
+    print(f"\n\033[1mProcessing region: {display_region}\033[0m")
+
+    def legacy_path(*parts: str) -> Path:
+        if input_dir is None or region is None:
+            raise ValueError(
+                "input_dir and region are required for paths that were not "
+                "supplied explicitly"
+            )
+        return Path(input_dir) / region / Path(*parts)
 
     decoded_dir = "2_decoded_dense" if dense else "2_decoded"
-    spots_path = Path(input_dir) / region / "decoding" / decoded_dir / f"{region}_decoded.csv"
-    seg_path   = Path(input_dir) / region / "postprocessing" / "segmentation" / f"{region}_{segmentation_method}_expanded.npz"
-    out_dir    = Path(input_dir) / region / "postprocessing" / "segmentation"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    output_file = out_dir / f"{region}_anndata_{segmentation_method}.h5ad"
+    spots_was_explicit = spots_path is not None
+    segmentation_was_explicit = segmentation_path is not None
+    spots_path = (
+        Path(spots_path)
+        if spots_was_explicit
+        else legacy_path("decoding", decoded_dir, f"{region}_decoded.csv")
+    )
+    seg_path = (
+        Path(segmentation_path)
+        if segmentation_was_explicit
+        else legacy_path(
+            "postprocessing",
+            "segmentation",
+            f"{region}_{segmentation_method}_expanded.npz",
+        )
+    )
+    if output_file is None:
+        output_file = legacy_path(
+            "postprocessing",
+            "segmentation",
+            f"{region}_anndata_{segmentation_method}.h5ad",
+        )
+    else:
+        output_file = Path(output_file)
 
-    if write_h5ad and output_file.is_file():
+    # Explicit invalid inputs must never be hidden by an existing cached output.
+    if spots_was_explicit and not spots_path.is_file():
+        raise FileNotFoundError(f"Decoded transcript file not found: {spots_path}")
+    if segmentation_was_explicit and not seg_path.is_file():
+        raise FileNotFoundError(f"Segmentation mask not found: {seg_path}")
+
+    if write_h5ad and output_file.is_file() and not overwrite:
         print(f"AnnData file already exists, reloading: {output_file}")
         return sc.read_h5ad(output_file)
+
+    if not spots_path.is_file():
+        raise FileNotFoundError(f"Decoded transcript file not found: {spots_path}")
+    if not seg_path.is_file():
+        raise FileNotFoundError(f"Segmentation mask not found: {seg_path}")
 
     spots = pd.read_csv(spots_path)
     if filter_data and metric in spots.columns:
@@ -115,6 +166,7 @@ def create_anndata_obj(
     ad_sp.obsm["spatial"] = ad_sp.obs[["x", "y"]].to_numpy(float)
 
     if write_h5ad:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         print(f"Writing AnnData: {output_file}")
         ad_sp.write_h5ad(output_file)
     return ad_sp
@@ -122,13 +174,33 @@ def create_anndata_obj(
 
 def concat_anndata(
     regions: Iterable[str],
-    input_dir: str | Path,
+    input_dir: str | Path | None = None,
     segmentation_method: str = "cellpose",
+    anndata_files: Mapping[str, str | Path] | None = None,
 ):
-    """Concatenate per-region AnnData files into one."""
+    """Concatenate per-region AnnData files.
+
+    ``anndata_files`` may override any subset of region paths.  Regions not in
+    the mapping continue to use the legacy path under ``input_dir``.
+    """
     adatas = []
     for region in regions:
-        f = Path(input_dir) / region / "postprocessing" / "segmentation" / f"{region}_anndata_{segmentation_method}.h5ad"
+        if anndata_files is not None and region in anndata_files:
+            f = Path(anndata_files[region])
+            if not f.is_file():
+                raise FileNotFoundError(f"Explicit AnnData file not found for {region}: {f}")
+        else:
+            if input_dir is None:
+                raise ValueError(
+                    f"input_dir is required because no AnnData path was supplied for {region}"
+                )
+            f = (
+                Path(input_dir)
+                / region
+                / "postprocessing"
+                / "segmentation"
+                / f"{region}_anndata_{segmentation_method}.h5ad"
+            )
         if f.is_file():
             print(f"Reading: {f}")
             ad = sc.read(f)
@@ -266,12 +338,39 @@ def spatial_neighborhood(anndata, cluster_label="leiden_0.5", max_distance_allow
     return ad
 
 
-def create_ann_tiles(sample_path, segmentation_folder="/cell_segmentation/", expand=True, expand_distance=30):
-    """Build AnnData object from per-tile segmentation + decoded spots."""
-    path = Path(sample_path) / segmentation_folder
-    spots = pd.read_csv(Path(sample_path)/"decoded.csv").dropna()
+def create_ann_tiles(
+    sample_path=None,
+    segmentation_folder="/cell_segmentation/",
+    expand=True,
+    expand_distance=30,
+    segmentation_dir=None,
+    spots_path=None,
+    tile_pattern="tile*.npz",
+):
+    """Build AnnData from per-tile masks and decoded spots.
+
+    ``segmentation_dir`` and ``spots_path`` are exact, independent overrides.
+    When omitted, the historical ``sample_path`` resolution is retained.
+    """
+    if segmentation_dir is not None:
+        path = Path(segmentation_dir)
+        if not path.is_dir():
+            raise FileNotFoundError(f"Explicit segmentation directory not found: {path}")
+    else:
+        if sample_path is None:
+            raise ValueError("sample_path or segmentation_dir is required")
+        path = Path(sample_path) / segmentation_folder
+    if spots_path is not None:
+        resolved_spots = Path(spots_path)
+        if not resolved_spots.is_file():
+            raise FileNotFoundError(f"Explicit decoded transcript file not found: {resolved_spots}")
+    else:
+        if sample_path is None:
+            raise ValueError("sample_path or spots_path is required")
+        resolved_spots = Path(sample_path) / "decoded.csv"
+    spots = pd.read_csv(resolved_spots).dropna()
     adatas = []
-    for f in sorted(path.glob("tile*.npz")):
+    for f in sorted(path.glob(tile_pattern)):
         image = load_npz(f).toarray()
         if len(np.unique(image)) == 1:
             continue

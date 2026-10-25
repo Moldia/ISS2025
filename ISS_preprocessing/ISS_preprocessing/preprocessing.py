@@ -43,7 +43,7 @@ from pathlib import Path
 from datetime import datetime
 
 from collections import defaultdict
-from typing import Optional, List, Dict, Any, Iterable, Tuple
+from typing import Optional, List, Dict, Any, Iterable, Mapping, Tuple
 
 import xml.etree.ElementTree as ET
 
@@ -4460,7 +4460,21 @@ def preprocessing_main(input_dirs,
                             mip=True,
                             tile_dimension=6000, 
                             pixel_to_um = None,
-                            chunk_size=None):
+                            chunk_size=None,
+                            run_extraction=True,
+                            run_ome_conversion=True,
+                            run_alignment=True,
+                            run_retiling=True,
+                            region_directories=None,
+                            overwrite=False,
+                            mipped_dirs=None,
+                            metadata_files=None,
+                            ome_output_files=None,
+                            ome_input_files=None,
+                            stitched_output_dirs=None,
+                            ashlar_work_dirs=None,
+                            stitched_input_dirs=None,
+                            retiled_output_dirs=None):
     
     """
     Main preprocessing pipeline for microscopy image data.
@@ -4534,6 +4548,25 @@ def preprocessing_main(input_dirs,
         Chunk/tile size used for chunked processing in deconvolution backends that support it
         (e.g., Deconwolf tiling). Default is None.
 
+    run_extraction, run_ome_conversion, run_alignment, run_retiling : bool
+        Enable individual stages. All default to True, preserving the original
+        end-to-end workflow. When extraction is disabled, pass
+        ``region_directories`` for the later stages.
+
+    overwrite : bool
+        Force enabled stages to recompute outputs. False preserves existing
+        cache/reuse behavior.
+
+    mipped_dirs, metadata_files, ome_output_files, ome_input_files,
+    stitched_output_dirs, stitched_input_dirs, retiled_output_dirs : Mapping, optional
+        Per-stage ``(region_name, cycle_number)`` path overrides. Output paths
+        from one enabled stage are automatically forwarded to the next unless
+        a separate input mapping is supplied.
+
+    ashlar_work_dirs : Mapping[str, path-like], optional
+        Exact temporary Ashlar work directory per region. Caller-managed
+        contents are never recursively removed.
+
     Raises
     ------
     ValueError
@@ -4554,7 +4587,7 @@ def preprocessing_main(input_dirs,
     mode = str(mode).lower()
 
     # --- SAFETY CHECK FOR LIF ---
-    if mode == "lif" and pixel_to_um is None:
+    if run_extraction and mode == "lif" and pixel_to_um is None:
         raise ValueError(
             "\n[ERROR] LIF metadata pixel size extraction is not considered reliable.\n"
             "Please provide a manual value for 'pixel_to_um' (µm per pixel).\n\n"
@@ -4564,18 +4597,19 @@ def preprocessing_main(input_dirs,
         )
 
     valid_modes = {'tif_autosaved', 'tif_exported', 'lif', 'nd2', 'czi'}
-    if mode not in valid_modes:
+    if run_extraction and mode not in valid_modes:
         raise ValueError(f"Unsupported mode: {mode}. Choose from {valid_modes}.")
 
     valid_methods = {'deconwolf', 'redlionfish', None}
-    if deconvolution_method not in valid_methods:
+    if run_extraction and deconvolution_method not in valid_methods:
         raise ValueError(f"Unsupported deconvolution method: {deconvolution_method}. Choose from {valid_methods - {None}} or None.")
 
-    if deconvolution_method is not None and PSF_metadata is None:
+    if run_extraction and deconvolution_method is not None and PSF_metadata is None:
         raise ValueError("PSF_metadata is required to generate PSF when deconvolution method is specified.")
 
-    # DECONVOLUTION
-    region_directories = deconvolve_and_mip(
+    # DECONVOLUTION / MIP (optional so later stages can be run independently)
+    if run_extraction:
+        region_directories = deconvolve_and_mip(
                             input_dirs=input_dirs,
                             cycles=cycles,
                             output_dir_prefix=output_dir_prefix, 
@@ -4586,25 +4620,53 @@ def preprocessing_main(input_dirs,
                             PSF_metadata=PSF_metadata, 
                             mip=mip,
                             pixel_to_um=pixel_to_um,
-                            chunk_size=chunk_size
+                            chunk_size=chunk_size,
+                            overwrite=overwrite,
                             )
+    elif region_directories is None:
+        raise ValueError(
+            "region_directories is required when run_extraction=False"
+        )
 
     # OME TIFFS
-    mipped_to_OME_tiffs(
-        region_directories=region_directories, 
-        cycles=cycles,
-        pixel_to_um=pixel_to_um)
+    if run_ome_conversion:
+        mipped_to_OME_tiffs(
+            region_directories=region_directories,
+            cycles=cycles,
+            pixel_to_um=pixel_to_um,
+            overwrite=overwrite,
+            mipped_dirs=mipped_dirs,
+            metadata_files=metadata_files,
+            ome_output_files=ome_output_files,
+        )
 
     # Align and stitch images
-    align_and_stitch(region_directories=region_directories, 
-                   cycles=cycles,
-                   n_total_cycles=n_total_cycles,
-                   align_channel=align_channel)
+    if run_alignment:
+        align_and_stitch(
+            region_directories=region_directories,
+            cycles=cycles,
+            n_total_cycles=n_total_cycles,
+            align_channel=align_channel,
+            overwrite=overwrite,
+            ome_input_files=ome_input_files if ome_input_files is not None else ome_output_files,
+            stitched_output_dirs=stitched_output_dirs,
+            work_dirs=ashlar_work_dirs,
+        )
 
     # retile stitched images
-    retile_stitched_images(region_directories=region_directories, 
-                    cycles=cycles, 
-                    tile_dimension=tile_dimension) 
+    if run_retiling:
+        retile_stitched_images(
+            region_directories=region_directories,
+            cycles=cycles,
+            tile_dimension=tile_dimension,
+            overwrite=overwrite,
+            stitched_dirs=(
+                stitched_input_dirs
+                if stitched_input_dirs is not None
+                else stitched_output_dirs
+            ),
+            retiled_dirs=retiled_output_dirs,
+        )
 
 
     # ----- Step 10: Final reporting -----
@@ -4627,7 +4689,8 @@ def deconvolve_and_mip(
     PSF_metadata: Optional[dict] = None, 
     mip: bool = True,
     pixel_to_um = None,
-    chunk_size: Optional[int] = None
+    chunk_size: Optional[int] = None,
+    overwrite: bool = False,
 ) -> list:
     """
     Deconvolve (optional) and write MIP/stack outputs per region and cycle.
@@ -4883,10 +4946,11 @@ def deconvolve_and_mip(
                 
                 # Count only VALID outputs (avoid getting stuck because a corrupted/empty file exists)
                 valid_existing = set()
-                for f in out_dir.glob(f"Cycle{cycle}_s*_ch*.tif"):
-                    m = re.search(r"_s0*(\d+)_ch0*(\d+)", f.name, re.IGNORECASE)
-                    if m and file_exists_and_valid(f, min_size=1024):
-                        valid_existing.add((int(m.group(1)), int(m.group(2))))
+                if not overwrite:
+                    for f in out_dir.glob(f"Cycle{cycle}_s*_ch*.tif"):
+                        m = re.search(r"_s0*(\d+)_ch0*(\d+)", f.name, re.IGNORECASE)
+                        if m and file_exists_and_valid(f, min_size=1024):
+                            valid_existing.add((int(m.group(1)), int(m.group(2))))
                 
                 # IMPORTANT:
                 # tiles_all represents the FULL expected tile set for this region.
@@ -5022,7 +5086,7 @@ def deconvolve_and_mip(
                         output_file_path = (mipped_directory if mip else stacked_directory) / f"Cycle{cycle}_s{tile}_ch{channel}.tif"
             
                         # Skip processing if output file already exists
-                        if file_exists_and_valid(output_file_path, min_size=1024):
+                        if not overwrite and file_exists_and_valid(output_file_path, min_size=1024):
                             run_skipped.append({
                                 "tile": tile,
                                 "channel": channel,
@@ -5187,6 +5251,10 @@ def mipped_to_OME_tiffs(
     region_directories: List[str],
     cycles: List[int],
     pixel_to_um: Optional[float] = None,
+    overwrite: bool = False,
+    mipped_dirs: Mapping[tuple[str, int], str | Path] | None = None,
+    metadata_files: Mapping[tuple[str, int], str | Path] | None = None,
+    ome_output_files: Mapping[tuple[str, int], str | Path] | None = None,
 ) -> None:
     """
     Convert per-tile MIPs to OME-TIFF with spatial Plane PositionX/PositionY (µm).
@@ -5206,6 +5274,10 @@ def mipped_to_OME_tiffs(
     - Pixel size:
         Prefer PixelSizeUm stored in XML, else fall back to pixel_to_um argument.
     - Writes an optional coords CSV for debugging.
+
+    ``mipped_dirs``, ``metadata_files``, and ``ome_output_files`` may override
+    any individual ``(region_name, cycle)`` path. Explicit inputs are validated
+    and exact output filenames are preserved.
     """
     print("\033[1;96mConverting to OME-TIFFs\033[0m")
 
@@ -5305,22 +5377,48 @@ def mipped_to_OME_tiffs(
 
         for region_directory in region_directories:
             region_directory = Path(region_directory)
+            region_id = region_directory.name
+            key = (region_id, int(cycle))
             cycle_directory = region_directory / "preprocessing" / f"Cycle{cycle}"
 
             # Input MIPs
-            mipped_directory = cycle_directory / "1_mipped"
+            mipped_was_explicit = mipped_dirs is not None and key in mipped_dirs
+            mipped_directory = (
+                Path(mipped_dirs[key])
+                if mipped_was_explicit
+                else cycle_directory / "1_mipped"
+            )
 
             # Output OME-TIFF
-            ome_tiff_directory = safe_mkdir(cycle_directory / "2_ome_tiffs")
-            ome_tiff_path = ome_tiff_directory / f"Cycle{cycle}.ome.tiff"
+            if ome_output_files is not None and key in ome_output_files:
+                ome_tiff_path = Path(ome_output_files[key])
+                ome_tiff_directory = ome_tiff_path.parent
+            else:
+                ome_tiff_directory = cycle_directory / "2_ome_tiffs"
+                ome_tiff_path = ome_tiff_directory / f"Cycle{cycle}.ome.tiff"
 
             # XML metadata folder
             metadata_directory = cycle_directory / "MetaData"
 
+            if mipped_was_explicit and not mipped_directory.is_dir():
+                raise FileNotFoundError(f"Explicit MIP directory not found: {mipped_directory}")
+            if mipped_was_explicit and not any(mipped_directory.glob("*.tif")):
+                raise FileNotFoundError(
+                    f"Explicit MIP directory contains no .tif files: {mipped_directory}"
+                )
+            metadata_was_explicit = metadata_files is not None and key in metadata_files
+            explicit_metadata_file = (
+                Path(metadata_files[key]) if metadata_was_explicit else None
+            )
+            if explicit_metadata_file is not None and not explicit_metadata_file.is_file():
+                raise FileNotFoundError(
+                    f"Explicit metadata XML not found: {explicit_metadata_file}"
+                )
+
             # ----------------------------------------------------------------------
             # STEP 0 — Skip if already converted
             # ----------------------------------------------------------------------
-            if ome_tiff_path.exists():
+            if ome_tiff_path.exists() and not overwrite:
                 print(f"OME-TIFF exists: {ome_tiff_path}. Skipping.")
                 continue
 
@@ -5329,6 +5427,10 @@ def mipped_to_OME_tiffs(
             # ----------------------------------------------------------------------
             tif_files = natsorted(list(mipped_directory.glob("*.tif")))
             if not tif_files:
+                if mipped_was_explicit:
+                    raise FileNotFoundError(
+                        f"Explicit MIP directory contains no .tif files: {mipped_directory}"
+                    )
                 print(f"No .tif files in {mipped_directory}. Skipping.")
                 continue
 
@@ -5355,18 +5457,20 @@ def mipped_to_OME_tiffs(
             # ----------------------------------------------------------------------
             # STEP 2 — Load TileScanInfo XML (prefer region_id.xml)
             # ----------------------------------------------------------------------
-            region_id = region_directory.name
-            preferred = metadata_directory / f"{region_id}.xml"
-            md_candidates = sorted(metadata_directory.glob("*.xml"))
-
-            if preferred.exists():
-                md_file = preferred
-            elif md_candidates:
-                md_file = md_candidates[0]
-                print(f"{BOLD}[WARN]⚠️ {RESET} Preferred XML missing; using {md_file.name}")
+            if metadata_was_explicit:
+                md_file = explicit_metadata_file
             else:
-                print(f"No XML metadata in {metadata_directory}. Skipping.")
-                continue
+                preferred = metadata_directory / f"{region_id}.xml"
+                md_candidates = sorted(metadata_directory.glob("*.xml"))
+
+                if preferred.exists():
+                    md_file = preferred
+                elif md_candidates:
+                    md_file = md_candidates[0]
+                    print(f"{BOLD}[WARN]⚠️ {RESET} Preferred XML missing; using {md_file.name}")
+                else:
+                    print(f"No XML metadata in {metadata_directory}. Skipping.")
+                    continue
 
             try:
                 root = ET.parse(md_file).getroot()
@@ -5482,6 +5586,7 @@ def mipped_to_OME_tiffs(
 
             # Optional coord CSV for debugging
             if effective_px is not None:
+                ome_tiff_directory.mkdir(parents=True, exist_ok=True)
                 x_px = x_um / float(effective_px)
                 y_px = y_um / float(effective_px)
                 pd.DataFrame(
@@ -5506,6 +5611,7 @@ def mipped_to_OME_tiffs(
             # ----------------------------------------------------------------------
             # STEP 6 — Write OME-TIFF (T tiles, C channels per tile)
             # ----------------------------------------------------------------------
+            ome_tiff_directory.mkdir(parents=True, exist_ok=True)
             with tifffile.TiffWriter(ome_tiff_path, bigtiff=True, ome=True) as tif:
                 for i, tile_id in enumerate(tiles_aligned):
                     image_stack = np.empty((len(channels), height_px, width_px), dtype=np.uint16)
@@ -5555,7 +5661,11 @@ def align_and_stitch(
     dfp=None,
     plates=False,
     quiet=True,
-    version=False):
+    version=False,
+    overwrite=False,
+    ome_input_files: Mapping[tuple[str, int], str | Path] | None = None,
+    stitched_output_dirs: Mapping[tuple[str, int], str | Path] | None = None,
+    work_dirs: Mapping[str, str | Path] | None = None):
     """
     Wrapper function for the Ashlar tool for image alignment and mosaicking.
 
@@ -5578,6 +5688,10 @@ def align_and_stitch(
 
     Returns:
         int: 1 on error, otherwise result of Ashlar processing.
+
+    Per-region/cycle entries in ``ome_input_files`` and
+    ``stitched_output_dirs`` override the conventional tree independently.
+    ``work_dirs`` controls Ashlar's temporary location per region.
     """
 
     print("\033[1;96mAligning and stitching tiles\033[0m")
@@ -5586,9 +5700,6 @@ def align_and_stitch(
     import ashlar.scripts.ashlar as ashlar
     ashlar.configure_terminal()
 
-    maximum_shift=200
-    filter_sigma=3
-    
     for region_directory in region_directories:
 
         region_directory = Path(region_directory)
@@ -5597,25 +5708,22 @@ def align_and_stitch(
         if re.match(r"^R\d+$", region_suffix):
             print(f"\033[1mProcessing {region_suffix}\033[0m")            
 
-        # --- STEP 1: Make directories for each cycle ---
-        for cycle in cycles:
-            cycle_directory = region_directory / 'preprocessing' / f'Cycle{cycle}'
-            ome_tiff_directory = cycle_directory / '2_ome_tiffs'
-            stitched_directory = cycle_directory / '3_stitched'
-            safe_mkdir(stitched_directory)
-
-        # --- STEP 2: Build OME-TIFF inputs in the EXACT requested cycles order ---
+        # --- STEP 1: Build OME-TIFF inputs in the EXACT requested cycles order ---
         ome_tiffs: List[Path] = []
         missing = []
         
         for cyc in cycles:
-            ome_path = (
-                region_directory
-                / "preprocessing"
-                / f"Cycle{cyc}"
-                / "2_ome_tiffs"
-                / f"Cycle{cyc}.ome.tiff"
-            )
+            key = (region_suffix, int(cyc))
+            if ome_input_files is not None and key in ome_input_files:
+                ome_path = Path(ome_input_files[key])
+            else:
+                ome_path = (
+                    region_directory
+                    / "preprocessing"
+                    / f"Cycle{cyc}"
+                    / "2_ome_tiffs"
+                    / f"Cycle{cyc}.ome.tiff"
+                )
             if not ome_path.exists():
                 missing.append(str(ome_path))
             else:
@@ -5642,16 +5750,21 @@ def align_and_stitch(
         # We intentionally do NOT allow Ashlar to run unless the dataset on disk contains
         # the expected total number of cycles for this experiment (n_total_cycles).
         # Earlier pipeline steps can run on subsets; alignment/stitching must not.
-        all_ome_tiffs = natsorted([
-            f for f in (region_directory / "preprocessing").rglob("2_ome_tiffs/*.ome.tiff")
-        ])
-        
-        found_cycles = sorted(set(
-            int(m.group(1))
-            for f in all_ome_tiffs
-            for m in [re.search(r"Cycle(\d+)", f.name)]
-            if m
-        ))
+        has_all_explicit_inputs = ome_input_files is not None and all(
+            (region_suffix, int(cyc)) in ome_input_files for cyc in cycles
+        )
+        if has_all_explicit_inputs:
+            found_cycles = sorted(int(cyc) for cyc in cycles)
+        else:
+            all_ome_tiffs = natsorted([
+                f for f in (region_directory / "preprocessing").rglob("2_ome_tiffs/*.ome.tiff")
+            ])
+            found_cycles = sorted(set(
+                int(m.group(1))
+                for f in all_ome_tiffs
+                for m in [re.search(r"Cycle(\d+)", f.name)]
+                if m
+            ))
         
         if len(found_cycles) != int(n_total_cycles):
             raise RuntimeError(
@@ -5678,15 +5791,22 @@ def align_and_stitch(
             )
 
         # --- STEP 3.1: Define expected stitched outputs for requested cycles ---
-        expected_outputs = [
-            Path(region_directory) / "preprocessing" / f"Cycle{cyc}" / "3_stitched" / f"Cycle{cyc}_ch{ch}.tif"
-            for cyc in cycles
-            for ch in range(n_channels)
-        ]
+        expected_outputs = []
+        for cyc in cycles:
+            key = (region_suffix, int(cyc))
+            stitched_dir = (
+                Path(stitched_output_dirs[key])
+                if stitched_output_dirs is not None and key in stitched_output_dirs
+                else Path(region_directory) / "preprocessing" / f"Cycle{cyc}" / "3_stitched"
+            )
+            expected_outputs.extend(
+                stitched_dir / f"Cycle{cyc}_ch{ch}.tif"
+                for ch in range(n_channels)
+            )
 
         # Skip only if *all* expected outputs exist AND are non-trivially sized (valid).
         # This prevents skipping when a previous run left tiny/corrupted files behind.
-        if all(file_exists_and_valid(p, min_size=1024) for p in expected_outputs):
+        if not overwrite and all(file_exists_and_valid(p, min_size=1024) for p in expected_outputs):
             print(
                 f"Stitched images already exist (and look valid) for all requested cycles "
                 f"(cycles={len(cycles)}, channels={n_channels}). Skipping."
@@ -5737,7 +5857,11 @@ def align_and_stitch(
             mosaic_args['verbose'] = True
 
         # Define temporary Ashlar output pattern (0-indexed cycles)
-        tmp_path = region_directory / "preprocessing" / "ashlar_tmp"
+        tmp_path = (
+            Path(work_dirs[region_suffix])
+            if work_dirs is not None and region_suffix in work_dirs
+            else region_directory / "preprocessing" / "ashlar_tmp"
+        )
         tmp_pattern = str(
             tmp_path / "Cycle{cycle}_ch{channel}.tif"
         )
@@ -5746,7 +5870,11 @@ def align_and_stitch(
         # --- STEP 5: Run Ashlar with inputs in the correct order ---
         ome_tiff_files = [str(p) for p in ome_tiffs]
         
-        tmp_path = region_directory / "preprocessing" / "ashlar_tmp"
+        tmp_path = (
+            Path(work_dirs[region_suffix])
+            if work_dirs is not None and region_suffix in work_dirs
+            else region_directory / "preprocessing" / "ashlar_tmp"
+        )
         safe_mkdir(tmp_path)
         
         tmp_pattern = str(tmp_path / "Cycle{cycle}_ch{channel}.tif")
@@ -5816,7 +5944,12 @@ def align_and_stitch(
 
         # Now remap safely
         for cyc_idx, cyc in enumerate(cycles):
-            stitched_dir = region_directory / "preprocessing" / f"Cycle{cyc}" / "3_stitched"
+            key = (region_suffix, int(cyc))
+            stitched_dir = (
+                Path(stitched_output_dirs[key])
+                if stitched_output_dirs is not None and key in stitched_output_dirs
+                else region_directory / "preprocessing" / f"Cycle{cyc}" / "3_stitched"
+            )
             safe_mkdir(stitched_dir)
 
             for ch in range(n_channels):
@@ -5835,8 +5968,16 @@ def align_and_stitch(
             f"from {tmp_path} → region Cycle folders"
         )
 
-        # Clean up temporary Ashlar directory
-        shutil.rmtree(tmp_path, ignore_errors=True)
+        # Clean up the conventional private temp directory. For an explicit
+        # work directory, only remove it if it is now empty; never recursively
+        # delete caller-managed contents.
+        if work_dirs is not None and region_suffix in work_dirs:
+            try:
+                tmp_path.rmdir()
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def plot_stitched_preview(region_directories, cycles, channels, downsample=100, cmap="gray"):
@@ -5890,7 +6031,10 @@ def plot_stitched_preview(region_directories, cycles, channels, downsample=100, 
 def retile_stitched_images(
     region_directories,
     cycles,
-    tile_dimension=6000
+    tile_dimension=6000,
+    overwrite=False,
+    stitched_dirs: Mapping[tuple[str, int], str | Path] | None = None,
+    retiled_dirs: Mapping[tuple[str, int], str | Path] | None = None,
 ):
     """
     Tiles stitched .tif images from each region/cycle and saves them with a naming convention:
@@ -5903,6 +6047,8 @@ def retile_stitched_images(
     - Input stitched images are 2D per channel (Y, X).
     - All stitched channel images in a given (region, cycle) are the same shape.
     - Output tile indices (s*) are per-channel (i.e. each channel gets s0..sN-1).
+    - ``stitched_dirs`` and ``retiled_dirs`` can override any individual
+      ``(region_name, cycle)`` input/output directory.
     """
     def _import_cv2():
         import cv2
@@ -5922,15 +6068,37 @@ def retile_stitched_images(
             if re.match(r"^R\d+$", region_name):
                 print(f"\033[1mProcessing {region_name}\033[0m")
 
+            key = (region_name, int(cycle))
             cycle_directory = region_directory / "preprocessing" / f"Cycle{cycle}"
-            stitched_directory = cycle_directory / "3_stitched"
-            retiled_directory = cycle_directory / "4_retiled"
-            safe_mkdir(retiled_directory)
+            stitched_was_explicit = stitched_dirs is not None and key in stitched_dirs
+            stitched_directory = (
+                Path(stitched_dirs[key])
+                if stitched_was_explicit
+                else cycle_directory / "3_stitched"
+            )
+            retiled_directory = (
+                Path(retiled_dirs[key])
+                if retiled_dirs is not None and key in retiled_dirs
+                else cycle_directory / "4_retiled"
+            )
+
+            if stitched_was_explicit and not stitched_directory.is_dir():
+                raise FileNotFoundError(
+                    f"Explicit stitched directory not found: {stitched_directory}"
+                )
+            if not stitched_directory.is_dir():
+                print(f"No stitched TIFF directory for cycle {cycle}: {stitched_directory}")
+                continue
 
             tif_files = sorted([p for p in stitched_directory.iterdir() if p.is_file() and p.suffix.lower() == ".tif"])
             if not tif_files:
+                if stitched_was_explicit:
+                    raise FileNotFoundError(
+                        f"Explicit stitched directory contains no TIFF files: {stitched_directory}"
+                    )
                 print(f"No stitched TIFFs found for cycle {cycle} in {stitched_directory}")
                 continue
+            safe_mkdir(retiled_directory)
 
             # ------------------------------------------------------------------
             # Pre-check: determine expected tiling grid from FIRST stitched file
@@ -5964,6 +6132,11 @@ def retile_stitched_images(
             y_positions = [row * tile_dimension for row in range(nrows) for col in range(ncols)]
 
             existing_tiles = list(retiled_directory.glob(f"Cycle{cycle}_s*_ch*.tif"))
+
+            if overwrite:
+                for path in existing_tiles:
+                    path.unlink()
+                existing_tiles = []
 
             # If the number of tiles matches, sample-check one tile size
             if len(existing_tiles) == expected_total_tiles and existing_tiles:

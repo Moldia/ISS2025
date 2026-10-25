@@ -497,12 +497,14 @@ def run_pciseq(
     spots,
     coo_mask,
     sc_expression_matrix,
-    output_dir_prefix,
+    output_dir_prefix=None,
     save_output=True,
     prob_threshold=None,
     retry_with_thinning=False,
     retry_spot_fraction=0.9999,
     retry_random_state=42,
+    output_dir=None,
+    overwrite=True,
 ):
     """
     Run PCIseq on a given region and optionally save results to disk.
@@ -513,15 +515,34 @@ def run_pciseq(
     Results are saved under:
 
         <output_dir_prefix>/<region>/PCIseq/
+
+    Pass ``output_dir`` to use an exact directory instead. The historical
+    behavior overwrites serialized outputs, so ``overwrite`` defaults to true;
+    set it false to fail before running when an output already exists.
     """
     # ------------------------------------------------------------------
     # Output directory handling.
     # ------------------------------------------------------------------
-    output_dir_prefix = Path(output_dir_prefix)
-    output_dir_prefix.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Using output_dir_prefix: {output_dir_prefix.resolve()}")
+    if output_dir is not None:
+        PCIseq_dir = Path(output_dir)
+    else:
+        if output_dir_prefix is None:
+            raise ValueError("output_dir_prefix or output_dir is required")
+        output_dir_prefix = Path(output_dir_prefix)
+        PCIseq_dir = output_dir_prefix / region / "PCIseq"
+    print(f"[INFO] Using PCIseq output directory: {PCIseq_dir.resolve()}")
 
-    PCIseq_dir = output_dir_prefix / region / "PCIseq"
+    expected_outputs = [
+        PCIseq_dir / "cellData.json",
+        PCIseq_dir / "geneData.json",
+        PCIseq_dir / "most_probable.csv",
+    ]
+    if save_output and not overwrite:
+        existing = [path for path in expected_outputs if path.exists()]
+        if existing:
+            raise FileExistsError(
+                f"PCIseq output already exists; pass overwrite=True to recompute: {existing[0]}"
+            )
     PCIseq_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -552,7 +573,7 @@ def run_pciseq(
     # ------------------------------------------------------------------
     # Configure pciSeq output path before calling fit().
     # ------------------------------------------------------------------
-    config.DEFAULT["output_path"] = [str(output_dir_prefix / region)]
+    config.DEFAULT["output_path"] = [str(PCIseq_dir.parent)]
 
     # ------------------------------------------------------------------
     # Internal helper to run pciSeq on a given spot table.
