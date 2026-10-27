@@ -11,7 +11,8 @@ dependencies:
   # Arrays / data
   - numpy>=1.26,<2
   - pandas
-  - pyarrow>=10
+  # PyArrow 26 requires NumPy 2; Starfish still needs the NumPy 1.x stack.
+  - pyarrow>=10,<26
 
   # Imaging & plotting
   - scikit-image

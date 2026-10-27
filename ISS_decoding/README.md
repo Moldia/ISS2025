@@ -54,6 +54,20 @@ python -c "import ISS_decoding; print(ISS_decoding.__file__)"
 # conda deactivate
 ```
 
+### NumPy and PyArrow compatibility
+
+The decoding environment intentionally uses NumPy 1.x for compatibility with
+Starfish. PyArrow 26 and newer require NumPy 2, so this package pins PyArrow to
+`>=10,<26`. If an earlier installation pulled in PyArrow 26, repair the existing
+environment with:
+
+```bash
+conda activate ISS_decoding
+conda install -c conda-forge --force-reinstall "numpy>=1.26,<2" "pyarrow>=10,<26"
+python -m pip install --upgrade --no-deps ./ISS_decoding
+python -c "import numpy, pyarrow, ISS_decoding; print(numpy.__version__, pyarrow.__version__)"
+```
+
 ## Decoding outputs
 
 Both the standard Starfish workflow and the PoSTcode workflow use Parquet as

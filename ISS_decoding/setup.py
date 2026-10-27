@@ -17,7 +17,9 @@ setup(
     install_requires=[
         "numpy>=1.22,<2",
         "pandas>=1.4",
-        "pyarrow>=10",
+        # PyArrow 26 requires NumPy 2, while Starfish and this environment
+        # currently require NumPy 1.x.
+        "pyarrow>=10,<26",
         "xarray>=0.20",
         "scikit-image>=0.19",
         "slicedimage>=3",
