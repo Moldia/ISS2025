@@ -102,7 +102,8 @@ The notebooks have been reorganized into a more modular and user-friendly struct
 - **CellGPS/COSTE** spatial-topology workflows are provided separately for
   annotated spatial AnnData objects and decoded transcript tables,
 - a dedicated notebook allows visualization of segmentation masks over the DAPI channel,
-- support for downstream analysis with **pciSeq** has been added
+- support for downstream analysis with **pciSeq** has been added, using Marco's
+  pinned GPU-accelerated fork by default with explicit CPU execution available
 
 The transcript-aware methods use adapters that normalize decoded ISS
 transcripts and convert each method's native polygons or label TIFF into the

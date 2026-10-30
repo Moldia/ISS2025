@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -6,6 +7,118 @@ import matplotlib.pyplot as plt
 from scipy.sparse import load_npz
 
 from pciSeq import fit, config
+
+
+PCISEQ_GPU_FORK_COMMIT = "ccbcf8c36efb478ea2030ea5820d12360487a9fa"
+PCISEQ_GPU_FORK_URL = "https://github.com/mgcizzu/pciSeq.git"
+_GPU_CONFIG_KEYS = {
+    "use_gpu",
+    "gpu_spots_to_cell",
+    "gpu_device",
+    "gpu_block_mb",
+}
+
+
+def pciseq_gpu_backend_installed():
+    """Return whether the imported pciSeq package exposes the GPU fork API."""
+    return _GPU_CONFIG_KEYS.issubset(config.DEFAULT)
+
+
+def _validate_gpu_runtime(gpu_device):
+    """Fail before a long PCIseq run when PyTorch cannot use the requested GPU."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "The pciSeq GPU backend requires a CUDA-enabled PyTorch installation."
+        ) from exc
+
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        raise RuntimeError(
+            "The pciSeq GPU backend was requested, but PyTorch reports that CUDA "
+            "is unavailable. Check the NVIDIA driver and PyTorch CUDA build."
+        )
+
+    device_count = cuda.device_count()
+    if gpu_device >= device_count:
+        raise ValueError(
+            f"gpu_device={gpu_device} is unavailable; PyTorch sees "
+            f"{device_count} CUDA device(s)."
+        )
+
+
+def _resolve_pciseq_options(
+    backend,
+    pciseq_options,
+    gpu_device,
+    gpu_spots_to_cell,
+    gpu_block_mb,
+):
+    """Build options for the default GPU fork or upstream CPU pciSeq."""
+    if not isinstance(backend, str):
+        raise TypeError("backend must be either 'cpu' or 'gpu'")
+    backend = backend.strip().lower()
+    if backend not in {"cpu", "gpu"}:
+        raise ValueError(f"backend must be either 'cpu' or 'gpu', got {backend!r}")
+
+    if pciseq_options is None:
+        options = {}
+    elif isinstance(pciseq_options, Mapping):
+        options = dict(pciseq_options)
+    else:
+        raise TypeError("pciseq_options must be a mapping or None")
+
+    if "output_path" in options:
+        raise ValueError(
+            "pciseq_options cannot set output_path; use output_dir or "
+            "output_dir_prefix instead"
+        )
+
+    reserved = _GPU_CONFIG_KEYS.intersection(options)
+    if reserved:
+        raise ValueError(
+            "Set GPU controls through backend, gpu_device, "
+            "gpu_spots_to_cell, and gpu_block_mb instead of pciseq_options: "
+            f"{sorted(reserved)}"
+        )
+
+    if backend == "gpu":
+        if not pciseq_gpu_backend_installed():
+            raise RuntimeError(
+                "backend='gpu' requires the GPU-enabled pciSeq fork pinned at "
+                f"{PCISEQ_GPU_FORK_URL}@{PCISEQ_GPU_FORK_COMMIT}. The installed "
+                "pciSeq package does not expose its GPU options; install the "
+                "'pciseq-gpu' extra or follow ISS_postprocessing/README.md."
+            )
+        if isinstance(gpu_device, bool) or not isinstance(gpu_device, int):
+            raise TypeError("gpu_device must be a non-negative integer")
+        if gpu_device < 0:
+            raise ValueError("gpu_device must be a non-negative integer")
+        if not isinstance(gpu_spots_to_cell, bool):
+            raise TypeError("gpu_spots_to_cell must be a boolean")
+        if (
+            isinstance(gpu_block_mb, bool)
+            or not isinstance(gpu_block_mb, (int, float))
+            or gpu_block_mb <= 0
+        ):
+            raise ValueError("gpu_block_mb must be a positive number")
+
+        _validate_gpu_runtime(gpu_device)
+        options.update(
+            {
+                "use_gpu": True,
+                "gpu_spots_to_cell": gpu_spots_to_cell,
+                "gpu_device": gpu_device,
+                "gpu_block_mb": gpu_block_mb,
+            }
+        )
+    elif pciseq_gpu_backend_installed():
+        # The fork mutates config.DEFAULT while parsing options. Explicitly
+        # disable both CUDA kernels so a GPU run cannot leak into a later CPU run.
+        options.update({"use_gpu": False, "gpu_spots_to_cell": False})
+
+    return options
 
 
 def _compute_bounds_metrics(spots_df, mask_shape):
@@ -505,6 +618,11 @@ def run_pciseq(
     retry_random_state=42,
     output_dir=None,
     overwrite=True,
+    backend="gpu",
+    pciseq_options=None,
+    gpu_device=0,
+    gpu_spots_to_cell=True,
+    gpu_block_mb=256,
 ):
     """
     Run PCIseq on a given region and optionally save results to disk.
@@ -519,7 +637,34 @@ def run_pciseq(
     Pass ``output_dir`` to use an exact directory instead. The historical
     behavior overwrites serialized outputs, so ``overwrite`` defaults to true;
     set it false to fail before running when an output already exists.
+
+    Parameters specific to execution
+    --------------------------------
+    backend : {"gpu", "cpu"}, default="gpu"
+        Execution backend. The default GPU path requires the pinned
+        ``mgcizzu/pciSeq`` fork and a CUDA-enabled PyTorch installation. Use
+        ``"cpu"`` for CPU execution or when the standard pciSeq package is
+        installed instead.
+    pciseq_options : mapping or None, default=None
+        Additional options forwarded to ``pciSeq.fit``. Output and GPU options
+        are managed by this wrapper and cannot be supplied here.
+    gpu_device : int, default=0
+        Logical CUDA device index used by the GPU fork.
+    gpu_spots_to_cell : bool, default=True
+        Accelerate both cell-type likelihoods and spot-to-cell assignment. Set
+        false to accelerate only cell-type likelihoods.
+    gpu_block_mb : int or float, default=256
+        Target GPU block size. The fork automatically streams bounded working
+        sets when the full tensors do not safely fit in free VRAM.
     """
+    fit_options = _resolve_pciseq_options(
+        backend=backend,
+        pciseq_options=pciseq_options,
+        gpu_device=gpu_device,
+        gpu_spots_to_cell=gpu_spots_to_cell,
+        gpu_block_mb=gpu_block_mb,
+    )
+
     # ------------------------------------------------------------------
     # Output directory handling.
     # ------------------------------------------------------------------
@@ -573,6 +718,7 @@ def run_pciseq(
     # ------------------------------------------------------------------
     # Configure pciSeq output path before calling fit().
     # ------------------------------------------------------------------
+    original_config = dict(config.DEFAULT)
     config.DEFAULT["output_path"] = [str(PCIseq_dir.parent)]
 
     # ------------------------------------------------------------------
@@ -580,40 +726,49 @@ def run_pciseq(
     # ------------------------------------------------------------------
     def _run_fit(spots_to_use, label):
         print(f"Running PCIseq on region {region} with {len(spots_to_use)} spots ({label})...")
-        return fit(
+        fit_kwargs = dict(
             spots=spots_to_use,
             coo=coo,
             scRNAseq=sc_expression_matrix,
         )
+        if fit_options:
+            fit_kwargs["opts"] = fit_options
+        return fit(**fit_kwargs)
 
     # ------------------------------------------------------------------
     # First attempt: full dataset.
     # ------------------------------------------------------------------
     try:
-        cellData, geneData = _run_fit(spots_base, label="full dataset")
+        try:
+            cellData, geneData = _run_fit(spots_base, label="full dataset")
 
-    except AssertionError as e:
-        known_msg = "The sum of the background spots and the total gene counts should be equal to the number of spots"
+        except AssertionError as e:
+            known_msg = "The sum of the background spots and the total gene counts should be equal to the number of spots"
 
-        if (not retry_with_thinning) or (known_msg not in str(e)):
-            raise
+            if (not retry_with_thinning) or (known_msg not in str(e)):
+                raise
 
-        print("[WARN] pciSeq failed on full dataset with known assertion error.")
-        print(
-            f"[WARN] Retrying with spot thinning: "
-            f"keep frac={retry_spot_fraction}, random_state={retry_random_state}"
-        )
+            print("[WARN] pciSeq failed on full dataset with known assertion error.")
+            print(
+                f"[WARN] Retrying with spot thinning: "
+                f"keep frac={retry_spot_fraction}, random_state={retry_random_state}"
+            )
 
-        spots_retry = (
-            spots_base
-            .sample(frac=retry_spot_fraction, random_state=retry_random_state)
-            .reset_index(drop=True)
-        )
+            spots_retry = (
+                spots_base
+                .sample(frac=retry_spot_fraction, random_state=retry_random_state)
+                .reset_index(drop=True)
+            )
 
-        print(f"[INFO] Full spots: {len(spots_base)}")
-        print(f"[INFO] Retry spots: {len(spots_retry)}")
+            print(f"[INFO] Full spots: {len(spots_base)}")
+            print(f"[INFO] Retry spots: {len(spots_retry)}")
 
-        cellData, geneData = _run_fit(spots_retry, label="retry with thinning")
+            cellData, geneData = _run_fit(spots_retry, label="retry with thinning")
+    finally:
+        # pciSeq mutates its module-level defaults while parsing opts. Restore
+        # them even when fitting fails so independent runs remain independent.
+        config.DEFAULT.clear()
+        config.DEFAULT.update(original_config)
 
     # ------------------------------------------------------------------
     # Reset index for easier downstream handling.

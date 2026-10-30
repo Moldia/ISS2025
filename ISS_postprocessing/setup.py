@@ -23,6 +23,15 @@ setup(
     py_modules=["ISS_postprocessing"],
     packages=find_packages(),
     install_requires=[],
+    extras_require={
+        "pciseq": [
+            "pciSeq>=0.0.61",
+        ],
+        "pciseq-gpu": [
+            "torch>=2.1,<3",
+            "pciSeq @ git+https://github.com/mgcizzu/pciSeq.git@ccbcf8c36efb478ea2030ea5820d12360487a9fa",
+        ],
+    },
     keywords=['python', 'spatial transcriptomics', 
             'spatial resolved transcriptomics', 
             'in situ sequencing', 

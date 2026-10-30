@@ -1,7 +1,9 @@
-import tempfile
+import inspect
 import sys
+import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -167,7 +169,108 @@ class PostprocessingPathOverrideTests(unittest.TestCase):
                     sc_expression_matrix=None,
                     output_dir=output,
                     overwrite=False,
+                    backend="cpu",
                 )
+
+    def test_pciseq_gpu_backend_requires_gpu_fork(self):
+        original = dict(pciseq.config.DEFAULT)
+        try:
+            pciseq.config.DEFAULT.clear()
+            with self.assertRaisesRegex(RuntimeError, "GPU-enabled pciSeq fork"):
+                pciseq._resolve_pciseq_options(
+                    backend="gpu",
+                    pciseq_options=None,
+                    gpu_device=0,
+                    gpu_spots_to_cell=True,
+                    gpu_block_mb=256,
+                )
+        finally:
+            pciseq.config.DEFAULT.clear()
+            pciseq.config.DEFAULT.update(original)
+
+    def test_pciseq_gpu_backend_is_default(self):
+        parameters = inspect.signature(pciseq.run_pciseq).parameters
+        self.assertEqual(parameters["backend"].default, "gpu")
+
+    def test_pciseq_cpu_backend_keeps_stock_options(self):
+        original = dict(pciseq.config.DEFAULT)
+        try:
+            pciseq.config.DEFAULT.clear()
+            options = pciseq._resolve_pciseq_options(
+                backend="cpu",
+                pciseq_options={"max_iter": 5},
+                gpu_device=0,
+                gpu_spots_to_cell=True,
+                gpu_block_mb=256,
+            )
+            self.assertEqual(options, {"max_iter": 5})
+        finally:
+            pciseq.config.DEFAULT.clear()
+            pciseq.config.DEFAULT.update(original)
+
+    def test_pciseq_gpu_backend_forwards_options_and_restores_defaults(self):
+        original = dict(pciseq.config.DEFAULT)
+        gpu_defaults = {
+            "output_path": ["default"],
+            "use_gpu": False,
+            "gpu_spots_to_cell": False,
+            "gpu_device": 0,
+            "gpu_block_mb": 256,
+        }
+        fake_cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 2,
+        )
+        fake_torch = types.SimpleNamespace(cuda=fake_cuda)
+        fake_cell_data = pd.DataFrame(
+            {
+                "Cell_Num": [1],
+                "X": [0.0],
+                "Y": [0.0],
+                "ClassName": [["type-a"]],
+                "Prob": [[1.0]],
+            }
+        )
+        fake_gene_data = pd.DataFrame({"Gene": ["GeneA"]})
+
+        try:
+            pciseq.config.DEFAULT.clear()
+            pciseq.config.DEFAULT.update(gpu_defaults)
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+                    with mock.patch.object(
+                        pciseq,
+                        "fit",
+                        return_value=(fake_cell_data, fake_gene_data),
+                    ) as fit_mock:
+                        pciseq.run_pciseq(
+                            region="sample",
+                            spots=pd.DataFrame(
+                                {"Gene": ["GeneA"], "x": [0.0], "y": [0.0]}
+                            ),
+                            coo_mask=coo_matrix(np.array([[1]], dtype=np.int32)),
+                            sc_expression_matrix=pd.DataFrame(
+                                {"type-a": [1]}, index=["GeneA"]
+                            ),
+                            output_dir=Path(tmp) / "gpu-output",
+                            save_output=False,
+                            backend="gpu",
+                            gpu_device=1,
+                            gpu_spots_to_cell=True,
+                            gpu_block_mb=128,
+                            pciseq_options={"max_iter": 5},
+                        )
+
+            options = fit_mock.call_args.kwargs["opts"]
+            self.assertEqual(options["max_iter"], 5)
+            self.assertIs(options["use_gpu"], True)
+            self.assertIs(options["gpu_spots_to_cell"], True)
+            self.assertEqual(options["gpu_device"], 1)
+            self.assertEqual(options["gpu_block_mb"], 128)
+            self.assertEqual(pciseq.config.DEFAULT, gpu_defaults)
+        finally:
+            pciseq.config.DEFAULT.clear()
+            pciseq.config.DEFAULT.update(original)
 
 
 if __name__ == "__main__":
