@@ -47,6 +47,8 @@ class PreprocessingFlexibilityTests(unittest.TestCase):
                     overwrite=True,
                     ome_input_files={("R1", 1): Path(tmp) / "input.ome.tiff"},
                     stitched_output_dirs={("R1", 1): Path(tmp) / "stitched"},
+                    registration_reference="rca_composite",
+                    rca_channels=[0, 1],
                 )
 
             extraction.assert_not_called()
@@ -57,6 +59,11 @@ class PreprocessingFlexibilityTests(unittest.TestCase):
                 align.call_args.kwargs["ome_input_files"][("R1", 1)],
                 Path(tmp) / "input.ome.tiff",
             )
+            self.assertEqual(
+                align.call_args.kwargs["registration_reference"],
+                "rca_composite",
+            )
+            self.assertEqual(align.call_args.kwargs["rca_channels"], [0, 1])
 
     def test_explicit_missing_mip_directory_raises(self):
         with tempfile.TemporaryDirectory() as tmp:

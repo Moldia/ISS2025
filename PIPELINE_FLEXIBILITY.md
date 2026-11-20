@@ -74,6 +74,35 @@ The historical cache behavior remains the default. `overwrite=True` forces
 recomputation. `align_and_stitch` now honors the supplied `maximum_shift` and
 `filter_sigma` instead of replacing them internally.
 
+## RCA-composite stitching and cycle registration
+
+The legacy DAPI path remains the default. To use the same synthetic RCA signal
+for both ASHLAR tile stitching and cross-cycle registration:
+
+```python
+align_and_stitch(
+    region_directories=[workspace / "R1"],
+    cycles=[1, 2, 3, 4],
+    n_total_cycles=4,
+    align_channel=4,
+    registration_reference="rca_composite",
+    rca_channels=[0, 1, 2, 3],
+    rca_composite_method="normalized_max",
+    stitched_output_dirs={
+        ("R1", cycle): exports / f"cycle-{cycle}-stitched"
+        for cycle in [1, 2, 3, 4]
+    },
+    registration_diagnostic_dirs={"R1": exports / "registration-qc"},
+    save_registration_composites=True,
+    registration_qc=True,
+)
+```
+
+The RCA reference is appended to temporary OME-TIFF copies and passed through
+ASHLAR's standard processing entry point. It is not added to normal stitched
+outputs. See [`ISS_preprocessing/README.md`](ISS_preprocessing/README.md) for
+composite methods, output details, and limitations.
+
 ## CARE with arbitrary cycle folders
 
 Mappings use `(region_name, cycle_name)` keys. They reach the per-cycle file

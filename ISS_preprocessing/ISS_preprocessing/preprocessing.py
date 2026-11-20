@@ -34,9 +34,11 @@ Notes
 # ============================
 import os
 import re
+import json
 import math
 import time
 import shutil
+import tempfile
 import warnings
 import subprocess
 from pathlib import Path
@@ -62,6 +64,15 @@ from natsort import natsorted
 # ============================
 
 import ISS_preprocessing.psf as fd_psf
+from ISS_preprocessing.registration import (
+    create_rca_augmented_ome,
+    estimate_residual_translation,
+    generate_rca_composite,
+    normalized_cross_correlation,
+    read_ome_channel_names,
+    registration_overlay,
+    resolve_rca_channels,
+)
 
 from skimage import img_as_ubyte
 from skimage.exposure import rescale_intensity
@@ -4474,7 +4485,17 @@ def preprocessing_main(input_dirs,
                             stitched_output_dirs=None,
                             ashlar_work_dirs=None,
                             stitched_input_dirs=None,
-                            retiled_output_dirs=None):
+                            retiled_output_dirs=None,
+                            registration_reference="dapi",
+                            rca_channels=None,
+                            rca_composite_method="normalized_max",
+                            rca_normalization_percentiles=(1, 99.9),
+                            rca_background_subtraction=True,
+                            rca_gaussian_sigma=None,
+                            reference_cycle=None,
+                            save_registration_composites=False,
+                            registration_qc=False,
+                            registration_diagnostic_dirs=None):
     
     """
     Main preprocessing pipeline for microscopy image data.
@@ -4567,6 +4588,19 @@ def preprocessing_main(input_dirs,
         Exact temporary Ashlar work directory per region. Caller-managed
         contents are never recursively removed.
 
+    registration_reference : {"dapi", "rca_composite"}
+        Signal used by ASHLAR for both tile stitching and cross-cycle
+        registration. The default ``"dapi"`` preserves legacy behavior.
+    rca_channels : sequence of int or str, optional
+        Channels combined for RCA registration. By default every channel except
+        ``align_channel`` is used. Names require OME channel-name metadata.
+    reference_cycle : int, optional
+        Cycle used as ASHLAR's reference. Defaults to the first item in
+        ``cycles``.
+    save_registration_composites, registration_qc : bool
+        Save stitched RCA references and optionally calculate residual phase
+        correlation, normalized cross-correlation, and overlay diagnostics.
+
     Raises
     ------
     ValueError
@@ -4651,6 +4685,16 @@ def preprocessing_main(input_dirs,
             ome_input_files=ome_input_files if ome_input_files is not None else ome_output_files,
             stitched_output_dirs=stitched_output_dirs,
             work_dirs=ashlar_work_dirs,
+            registration_reference=registration_reference,
+            rca_channels=rca_channels,
+            rca_composite_method=rca_composite_method,
+            rca_normalization_percentiles=rca_normalization_percentiles,
+            rca_background_subtraction=rca_background_subtraction,
+            rca_gaussian_sigma=rca_gaussian_sigma,
+            reference_cycle=reference_cycle,
+            save_registration_composites=save_registration_composites,
+            registration_qc=registration_qc,
+            registration_diagnostic_dirs=registration_diagnostic_dirs,
         )
 
     # retile stitched images
@@ -5665,7 +5709,17 @@ def align_and_stitch(
     overwrite=False,
     ome_input_files: Mapping[tuple[str, int], str | Path] | None = None,
     stitched_output_dirs: Mapping[tuple[str, int], str | Path] | None = None,
-    work_dirs: Mapping[str, str | Path] | None = None):
+    work_dirs: Mapping[str, str | Path] | None = None,
+    registration_reference="dapi",
+    rca_channels=None,
+    rca_composite_method="normalized_max",
+    rca_normalization_percentiles=(1, 99.9),
+    rca_background_subtraction=True,
+    rca_gaussian_sigma=None,
+    reference_cycle=None,
+    save_registration_composites=False,
+    registration_qc=False,
+    registration_diagnostic_dirs: Mapping[str, str | Path] | None = None):
     """
     Wrapper function for the Ashlar tool for image alignment and mosaicking.
 
@@ -5685,6 +5739,13 @@ def align_and_stitch(
         plates (bool): Whether to use plate processing mode.
         quiet (bool): Suppress verbose output.
         version (bool): Print version (not used in this wrapper).
+        registration_reference (str): ``"dapi"`` (legacy) or
+            ``"rca_composite"``. RCA mode uses the composite for both
+            first-cycle stitching and cross-cycle registration.
+        rca_channels (list or None): Channels included in the RCA composite.
+            None selects all channels except ``align_channel``.
+        reference_cycle (int or None): Reference cycle; defaults to the first
+            cycle supplied.
 
     Returns:
         int: 1 on error, otherwise result of Ashlar processing.
@@ -5700,6 +5761,35 @@ def align_and_stitch(
     import ashlar.scripts.ashlar as ashlar
     ashlar.configure_terminal()
 
+    registration_reference = str(registration_reference).strip().lower()
+    if registration_reference not in {"dapi", "rca_composite"}:
+        raise ValueError(
+            "registration_reference must be 'dapi' or 'rca_composite'"
+        )
+    rca_composite_method = str(rca_composite_method).strip().lower()
+
+    cycles = list(cycles)
+    if not cycles:
+        raise ValueError("cycles must contain at least one cycle")
+    cycle_numbers = [int(cycle) for cycle in cycles]
+    if len(set(cycle_numbers)) != len(cycle_numbers):
+        raise ValueError(f"cycles contains duplicate identifiers: {cycles}")
+    if reference_cycle is None:
+        reference_cycle_number = cycle_numbers[0]
+    else:
+        reference_cycle_number = int(reference_cycle)
+        if reference_cycle_number not in cycle_numbers:
+            raise ValueError(
+                f"reference_cycle={reference_cycle!r} is not present in cycles={cycles}"
+            )
+    ordered_cycle_numbers = [reference_cycle_number] + [
+        cycle for cycle in cycle_numbers if cycle != reference_cycle_number
+    ]
+    cycle_value_by_number = dict(zip(cycle_numbers, cycles))
+    processing_cycles = [
+        cycle_value_by_number[cycle] for cycle in ordered_cycle_numbers
+    ]
+
     for region_directory in region_directories:
 
         region_directory = Path(region_directory)
@@ -5712,7 +5802,7 @@ def align_and_stitch(
         ome_tiffs: List[Path] = []
         missing = []
         
-        for cyc in cycles:
+        for cyc in processing_cycles:
             key = (region_suffix, int(cyc))
             if ome_input_files is not None and key in ome_input_files:
                 ome_path = Path(ome_input_files[key])
@@ -5735,14 +5825,14 @@ def align_and_stitch(
                 + "\n  - ".join(missing)
             )
         
-        print(f"Using OME-TIFF inputs (in cycles order): {cycles}")
+        print(f"Using OME-TIFF inputs (ASHLAR order): {processing_cycles}")
         # NOTE: This order defines Ashlar output indices Cycle0, Cycle1, ... (temporary outputs)
 
         # --- PRECHECK 0: stitching must run on ALL cycles (no subsets) ---
-        if len(cycles) != int(n_total_cycles):
+        if len(processing_cycles) != int(n_total_cycles):
             raise RuntimeError(
                 f"[ERROR] Refusing to run stitching on a subset: "
-                f"len(cycles)={len(cycles)} but n_total_cycles={n_total_cycles}. "
+                f"len(cycles)={len(processing_cycles)} but n_total_cycles={n_total_cycles}. "
                 f"Provide all cycles for stitching. cycles={cycles}"
     )
 
@@ -5751,10 +5841,10 @@ def align_and_stitch(
         # the expected total number of cycles for this experiment (n_total_cycles).
         # Earlier pipeline steps can run on subsets; alignment/stitching must not.
         has_all_explicit_inputs = ome_input_files is not None and all(
-            (region_suffix, int(cyc)) in ome_input_files for cyc in cycles
+            (region_suffix, int(cyc)) in ome_input_files for cyc in processing_cycles
         )
         if has_all_explicit_inputs:
-            found_cycles = sorted(int(cyc) for cyc in cycles)
+            found_cycles = sorted(int(cycle) for cycle in processing_cycles)
         else:
             all_ome_tiffs = natsorted([
                 f for f in (region_directory / "preprocessing").rglob("2_ome_tiffs/*.ome.tiff")
@@ -5783,6 +5873,14 @@ def align_and_stitch(
                 raise RuntimeError(f"OME-TIFF missing channel axis 'C': {ome_tiffs[0]}")
             n_channels = int(tif.series[0].shape[axes.index("C")])
 
+        channel_names = None
+        if (
+            registration_reference == "rca_composite"
+            or save_registration_composites
+            or registration_qc
+        ):
+            channel_names = read_ome_channel_names(ome_tiffs[0])
+
         # Validate align_channel
         if not (0 <= int(align_channel) < int(n_channels)):
             raise ValueError(
@@ -5790,9 +5888,46 @@ def align_and_stitch(
                 f"(valid: 0..{n_channels-1})"
             )
 
+        final_output_channels = (
+            [int(channel) for channel in output_channels]
+            if output_channels
+            else list(range(n_channels))
+        )
+        invalid_output_channels = sorted(
+            set(int(channel) for channel in final_output_channels)
+            - set(range(n_channels))
+        )
+        if invalid_output_channels:
+            raise ValueError(
+                f"output_channels contains invalid original channel(s) "
+                f"{invalid_output_channels} for n_channels={n_channels}"
+            )
+
+        selected_rca_channels = None
+        if (
+            registration_reference == "rca_composite"
+            or save_registration_composites
+            or registration_qc
+        ):
+            selected_rca_channels = resolve_rca_channels(
+                rca_channels,
+                n_channels=n_channels,
+                nuclear_channel=align_channel,
+                channel_names=channel_names,
+            )
+        diagnostics_requested = bool(
+            save_registration_composites or registration_qc
+        )
+        diagnostic_dir = (
+            Path(registration_diagnostic_dirs[region_suffix])
+            if registration_diagnostic_dirs is not None
+            and region_suffix in registration_diagnostic_dirs
+            else region_directory / "preprocessing" / "registration_diagnostics"
+        )
+
         # --- STEP 3.1: Define expected stitched outputs for requested cycles ---
         expected_outputs = []
-        for cyc in cycles:
+        for cyc in processing_cycles:
             key = (region_suffix, int(cyc))
             stitched_dir = (
                 Path(stitched_output_dirs[key])
@@ -5801,15 +5936,77 @@ def align_and_stitch(
             )
             expected_outputs.extend(
                 stitched_dir / f"Cycle{cyc}_ch{ch}.tif"
-                for ch in range(n_channels)
+                for ch in final_output_channels
             )
 
         # Skip only if *all* expected outputs exist AND are non-trivially sized (valid).
         # This prevents skipping when a previous run left tiny/corrupted files behind.
-        if not overwrite and all(file_exists_and_valid(p, min_size=1024) for p in expected_outputs):
+        rca_cache_matches = False
+        if registration_reference == "rca_composite":
+            metadata_path = diagnostic_dir / "registration_metadata.json"
+            try:
+                cached_metadata = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+                expected_cache_metadata = {
+                    "registration_reference": "rca_composite",
+                    "reference_cycle": int(reference_cycle_number),
+                    "rca_composite_method": str(rca_composite_method).lower(),
+                    "rca_channels": selected_rca_channels,
+                    "rca_normalization_percentiles": list(
+                        map(float, rca_normalization_percentiles)
+                    ),
+                    "rca_background_subtraction": bool(
+                        rca_background_subtraction
+                    ),
+                    "rca_gaussian_sigma": (
+                        None
+                        if rca_gaussian_sigma is None
+                        else float(rca_gaussian_sigma)
+                    ),
+                    "ashlar_maximum_shift": float(maximum_shift),
+                    "ashlar_filter_sigma": float(filter_sigma),
+                    "output_channels": final_output_channels,
+                }
+                rca_cache_matches = all(
+                    cached_metadata.get(key) == value
+                    for key, value in expected_cache_metadata.items()
+                )
+                if diagnostics_requested:
+                    rca_cache_matches &= all(
+                        file_exists_and_valid(
+                            diagnostic_dir / f"Cycle{cycle}_rca_composite.tif",
+                            min_size=1024,
+                        )
+                        for cycle in processing_cycles
+                    )
+                if registration_qc:
+                    rca_cache_matches &= (
+                        len(cached_metadata.get("quality_control", []))
+                        == len(processing_cycles)
+                    )
+                    rca_cache_matches &= all(
+                        file_exists_and_valid(
+                            diagnostic_dir / f"Cycle{cycle}_overlay.tif",
+                            min_size=1024,
+                        )
+                        for cycle in processing_cycles
+                    )
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                rca_cache_matches = False
+
+        if (
+            not overwrite
+            and (registration_reference == "dapi" or rca_cache_matches)
+            and not (
+                registration_reference == "dapi" and diagnostics_requested
+            )
+            and all(file_exists_and_valid(p, min_size=1024) for p in expected_outputs)
+        ):
             print(
                 f"Stitched images already exist (and look valid) for all requested cycles "
-                f"(cycles={len(cycles)}, channels={n_channels}). Skipping."
+                f"(cycles={len(processing_cycles)}, "
+                f"channels={len(final_output_channels)}). Skipping."
             )
             continue 
 
@@ -5824,33 +6021,63 @@ def align_and_stitch(
             continue
     
         # **Normalize FFP/DFP paths if provided**
-        ffp_paths = ffp
+        ffp_paths = list(ffp) if ffp else None
         if ffp_paths:
             if len(ffp_paths) not in (0, 1, len(ome_tiffs)):
                 ashlar.print_error(f"Wrong number of flat-field profiles. Must be 1, or {len(ome_tiffs)}")
                 continue
             if len(ffp_paths) == 1:
-                ffp_paths *= len(ome_tiffs)
+                ffp_paths = ffp_paths * len(ome_tiffs)
+            else:
+                ffp_by_cycle = dict(zip(cycle_numbers, ffp_paths))
+                ffp_paths = [
+                    ffp_by_cycle[int(cycle)] for cycle in processing_cycles
+                ]
     
-        dfp_paths = dfp
+        dfp_paths = list(dfp) if dfp else None
         if dfp_paths:
             if len(dfp_paths) not in (0, 1, len(ome_tiffs)):
                 ashlar.print_error(f"Wrong number of dark-field profiles. Must be 1, or {len(ome_tiffs)}")
                 continue
             if len(dfp_paths) == 1:
-                dfp_paths *= len(ome_tiffs)
+                dfp_paths = dfp_paths * len(ome_tiffs)
+            else:
+                dfp_by_cycle = dict(zip(cycle_numbers, dfp_paths))
+                dfp_paths = [
+                    dfp_by_cycle[int(cycle)] for cycle in processing_cycles
+                ]
     
+        if registration_reference == "rca_composite" and (ffp_paths or dfp_paths):
+            raise ValueError(
+                "RCA-composite registration cannot safely append an alignment "
+                "channel to existing flat/dark-field profiles. Apply illumination "
+                "correction upstream or omit ffp/dfp."
+            )
+
+        composite_channel = (
+            n_channels if registration_reference == "rca_composite" else None
+        )
+
         # **Set Ashlar aligner and mosaic parameters**
         aligner_args = {
-            'channel': align_channel,
+            'channel': (
+                composite_channel
+                if registration_reference == "rca_composite"
+                else align_channel
+            ),
             'verbose': not quiet,
             'max_shift': maximum_shift,
             'filter_sigma': filter_sigma
         }
     
         mosaic_args = {}
-        if output_channels:
-            mosaic_args['channels'] = output_channels
+        if registration_reference == "rca_composite":
+            ashlar_output_channels = list(final_output_channels)
+            if diagnostics_requested:
+                ashlar_output_channels.append(composite_channel)
+            mosaic_args['channels'] = ashlar_output_channels
+        elif output_channels:
+            mosaic_args['channels'] = final_output_channels
         if pyramid:
             mosaic_args['tile_size'] = tile_size
         if not quiet:
@@ -5862,22 +6089,34 @@ def align_and_stitch(
             if work_dirs is not None and region_suffix in work_dirs
             else region_directory / "preprocessing" / "ashlar_tmp"
         )
-        tmp_pattern = str(
-            tmp_path / "Cycle{cycle}_ch{channel}.tif"
-        )
-        safe_mkdir(Path(tmp_pattern).parent)
-    
-        # --- STEP 5: Run Ashlar with inputs in the correct order ---
-        ome_tiff_files = [str(p) for p in ome_tiffs]
-        
-        tmp_path = (
-            Path(work_dirs[region_suffix])
-            if work_dirs is not None and region_suffix in work_dirs
-            else region_directory / "preprocessing" / "ashlar_tmp"
-        )
         safe_mkdir(tmp_path)
-        
         tmp_pattern = str(tmp_path / "Cycle{cycle}_ch{channel}.tif")
+
+        # --- STEP 5: Optionally append an RCA channel, then run standard ASHLAR ---
+        ome_tiff_files = [str(path) for path in ome_tiffs]
+        rca_input_dir = None
+        if registration_reference == "rca_composite":
+            rca_input_dir = Path(
+                tempfile.mkdtemp(prefix="rca_composite_inputs_", dir=tmp_path)
+            )
+            try:
+                augmented_inputs = []
+                for cycle, source_path in zip(processing_cycles, ome_tiffs):
+                    augmented_path = rca_input_dir / f"Cycle{cycle}.ome.tiff"
+                    create_rca_augmented_ome(
+                        source_path,
+                        augmented_path,
+                        rca_channels=selected_rca_channels,
+                        method=rca_composite_method,
+                        background_subtraction=rca_background_subtraction,
+                        normalization_percentiles=rca_normalization_percentiles,
+                        gaussian_sigma=rca_gaussian_sigma,
+                    )
+                    augmented_inputs.append(str(augmented_path))
+                ome_tiff_files = augmented_inputs
+            except Exception:
+                shutil.rmtree(rca_input_dir, ignore_errors=True)
+                raise
         
         try:
             if plates:
@@ -5911,7 +6150,11 @@ def align_and_stitch(
         
         except Exception as e:
             ashlar.print_error(f"Unexpected error during Ashlar run: {e}")
-            continue  
+            continue
+
+        finally:
+            if rca_input_dir is not None:
+                shutil.rmtree(rca_input_dir, ignore_errors=True)
             
         # --- STEP 6: Remap Ashlar temp cycle indices back onto REAL cycle numbers ---
         #
@@ -5921,18 +6164,21 @@ def align_and_stitch(
         # where the numeric index corresponds EXACTLY to the order of ome_tiff_files.
         #
         # In this pipeline:
-        #   ome_tiff_files are ordered to match `cycles`
+        #   ome_tiff_files are ordered to match `processing_cycles`
         # Therefore:
-        #   tmp Cycle{i}  →  real Cycle{cycles[i]}
+        #   tmp Cycle{i}  →  real Cycle{processing_cycles[i]}
         #
 
         tmp_path = Path(tmp_pattern).parent
 
         # Sanity check: ensure all expected temp files exist BEFORE moving anything
+        expected_temp_channels = list(final_output_channels)
+        if registration_reference == "rca_composite" and diagnostics_requested:
+            expected_temp_channels.append(composite_channel)
         expected_tmp = [
             tmp_path / f"Cycle{cyc_idx}_ch{ch}.tif"
-            for cyc_idx in range(len(cycles))
-            for ch in range(n_channels)
+            for cyc_idx in range(len(processing_cycles))
+            for ch in expected_temp_channels
         ]
 
         missing_tmp = [p for p in expected_tmp if not p.exists()]
@@ -5942,8 +6188,11 @@ def align_and_stitch(
                 f"Example missing: {missing_tmp[:5]}"
             )
 
+        composite_paths = {}
+        stitched_paths = {}
+
         # Now remap safely
-        for cyc_idx, cyc in enumerate(cycles):
+        for cyc_idx, cyc in enumerate(processing_cycles):
             key = (region_suffix, int(cyc))
             stitched_dir = (
                 Path(stitched_output_dirs[key])
@@ -5952,7 +6201,8 @@ def align_and_stitch(
             )
             safe_mkdir(stitched_dir)
 
-            for ch in range(n_channels):
+            stitched_paths[int(cyc)] = {}
+            for ch in final_output_channels:
                 tmp_file = tmp_path / f"Cycle{cyc_idx}_ch{ch}.tif"
                 final_file = stitched_dir / f"Cycle{cyc}_ch{ch}.tif"
 
@@ -5961,12 +6211,130 @@ def align_and_stitch(
                     print(f"{BOLD}[WARN]⚠️ {RESET} Overwriting existing stitched file: {final_file}")
 
                 tmp_file.replace(final_file)
+                stitched_paths[int(cyc)][int(ch)] = final_file
+
+            if registration_reference == "rca_composite" and diagnostics_requested:
+                safe_mkdir(diagnostic_dir)
+                composite_file = (
+                    diagnostic_dir / f"Cycle{cyc}_rca_composite.tif"
+                )
+                if composite_file.exists():
+                    print(
+                        f"{BOLD}[WARN]⚠️ {RESET} Overwriting existing "
+                        f"registration composite: {composite_file}"
+                    )
+                (
+                    tmp_path
+                    / f"Cycle{cyc_idx}_ch{composite_channel}.tif"
+                ).replace(composite_file)
+                composite_paths[int(cyc)] = composite_file
 
         print(
             f"[INFO] Remapped Ashlar outputs: "
-            f"{len(cycles)} cycles × {n_channels} channels "
+            f"{len(processing_cycles)} cycles × {len(final_output_channels)} channels "
             f"from {tmp_path} → region Cycle folders"
         )
+
+        if diagnostics_requested and registration_reference == "dapi":
+            missing_diagnostic_channels = sorted(
+                set(selected_rca_channels) - set(final_output_channels)
+            )
+            if missing_diagnostic_channels:
+                raise ValueError(
+                    "RCA diagnostics require stitched outputs for channels "
+                    f"{missing_diagnostic_channels}; include them in output_channels"
+                )
+            safe_mkdir(diagnostic_dir)
+            for cyc in processing_cycles:
+                composite = generate_rca_composite(
+                    (
+                        tifffile.imread(stitched_paths[int(cyc)][channel])
+                        for channel in selected_rca_channels
+                    ),
+                    method=rca_composite_method,
+                    background_subtraction=rca_background_subtraction,
+                    normalization_percentiles=rca_normalization_percentiles,
+                    gaussian_sigma=rca_gaussian_sigma,
+                    output_dtype=np.uint16,
+                )
+                composite_file = (
+                    diagnostic_dir / f"Cycle{cyc}_rca_composite.tif"
+                )
+                tifffile.imwrite(composite_file, composite, bigtiff=True)
+                composite_paths[int(cyc)] = composite_file
+
+        qc_records = []
+        if registration_qc:
+            reference_image = tifffile.imread(
+                composite_paths[reference_cycle_number]
+            )
+            for cyc in processing_cycles:
+                moving = tifffile.imread(composite_paths[int(cyc)])
+                shift, error, phase = estimate_residual_translation(
+                    reference_image, moving, upsample_factor=10
+                )
+                ncc = normalized_cross_correlation(reference_image, moving)
+                overlay_path = diagnostic_dir / f"Cycle{cyc}_overlay.tif"
+                overlay = registration_overlay(reference_image, moving)
+                tifffile.imwrite(
+                    overlay_path,
+                    np.round(overlay * 255).astype(np.uint8),
+                    photometric="rgb",
+                    bigtiff=True,
+                )
+                qc_records.append(
+                    {
+                        "cycle": int(cyc),
+                        "residual_shift_yx_pixels": shift.tolist(),
+                        "phase_correlation_error": error,
+                        "phase_difference_radians": phase,
+                        "normalized_cross_correlation": ncc,
+                        "overlay": str(overlay_path),
+                    }
+                )
+
+        if registration_reference == "rca_composite" or diagnostics_requested:
+            safe_mkdir(diagnostic_dir)
+            metadata = {
+                "registration_reference": registration_reference,
+                "stitching_reference": registration_reference,
+                "reference_cycle": int(reference_cycle_number),
+                "ashlar_cycle_order": [
+                    int(cycle) for cycle in processing_cycles
+                ],
+                "source_ome_tiffs": [str(path) for path in ome_tiffs],
+                "composite_channel_index": composite_channel,
+                "rca_composite_method": rca_composite_method,
+                "rca_channels": selected_rca_channels,
+                "rca_channel_names": (
+                    [channel_names[index] for index in selected_rca_channels]
+                    if channel_names is not None
+                    else None
+                ),
+                "rca_normalization_percentiles": list(
+                    map(float, rca_normalization_percentiles)
+                ),
+                "rca_background_subtraction": bool(
+                    rca_background_subtraction
+                ),
+                "rca_gaussian_sigma": (
+                    None
+                    if rca_gaussian_sigma is None
+                    else float(rca_gaussian_sigma)
+                ),
+                "ashlar_maximum_shift": float(maximum_shift),
+                "ashlar_filter_sigma": float(filter_sigma),
+                "output_channels": final_output_channels,
+                "temporary_augmented_ome_tiffs": (
+                    registration_reference == "rca_composite"
+                ),
+                "estimated_residual_transformations": qc_records,
+                "quality_control": qc_records,
+            }
+            with (diagnostic_dir / "registration_metadata.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(metadata, handle, indent=2)
 
         # Clean up the conventional private temp directory. For an explicit
         # work directory, only remove it if it is now empty; never recursively
